@@ -1,0 +1,20 @@
+daily:
+  calls:
+    target: 40
+    xp_per_unit: 1
+  minutes:
+    target: 120
+    block_minutes: 5
+    xp_per_block: 1
+badges:
+  - name: Bronze Caller
+    when:
+      calls: 20
+  - name: Silver Caller
+    when:
+      calls: 40
+  - name: Golden Talker
+    when:
+      minutes: 120
+announce:
+  enabled: true
