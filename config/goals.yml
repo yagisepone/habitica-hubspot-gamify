@@ -1,20 +1,65 @@
-daily:
+# ※ 数値をいじるだけで実装はそのまま動く設定
+
+# 1日のKPI→ポイント換算
+points:
   calls:
-    target: 40
-    xp_per_unit: 1
+    pt_per_unit: 2          # 架電1件 = 2pt
   minutes:
-    target: 120
-    block_minutes: 5
-    xp_per_block: 1
+    pt_per_unit: 1          # 通話1分 = 1pt
+    block_minutes: 5        # Habitica側は5分ブロック（将来用、未使用でもOK）
+  deals:
+    pt_per_unit: 100        # 成約1件 = 100pt（将来拡張）
+
+# 称号（累計ポイントで決定）
+titles:
+  - name: "営業見習い"
+    min_total_pt: 0
+  - name: "商談ファイター"
+    min_total_pt: 200
+  - name: "クローザー"
+    min_total_pt: 500
+  - name: "営業忍者"
+    min_total_pt: 1000
+  - name: "レジェンドクロージャー"
+    min_total_pt: 1500
+
+# バッジ（“当日”の達成条件）
 badges:
-  - name: Bronze Caller
-    when:
-      calls: 20
-  - name: Silver Caller
-    when:
-      calls: 40
-  - name: Golden Talker
-    when:
-      minutes: 120
+  - key: "daily_calls_50"
+    name: "架電50チャレンジャー"
+    condition:
+      calls: 50            # 当日コール50件で付与
+  - key: "daily_minutes_180"
+    name: "3時間トーカー"
+    condition:
+      minutes: 180         # 当日通話180分で付与
+  - key: "daily_deal_1"
+    name: "初アポ"
+    condition:
+      deals: 1             # 当日成約1件で付与
+
+# ストリーク（連続達成でボーナス）
+streak:
+  enabled: true
+  # “達成”の定義：最低ライン（どちらか満たせば達成）
+  achieve_rule:
+    calls_min: 30          # 1日30件
+    minutes_min: 120       # もしくは 120分
+  # 連続達成ボーナス（累積ボーナス想定）
+  bonus:
+    thresholds:
+      - days: 3
+        extra_pt: 30
+      - days: 5
+        extra_pt: 80
+      - days: 10
+        extra_pt: 200
+
+# 公告（いまはコンソール出力のみ。承認後にHabitica/Slackへ切替）
 announce:
   enabled: true
+  template:
+    rankup: "🎉 {name} さんが {title} に昇格！（累計 {total_pt} pt）次の称号まで {remain_pt} pt"
+    daily:  "✅ {name} 本日 {calls}件 / {minutes}分 / {deals}件成約 → {delta_pt} pt（累計 {total_pt} pt）"
+    badge:  "🏅 {name} バッジ獲得：{badge}"
+    streak: "🔥 {name} 連続達成 {days} 日！ボーナス +{bonus_pt} pt"

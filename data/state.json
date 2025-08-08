@@ -1,8 +1,1 @@
-{
-  "2025-08-08": {
-    "123456": {
-      "calls": 43,
-      "minutes": 148
-    }
-  }
-}
+{"byDate":{"2025-08-01":{"owner-123":{"calls":10,"minutes":30,"deals":1,"deltaPt":50}}},"byMember":{"owner-123":{"totalPt":500,"streakDays":3,"lastDate":"2025-08-01","lastTitle":"商談ファイター"}}}

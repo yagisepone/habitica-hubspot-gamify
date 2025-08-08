@@ -10,32 +10,39 @@
     "start:dev": "ts-node src/scheduler/cron.ts",
     "run:once": "ts-node src/orchestrator/index.ts",
     "run:once:dist": "node dist/orchestrator/index.js",
-    "test": "jest --passWithNoTests"
+    "run:today": "ts-node src/orchestrator/index.ts",
+    "run:date": "ts-node src/orchestrator/index.ts --date=",
+    "report:today": "ts-node src/orchestrator/index.ts --report",
+    "report:date": "ts-node src/orchestrator/index.ts --report --date=",
+    "dry": "ts-node src/orchestrator/index.ts --dry-run --report",
+    "reset:state": "node -e \"require('fs').writeFileSync('data/state.json', JSON.stringify({byDate:{},byMember:{}},null,2))\"",
+    "backup:state": "node -e \"const fs=require('fs');const d=new Date().toISOString().slice(0,10);fs.mkdirSync('backup',{recursive:true});fs.copyFileSync('data/state.json', `backup/state-${d}.json`);console.log('backup -> backup/');\"",
+    "web:dev": "ts-node src/web/server.ts",
+    "web:start": "node dist/web/server.js",
+    "test": "jest",
+    "test:watch": "jest --watch"
   },
-  "keywords": [
-    "habitica",
-    "hubspot",
-    "gamification",
-    "poc"
-  ],
+  "keywords": ["habitica", "hubspot", "gamification", "poc"],
   "author": "",
   "license": "ISC",
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "axios": "^1.11.0",
     "dayjs": "^1.11.13",
     "dotenv": "^17.2.1",
+    "express": "^4.21.2",
     "js-yaml": "^4.1.0",
     "node-cron": "^4.2.1"
   },
   "devDependencies": {
-    "@types/jest": "^30.0.0",
+    "@types/express": "^4.17.23",
+    "@types/jest": "^29.5.12",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.1.0",
-    "jest": "^30.0.5",
-    "ts-jest": "^29.4.0",
+    "@types/supertest": "^6.0.3",
+    "jest": "^29.7.0",
+    "supertest": "^7.1.4",
+    "ts-jest": "^29.1.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
   }
