@@ -1,0 +1,42 @@
+{
+  "name": "habitica-hubspot-gamify",
+  "version": "1.0.0",
+  "description": "PoC for integrating HubSpot call counts with Habitica gamification",
+  "main": "src/orchestrator/index.ts",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/scheduler/cron.js",
+    "start:dev": "ts-node src/scheduler/cron.ts",
+    "run:once": "ts-node src/orchestrator/index.ts",
+    "run:once:dist": "node dist/orchestrator/index.js",
+    "test": "jest --passWithNoTests"
+  },
+  "keywords": [
+    "habitica",
+    "hubspot",
+    "gamification",
+    "poc"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "dayjs": "^1.11.13",
+    "dotenv": "^17.2.1",
+    "js-yaml": "^4.1.0",
+    "node-cron": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.1.0",
+    "jest": "^30.0.5",
+    "ts-jest": "^29.4.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}

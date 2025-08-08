@@ -1,0 +1,8 @@
+[
+  {
+    "name": "Your Name",
+    "hubspotOwnerId": "123456",
+    "habiticaUserId": "your_habitica_user_id",
+    "habiticaApiToken": "your_habitica_api_token"
+  }
+]
