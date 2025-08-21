@@ -1,1 +1,16 @@
-[{"name":"福田","hubspotOwnerId":"owner-123"}]
+[
+  {
+    "name": "福田",
+    "email": "fukuda@example.com",
+    "active": true,
+
+    "hubspotOwnerId": "owner-123",
+    "hubspotEmail": "fukuda@example.com",
+
+    "habiticaUserId": null,
+    "habiticaApiToken": null,
+
+    "chatworkAccountId": null,
+    "zoomEmail": "fukuda@example.com"
+  }
+]

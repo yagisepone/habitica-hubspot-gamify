@@ -44,6 +44,7 @@ if (BASIC_USER && BASIC_PASS && !DISABLE_BASIC) {
 // ---- /Basic認証 ----
 
 app.use("/reports", express.static(path.resolve(process.cwd(), "reports")));
+app.use(express.json({ verify: (req: any, _res, buf) => { req.rawBody = buf.toString(); } }));
 
 function loadState(): StateShape {
   const p = path.resolve(process.cwd(), "data/state.json");
@@ -58,6 +59,7 @@ function loadState(): StateShape {
 }
 
 function loadMembers(): Member[] {
+  // 互換: config/members.json を読み込む
   const p = path.resolve(process.cwd(), "config/members.json");
   if (!fs.existsSync(p)) return [];
   try {
@@ -145,14 +147,11 @@ function buildHtml(opts: {
 }
 
 // health
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
+app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
 // state JSON
-app.get("/api/state", (_req, res) => {
-  res.json(loadState());
-});
+app.get("/api/state", (_req, res) => res.json(loadState()));
 
 // 最新日
 app.get("/", (_req, res) => {
@@ -209,7 +208,7 @@ app.get("/day", (req, res) => {
   res.send(buildHtml({ title: `Dashboard ${date}`, date, rows, dates }));
 });
 
-// ====== ここを変更：Jest では絶対に起動しない ======
+// ====== 起動関数 ======
 export function start() {
   const server = app.listen(PORT, () => {
     console.log(`[web] listening on http://localhost:${PORT}`);
@@ -217,7 +216,7 @@ export function start() {
   return server;
 }
 
-// require.main === module で「直接起動のときだけ」自動起動
+// 直接起動時のみ立ち上げ（Jest/テストでは起動しない）
 const isJest = Boolean(process.env.JEST_WORKER_ID);
 if (!isJest && process.env.NODE_ENV !== "test" && require.main === module) {
   start();

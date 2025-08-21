@@ -20,7 +20,9 @@
     "web:dev": "ts-node src/web/server.ts",
     "web:start": "node dist/web/server.js",
     "test": "jest",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "members:sync": "ts-node tools/resolve_owner_ids.ts",
+    "members:sync:dist": "node dist/tools/resolve_owner_ids.js"
   },
   "keywords": ["habitica", "hubspot", "gamification", "poc"],
   "author": "",
