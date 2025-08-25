@@ -1,26 +1,28 @@
-import cron from "node-cron";
 import yaml from "js-yaml";
 import fs from "fs";
-import 'dotenv/config';
-import { run } from "../orchestrator/index";
+import path from "path";
+import cron from "node-cron";
+import "dotenv/config";
+import { runDaily } from "../orchestrator/daily";
 
-function loadSchedule() {
-  const obj = yaml.load(fs.readFileSync("config/schedule.yml", "utf-8")) as any;
-  const timezone = obj?.timezone || "Asia/Tokyo";
-  const daily = obj?.daily_time || "18:05"; // HH:mm
-  const [hh, mm] = daily.split(":").map((x: string) => parseInt(x, 10));
-  // node-cron は分・時の順
-  const cronExpr = `${mm} ${hh} * * *`;
-  return { cronExpr, timezone };
-}
+type Schedules = { timezone?: string; daily_time?: string };
 
-// サービスとして常駐させる想定
-const { cronExpr, timezone } = loadSchedule();
-console.log(`[scheduler] cron=${cronExpr} tz=${timezone}`);
-cron.schedule(cronExpr, async () => {
-  console.log(`[scheduler] tick @${new Date().toISOString()}`);
-  await run().catch(console.error);
-}, { timezone });
+const cfg = yaml.load(
+  fs.readFileSync(path.resolve(process.cwd(), "config/schedules.yml"), "utf-8")
+) as Schedules;
 
-// すぐ1回走らせたいとき（ローカル確認用）:
-// run().catch(console.error);
+const tz = cfg.timezone || "Asia/Tokyo";
+const [hh, mm] = (cfg.daily_time || "18:05").split(":").map(n => parseInt(n, 10) || 0);
+
+// node-cron は "分 時 * * *"
+const expr = `${mm} ${hh} * * *`;
+console.log(`[cron] schedule daily at ${cfg.daily_time} (${tz}) -> ${expr}`);
+
+cron.schedule(expr, async () => {
+  const today = new Date();
+  const y = today.getFullYear();
+  const m = String(today.getMonth() + 1).padStart(2, "0");
+  const d = String(today.getDate()).padStart(2, "0");
+  const date = `${y}-${m}-${d}`;
+  await runDaily(date);
+}, { timezone: tz });

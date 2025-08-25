@@ -24,12 +24,20 @@
     "members:sync": "ts-node tools/resolve_owner_ids.ts",
     "members:sync:dist": "node dist/tools/resolve_owner_ids.js"
   },
-  "keywords": ["habitica", "hubspot", "gamification", "poc"],
+  "keywords": [
+    "habitica",
+    "hubspot",
+    "gamification",
+    "poc"
+  ],
   "author": "",
   "license": "ISC",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "axios": "^1.11.0",
+    "csv-parse": "^6.1.0",
     "dayjs": "^1.11.13",
     "dotenv": "^17.2.1",
     "express": "^4.21.2",
@@ -40,12 +48,12 @@
     "@types/express": "^4.17.23",
     "@types/jest": "^29.5.12",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^24.1.0",
+    "@types/node": "^24.3.0",
     "@types/supertest": "^6.0.3",
     "jest": "^29.7.0",
     "supertest": "^7.1.4",
     "ts-jest": "^29.1.2",
     "ts-node": "^10.9.2",
-    "typescript": "^5.8.3"
+    "typescript": "^5.9.2"
   }
 }

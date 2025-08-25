@@ -1,8 +1,9 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
-import yaml from "js-yaml";
 import fs from "fs";
 import path from "path";
+import yaml from "js-yaml";
+import dayjs from "dayjs";
 
 import { buildUserLookup } from "../utils/users";
 import { isProcessed, markProcessed } from "../utils/idempotency";
@@ -10,100 +11,141 @@ import { sendChatworkMessage } from "../connectors/chatwork";
 import {
   addXpForKpi,
   addNewAppointment,
-  addApproval,
-  addSales,
   HabiticaCred,
 } from "../connectors/habitica";
 
-// 環境変数から署名検証に使う秘密鍵を読み込む
 const HUBSPOT_SECRET = process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET || "";
 const ZOOM_SECRET = process.env.ZOOM_WEBHOOK_SECRET_TOKEN || "";
 
-// goals.yml を読み込み、得点を参照する
-const goals = yaml.load(fs.readFileSync(path.resolve(process.cwd(), "config/goals.yml"), "utf-8")) as any;
+const goals = yaml.load(
+  fs.readFileSync(path.resolve(process.cwd(), "config/goals.yml"), "utf-8")
+) as any;
 
-/** HubSpot署名検証 */
+function ensureDir(p: string) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function appendJsonl(filePath: string, obj: any) {
+  ensureDir(path.dirname(filePath));
+  fs.appendFileSync(filePath, JSON.stringify(obj) + "\n", "utf-8");
+}
+
 function validateHubspot(req: Request): boolean {
-  const signature = req.headers["x-hubspot-signature"] as string;
-  if (!signature || !HUBSPOT_SECRET) return false;
-  const payload = JSON.stringify(req.body);
+  if (!HUBSPOT_SECRET) return true;
+  const payload = (req as any).rawBody ?? JSON.stringify(req.body);
   const digest = crypto.createHmac("sha256", HUBSPOT_SECRET).update(payload).digest("hex");
+  const signature = String(req.headers["x-hubspot-signature"] || "");
   return digest === signature;
 }
 
-/** Zoom署名検証 */
 function validateZoom(req: Request): boolean {
-  const token = req.headers["x-zm-signature"] as string;
-  return !!ZOOM_SECRET && token === ZOOM_SECRET;
+  if (!ZOOM_SECRET) return true;
+  const token = String(req.headers["x-zm-signature"] || "");
+  return token === ZOOM_SECRET;
 }
 
-/** HubSpot Webhook ハンドラ */
+/** HubSpot Webhook（新規アポ判定） */
 export async function handleHubspotWebhook(req: Request, res: Response) {
-  if (HUBSPOT_SECRET && !validateHubspot(req)) {
-    return res.status(401).send("Invalid signature");
-  }
-  const event = req.body;
-  const objectId = String(event.objectId);
-  if (isProcessed(objectId)) {
-    return res.status(200).send("Duplicate");
-  }
+  if (!validateHubspot(req)) return res.status(401).send("Invalid signature");
+
+  const event = req.body || {};
+  const objectId = String(event.objectId ?? event.eventId ?? "");
+  if (!objectId) return res.status(400).send("No objectId");
+
+  if (isProcessed(objectId)) return res.status(200).send("Duplicate");
   markProcessed(objectId);
 
   const { byHubSpot } = buildUserLookup();
 
-  // 新規アポ検出
   if (event.subscriptionType === "engagement.created" && event.objectType === "CALL") {
     const props = event.properties || {};
-    const disposition = props.hs_call_disposition;
-    const ownerId = String(props.hs_owner_id);
+    const disposition = String(props.hs_call_disposition ?? "");
+    const ownerId = String(props.hs_owner_id ?? "");
+    const ts = props.hs_timestamp || event.occurredAt || Date.now();
+
     const user = byHubSpot[ownerId];
     if (!user) {
-      console.warn("Unknown HubSpot owner:", ownerId);
+      console.warn("[HubSpot] unknown owner:", ownerId);
       return res.status(200).send("Unknown owner");
     }
-    // 新規アポ判定値を環境変数またはデフォルトから取得
-    const list = (process.env.HUBSPOT_NEW_APPOINT_VALUES || "新規アポ,Appointment Booked").split(",");
-    if (list.includes(disposition)) {
+
+    const values = (process.env.HUBSPOT_NEW_APPOINT_VALUES || "新規アポ,Appointment Booked")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    if (values.includes(disposition)) {
       const cred: HabiticaCred = { userId: user.habitica_user_id, apiToken: user.habitica_api_token };
       await addNewAppointment(cred, 1);
-      const xp = goals.points?.new_appoint?.pt_per_unit ?? 20;
-      const msg = `🎉 ${user.display_name} が新規アポを獲得！ (+${xp}XP)`;
-      await sendChatworkMessage(msg);
+
+      // Chatwork通知
+      const xp = goals?.points?.new_appoint?.pt_per_unit ?? 20;
+      await sendChatworkMessage(`🎉 ${user.display_name} が新規アポを獲得！ (+${xp}XP)`);
+
+      // イベントログ
+      appendJsonl(
+        path.resolve(process.cwd(), "data/events/hubspot_appointments.jsonl"),
+        {
+          type: "new_appointment",
+          owner_id: ownerId,
+          canonical_user_id: user.canonical_user_id,
+          display_name: user.display_name,
+          disposition,
+          occurred_at: dayjs(Number(ts)).toISOString(),
+          object_id: objectId,
+        }
+      );
     }
   }
-  res.status(200).send("OK");
+
+  return res.status(200).send("OK");
 }
 
-/** Zoom Phone Webhook ハンドラ */
+/** Zoom Phone Webhook（架電/通話時間） */
 export async function handleZoomWebhook(req: Request, res: Response) {
-  if (ZOOM_SECRET && !validateZoom(req)) {
-    return res.status(401).send("Invalid signature");
-  }
+  if (!validateZoom(req)) return res.status(401).send("Invalid signature");
+
   const { event, payload } = req.body || {};
   if (event !== "call.ended") return res.status(200).send("Ignored");
 
   const call = payload?.object || {};
-  const callId = String(call.call_id);
-  if (isProcessed(callId)) {
-    return res.status(200).send("Duplicate");
-  }
+  const callId = String(call.call_id || "");
+  if (!callId) return res.status(400).send("No call_id");
+
+  if (isProcessed(callId)) return res.status(200).send("Duplicate");
   markProcessed(callId);
 
-  const userId = call.user_id;
-  const direction = call.direction;
-  const durationSec = Number(call.duration || 0);
-  if (direction !== "outbound") {
-    return res.status(200).send("OK");
-  }
   const { byZoom } = buildUserLookup();
-  const user = byZoom[userId];
+  const user = byZoom[String(call.user_id || "")];
   if (!user) {
-    console.warn("Unknown Zoom user:", userId);
+    console.warn("[Zoom] unknown user_id:", call.user_id);
     return res.status(200).send("Unknown user");
   }
-  const calls = 1;
+
+  if (String(call.direction) !== "outbound") {
+    return res.status(200).send("OK"); // 受電は対象外
+  }
+
+  const durationSec = Number(call.duration || 0);
   const minutes = Math.floor(durationSec / 60);
+  const calls = 1;
+
   const cred: HabiticaCred = { userId: user.habitica_user_id, apiToken: user.habitica_api_token };
   await addXpForKpi(cred, calls, minutes, 5);
-  res.status(200).send("OK");
+
+  // イベントログ
+  appendJsonl(
+    path.resolve(process.cwd(), "data/events/zoom_calls.jsonl"),
+    {
+      type: "outbound_call",
+      zoom_user_id: call.user_id,
+      canonical_user_id: user.canonical_user_id,
+      display_name: user.display_name,
+      call_id: callId,
+      duration_sec: durationSec,
+      end_time: call.end_time || null
+    }
+  );
+
+  return res.status(200).send("OK");
 }

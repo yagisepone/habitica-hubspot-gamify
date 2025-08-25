@@ -1,9 +1,11 @@
 import "dotenv/config";
-import express from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import fs from "fs";
 import path from "path";
 import dayjs from "dayjs";
+import { handleHubspotWebhook, handleZoomWebhook } from "../handlers/webhooks";
 
+// ===== 型定義 =====
 type ByDateEntry = { calls: number; minutes: number; deals?: number; deltaPt: number };
 type MemberState = { totalPt: number; streakDays: number; lastDate?: string; lastTitle?: string };
 type StateShape = {
@@ -18,22 +20,32 @@ type Member = {
   email?: string;
 };
 
+// ===== 基本設定 =====
 export const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
-// ---- Basic認証（テスト時は無効化可能）----
+// Basic認証（テスト時は .env の BASIC_AUTH_DISABLE=true で無効化可）
 const BASIC_USER = process.env.BASIC_USER;
 const BASIC_PASS = process.env.BASIC_PASS;
 const DISABLE_BASIC =
   process.env.BASIC_AUTH_DISABLE === "true" || process.env.NODE_ENV === "test";
 
-function unauthorized(res: import("express").Response) {
+// 署名検証で使う rawBody を確保（handlers で使用）
+app.use(
+  express.json({
+    verify: (req: Request & { rawBody?: string }, _res: Response, buf: Buffer) => {
+      req.rawBody = buf.toString();
+    },
+  })
+);
+
+function unauthorized(res: Response) {
   res.set("WWW-Authenticate", 'Basic realm="dashboard"');
   return res.status(401).send("Auth required");
 }
 
 if (BASIC_USER && BASIC_PASS && !DISABLE_BASIC) {
-  app.use((req, res, next) => {
+  app.use((req: Request, res: Response, next: NextFunction) => {
     const hdr = req.headers.authorization || "";
     if (!hdr.startsWith("Basic ")) return unauthorized(res);
     const creds = Buffer.from(hdr.slice(6), "base64").toString().split(":");
@@ -41,11 +53,11 @@ if (BASIC_USER && BASIC_PASS && !DISABLE_BASIC) {
     return unauthorized(res);
   });
 }
-// ---- /Basic認証 ----
 
+// レポートファイルを配信
 app.use("/reports", express.static(path.resolve(process.cwd(), "reports")));
-app.use(express.json({ verify: (req: any, _res, buf) => { req.rawBody = buf.toString(); } }));
 
+// ===== ユーティリティ =====
 function loadState(): StateShape {
   const p = path.resolve(process.cwd(), "data/state.json");
   if (!fs.existsSync(p)) return { byDate: {}, byMember: {} };
@@ -59,7 +71,6 @@ function loadState(): StateShape {
 }
 
 function loadMembers(): Member[] {
-  // 互換: config/members.json を読み込む
   const p = path.resolve(process.cwd(), "config/members.json");
   if (!fs.existsSync(p)) return [];
   try {
@@ -146,15 +157,21 @@ function buildHtml(opts: {
 </body></html>`;
 }
 
+// ===== API =====
+
 // health
-app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
-app.get("/healthz", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+app.get("/healthz", (_req: Request, res: Response) => res.status(200).send("OK"));
 
 // state JSON
-app.get("/api/state", (_req, res) => res.json(loadState()));
+app.get("/api/state", (_req: Request, res: Response) => {
+  res.json(loadState());
+});
 
-// 最新日
-app.get("/", (_req, res) => {
+// 最新日（ダッシュボード）
+app.get("/", (_req: Request, res: Response) => {
   const state = loadState();
   const members = loadMembers();
   const dates = datesDesc(state);
@@ -167,10 +184,10 @@ app.get("/", (_req, res) => {
       const v = day[ownerId];
       return {
         name: m?.name || ownerId,
-        calls: v.calls || 0,
-        minutes: v.minutes || 0,
-        deals: v.deals || 0,
-        deltaPt: v.deltaPt || 0,
+        calls: v?.calls || 0,
+        minutes: v?.minutes || 0,
+        deals: v?.deals || 0,
+        deltaPt: v?.deltaPt || 0,
         totalPt: ms.totalPt || 0,
         title: ms.lastTitle || "",
         streakDays: ms.streakDays || 0
@@ -181,7 +198,7 @@ app.get("/", (_req, res) => {
 });
 
 // 日付指定
-app.get("/day", (req, res) => {
+app.get("/day", (req: Request, res: Response) => {
   const q = (req.query.d as string) || "";
   const state = loadState();
   const members = loadMembers();
@@ -195,10 +212,10 @@ app.get("/day", (req, res) => {
       const v = day[ownerId];
       return {
         name: m?.name || ownerId,
-        calls: v.calls || 0,
-        minutes: v.minutes || 0,
-        deals: v.deals || 0,
-        deltaPt: v.deltaPt || 0,
+        calls: v?.calls || 0,
+        minutes: v?.minutes || 0,
+        deals: v?.deals || 0,
+        deltaPt: v?.deltaPt || 0,
         totalPt: ms.totalPt || 0,
         title: ms.lastTitle || "",
         streakDays: ms.streakDays || 0
@@ -208,7 +225,11 @@ app.get("/day", (req, res) => {
   res.send(buildHtml({ title: `Dashboard ${date}`, date, rows, dates }));
 });
 
-// ====== 起動関数 ======
+// Webhook 受け口（仕様どおり）
+app.post("/webhooks/hubspot", handleHubspotWebhook);
+app.post("/webhooks/zoom", handleZoomWebhook);
+
+// ===== 起動制御 =====
 export function start() {
   const server = app.listen(PORT, () => {
     console.log(`[web] listening on http://localhost:${PORT}`);
@@ -216,7 +237,6 @@ export function start() {
   return server;
 }
 
-// 直接起動時のみ立ち上げ（Jest/テストでは起動しない）
 const isJest = Boolean(process.env.JEST_WORKER_ID);
 if (!isJest && process.env.NODE_ENV !== "test" && require.main === module) {
   start();

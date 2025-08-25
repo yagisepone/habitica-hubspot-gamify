@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import yaml from "js-yaml";
 
-interface UserEntry {
+export interface UserEntry {
   canonical_user_id: string;
   display_name: string;
   zoom_user_id?: string;
@@ -13,7 +13,7 @@ interface UserEntry {
   chatwork_mention?: string;
 }
 
-/** users.yml を読み込んで配列で返す */
+/** users.yml を読み込む */
 export function loadUsers(): UserEntry[] {
   const p = path.resolve(process.cwd(), "config/users.yml");
   const raw = fs.readFileSync(p, "utf-8");
@@ -28,8 +28,8 @@ export function buildUserLookup() {
   const byCanonical: Record<string, UserEntry> = {};
   for (const u of users) {
     byCanonical[u.canonical_user_id] = u;
-    if (u.zoom_user_id) byZoom[u.zoom_user_id] = u;
+    if (u.zoom_user_id) byZoom[String(u.zoom_user_id)] = u;
     if (u.hubspot_owner_id) byHubSpot[String(u.hubspot_owner_id)] = u;
   }
-  return { byZoom, byHubSpot, byCanonical };
+  return { byZoom, byHubSpot, byCanonical, users };
 }
