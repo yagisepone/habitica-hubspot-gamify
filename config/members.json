@@ -1,16 +1,4 @@
-[
-  {
-    "name": "福田",
-    "email": "fukuda@example.com",
-    "active": true,
-
-    "hubspotOwnerId": "owner-123",
-    "hubspotEmail": "fukuda@example.com",
-
-    "habiticaUserId": null,
-    "habiticaApiToken": null,
-
-    "chatworkAccountId": null,
-    "zoomEmail": "fukuda@example.com"
-  }
-]
+{
+  "123456": "佐藤 太郎",
+  "789012": "鈴木 花子"
+}

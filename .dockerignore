@@ -1,0 +1,27 @@
+# Git / エディタ
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+
+# Node系
+node_modules
+npm-debug.log
+coverage
+
+# ビルド成果物（将来 tsc で dist 出す場合）
+dist
+
+# ランタイム出力はイメージに含めない（ホストにマウント）
+data
+reports
+logs
+tmp
+
+# 秘密情報
+.env
+
+# 機密を含む可能性が高い設定はビルドに含めない
+# （docker-compose で ./config を /app/config:ro にマウントする前提）
+config

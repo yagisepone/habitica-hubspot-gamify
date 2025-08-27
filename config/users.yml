@@ -1,19 +1,8 @@
-# Zoom・HubSpot・Habitica・Chatwork のIDを一元管理する台帳
-# canonical_user_id は好きなIDで良いですが、他サービスのID変更時もここだけ更新すれば良くなります。
-- canonical_user_id: u001
-  display_name: 山田太郎
-  zoom_user_id: ZOOM_USER_ID_001          # Zoom Webhook payload の user_id
-  hubspot_owner_id: 123456                # HubSpot の所有者ID
-  habitica_user_id: HABITICA_UID_001
-  habitica_api_token: HABITICA_TOKEN_001
-  chatwork_account_id: 7890123
-  chatwork_mention: "[To:7890123] 山田太郎"
+members:
+  - key: sato
+    name: 福田悠人
+    hubspot_owner_id: "123456"   # 文字列で
+    habitica_user_id: "2a5376b2-f44b-498d-88ed-29cebf1c3193"
+    habitica_api_token: "a7e14b60-cf8e-4c5c-b423-a38a6438fd2e"
 
-- canonical_user_id: u002
-  display_name: 佐藤花子
-  zoom_user_id: ZOOM_USER_ID_002
-  hubspot_owner_id: 654321
-  habitica_user_id: HABITICA_UID_002
-  habitica_api_token: HABITICA_TOKEN_002
-  chatwork_account_id: 7890456
-  chatwork_mention: "[To:7890456] 佐藤花子"
+

@@ -1,243 +1,133 @@
+// src/web/server.ts
 import "dotenv/config";
-import express, { type Request, type Response, type NextFunction } from "express";
 import fs from "fs";
 import path from "path";
-import dayjs from "dayjs";
-import { handleHubspotWebhook, handleZoomWebhook } from "../handlers/webhooks";
+import express, { Request, Response, NextFunction } from "express";
+import { rawBodySaver, requireZoomSignature } from "./server/zoomAuth";
 
-// ===== 型定義 =====
-type ByDateEntry = { calls: number; minutes: number; deals?: number; deltaPt: number };
-type MemberState = { totalPt: number; streakDays: number; lastDate?: string; lastTitle?: string };
-type StateShape = {
-  byDate: Record<string, Record<string, ByDateEntry>>;
-  byMember: Record<string, MemberState>;
-};
-type Member = {
-  name: string;
-  hubspotOwnerId: string;
-  habiticaUserId?: string;
-  habiticaApiToken?: string;
-  email?: string;
-};
+// ──────────────────────────────────────────────────────────────
+// 基本設定
+// ──────────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT || 3000);
+const TZ = process.env.TZ || "Asia/Tokyo";
 
-// ===== 基本設定 =====
-export const app = express();
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+// 基本認証（UI保護用）
+const BASIC_USER = process.env.BASIC_USER || "";
+const BASIC_PASS = process.env.BASIC_PASS || "";
 
-// Basic認証（テスト時は .env の BASIC_AUTH_DISABLE=true で無効化可）
-const BASIC_USER = process.env.BASIC_USER;
-const BASIC_PASS = process.env.BASIC_PASS;
-const DISABLE_BASIC =
-  process.env.BASIC_AUTH_DISABLE === "true" || process.env.NODE_ENV === "test";
+// データ置き場（イベント保存など）
+const DATA_DIR = path.join(process.cwd(), "data");
+const EVENTS_DIR = path.join(DATA_DIR, "events");
+fs.mkdirSync(EVENTS_DIR, { recursive: true });
 
-// 署名検証で使う rawBody を確保（handlers で使用）
-app.use(
-  express.json({
-    verify: (req: Request & { rawBody?: string }, _res: Response, buf: Buffer) => {
-      req.rawBody = buf.toString();
-    },
-  })
-);
+// ──────────────────────────────────────────────────────────────
+// アプリ初期化
+// ──────────────────────────────────────────────────────────────
+const app = express();
+app.set("trust proxy", true);
 
-function unauthorized(res: Response) {
-  res.set("WWW-Authenticate", 'Basic realm="dashboard"');
-  return res.status(401).send("Auth required");
-}
+// rawBody を保持しつつ JSON パース
+app.use(express.json({ verify: rawBodySaver }));
 
-if (BASIC_USER && BASIC_PASS && !DISABLE_BASIC) {
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    const hdr = req.headers.authorization || "";
-    if (!hdr.startsWith("Basic ")) return unauthorized(res);
-    const creds = Buffer.from(hdr.slice(6), "base64").toString().split(":");
-    if (creds[0] === BASIC_USER && creds[1] === BASIC_PASS) return next();
-    return unauthorized(res);
-  });
-}
+// 簡易ログ（必要に応じて morgan/pino へ）
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} from ${req.ip}`);
+  next();
+});
 
-// レポートファイルを配信
-app.use("/reports", express.static(path.resolve(process.cwd(), "reports")));
+// ──────────────────────────────────────────────────────────────
+// 公開エンドポイント（BASIC不要）
+// ──────────────────────────────────────────────────────────────
+app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, tz: TZ, now: new Date().toISOString() }));
 
-// ===== ユーティリティ =====
-function loadState(): StateShape {
-  const p = path.resolve(process.cwd(), "data/state.json");
-  if (!fs.existsSync(p)) return { byDate: {}, byMember: {} };
-  try {
-    const obj = JSON.parse(fs.readFileSync(p, "utf-8"));
-    if (obj.byDate && obj.byMember) return obj as StateShape;
-    return { byDate: {}, byMember: {} };
-  } catch {
-    return { byDate: {}, byMember: {} };
+app.get("/legal/privacy", (_req, res) => {
+  res.status(200).type("text/plain").send("Privacy Policy (placeholder).");
+});
+app.get("/legal/terms", (_req, res) => {
+  res.status(200).type("text/plain").send("Terms of Service (placeholder).");
+});
+app.get("/support", (_req, res) => {
+  res.status(200).type("text/plain").send("Support page (placeholder).");
+});
+
+// ──────────────────────────────────────────────────────────────
+// BASIC認証（UIのみ保護）
+//   - /webhooks/*, /healthz, /legal/*, /support は除外
+// ──────────────────────────────────────────────────────────────
+function uiBasicGuard(req: Request, res: Response, next: NextFunction) {
+  const open = [
+    /^\/webhooks\//,
+    /^\/healthz$/,
+    /^\/legal\/(privacy|terms)$/,
+    /^\/support$/,
+  ].some((r) => r.test(req.path));
+  if (open) return next();
+
+  if (!BASIC_USER || !BASIC_PASS) return next(); // 認証未設定なら素通り（運用では設定推奨）
+
+  const h = String(req.headers.authorization || "");
+  if (!h.startsWith("Basic ")) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Restricted"');
+    return res.status(401).send("Authentication required.");
   }
-}
+  const [, base64] = h.split(" ");
+  const decoded = Buffer.from(base64, "base64").toString("utf8");
+  const sep = decoded.indexOf(":");
+  const user = decoded.slice(0, sep);
+  const pass = decoded.slice(sep + 1);
 
-function loadMembers(): Member[] {
-  const p = path.resolve(process.cwd(), "config/members.json");
-  if (!fs.existsSync(p)) return [];
+  if (user === BASIC_USER && pass === BASIC_PASS) return next();
+
+  res.setHeader("WWW-Authenticate", 'Basic realm="Restricted"');
+  return res.status(401).send("Unauthorized");
+}
+app.use(uiBasicGuard);
+
+// ──────────────────────────────────────────────────────────────
+/** Webhook: Zoom（署名必須。URL検証イベントはこの中で200返却） */
+app.post("/webhooks/zoom", requireZoomSignature, (req: Request, res: Response) => {
+  // ここに本処理（例：イベントを JSONL に追記）
   try {
-    return JSON.parse(fs.readFileSync(p, "utf-8"));
-  } catch {
-    return [];
+    const line = JSON.stringify({ received_at: new Date().toISOString(), ...req.body }) + "\n";
+    fs.appendFileSync(path.join(EVENTS_DIR, "zoom_calls.jsonl"), line);
+  } catch (e) {
+    console.error("Failed to write event:", e);
   }
-}
-
-function datesDesc(state: StateShape): string[] {
-  return Object.keys(state.byDate).sort((a, b) => (a < b ? 1 : -1));
-}
-
-function buildHtml(opts: {
-  title: string;
-  date: string;
-  rows: Array<{
-    name: string;
-    calls: number;
-    minutes: number;
-    deals: number;
-    deltaPt: number;
-    totalPt: number;
-    title: string;
-    streakDays: number;
-  }>;
-  dates: string[];
-}) {
-  const css = `
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#0b1220;color:#e6edf3}
-  a{color:#9bdcff;text-decoration:none}
-  .wrap{max-width:1000px;margin:0 auto}
-  h1{font-size:20px;margin:0 0 12px}
-  .meta{display:flex;gap:8px;align-items:center;margin:0 0 16px}
-  select{background:#0b1a2a;color:#e6edf3;border:1px solid #294059;border-radius:8px;padding:6px 10px}
-  table{width:100%;border-collapse:collapse;background:#0b1a2a;border:1px solid #223b50;border-radius:10px;overflow:hidden}
-  th,td{padding:10px 12px;border-bottom:1px solid #223b50;text-align:right}
-  th:nth-child(1),td:nth-child(1){text-align:left}
-  tr:hover{background:#0e2134}
-  .badge{display:inline-block;background:#123e2b;border:1px solid #1a6d48;color:#b6ffd0;padding:2px 8px;border-radius:999px;font-size:12px}
-  .footer{margin-top:12px;color:#9fb3c8;font-size:12px}
-  `;
-  const dateOptions = opts.dates
-    .map((d) => `<option value="${d}" ${d === opts.date ? "selected" : ""}>${d}</option>`)
-    .join("");
-  const rows = opts.rows
-    .map(
-      (r) => `
-    <tr>
-      <td>${r.name}</td>
-      <td>${r.calls.toLocaleString()}</td>
-      <td>${r.minutes.toLocaleString()}</td>
-      <td>${r.deals.toLocaleString()}</td>
-      <td>${r.deltaPt.toLocaleString()}</td>
-      <td>${r.totalPt.toLocaleString()}</td>
-      <td>${r.title}</td>
-      <td>${r.streakDays}</td>
-    </tr>`
-    )
-    .join("");
-
-  return `<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>${opts.title}</title><style>${css}</style></head>
-<body>
-<div class="wrap">
-  <h1>営業ゲーミフィケーション ダッシュボード</h1>
-  <div class="meta">
-    <form method="GET" action="/day">
-      <label for="d">日付</label>
-      <select id="d" name="d" onchange="this.form.submit()">${dateOptions}</select>
-    </form>
-    <span class="badge">レポート: <a href="/reports/${opts.date}.md" target="_blank">${opts.date}.md</a></span>
-  </div>
-  <table>
-    <thead><tr>
-      <th>メンバー</th><th>架電</th><th>通話(分)</th><th>成約</th>
-      <th>付与pt</th><th>累計pt</th><th>称号</th><th>連続日数</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>
-  <div class="footer">最終更新: ${new Date().toLocaleString("ja-JP")}</div>
-</div>
-</body></html>`;
-}
-
-// ===== API =====
-
-// health
-app.get("/health", (_req: Request, res: Response) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
-app.get("/healthz", (_req: Request, res: Response) => res.status(200).send("OK"));
-
-// state JSON
-app.get("/api/state", (_req: Request, res: Response) => {
-  res.json(loadState());
+  return res.status(200).json({ ok: true });
 });
 
-// 最新日（ダッシュボード）
-app.get("/", (_req: Request, res: Response) => {
-  const state = loadState();
-  const members = loadMembers();
-  const dates = datesDesc(state);
-  const date = dates[0] || dayjs().format("YYYY-MM-DD");
-  const day = state.byDate[date] || {};
-  const rows = Object.keys(day)
-    .map((ownerId) => {
-      const m = members.find((x) => x.hubspotOwnerId === ownerId);
-      const ms = state.byMember[ownerId] || { totalPt: 0, streakDays: 0, lastTitle: "" };
-      const v = day[ownerId];
-      return {
-        name: m?.name || ownerId,
-        calls: v?.calls || 0,
-        minutes: v?.minutes || 0,
-        deals: v?.deals || 0,
-        deltaPt: v?.deltaPt || 0,
-        totalPt: ms.totalPt || 0,
-        title: ms.lastTitle || "",
-        streakDays: ms.streakDays || 0
-      };
-    })
-    .sort((a, b) => b.totalPt - a.totalPt);
-  res.send(buildHtml({ title: "Dashboard", date, rows, dates }));
+// ──────────────────────────────────────────────────────────────
+// UIルート（ダッシュボード等）。必要に応じて静的 or SSR を配置。
+// ここでは簡易なプレースホルダを返却。
+// ──────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => {
+  res.status(200).type("text/html").send(`<!doctype html>
+<html lang="ja"><meta charset="utf-8">
+<title>Gamify Dashboard</title>
+<body style="font-family:system-ui;padding:24px">
+  <h1>Gamify Dashboard</h1>
+  <p>Server time: ${new Date().toLocaleString("ja-JP", { timeZone: TZ })}</p>
+  <ul>
+    <li><a href="/healthz">/healthz</a></li>
+    <li><a href="/support">/support</a></li>
+    <li><a href="/legal/privacy">/legal/privacy</a></li>
+    <li><a href="/legal/terms">/legal/terms</a></li>
+  </ul>
+</body></html>`);
 });
 
-// 日付指定
-app.get("/day", (req: Request, res: Response) => {
-  const q = (req.query.d as string) || "";
-  const state = loadState();
-  const members = loadMembers();
-  const dates = datesDesc(state);
-  const date = dates.includes(q) ? q : dates[0] || dayjs().format("YYYY-MM-DD");
-  const day = state.byDate[date] || {};
-  const rows = Object.keys(day)
-    .map((ownerId) => {
-      const m = members.find((x) => x.hubspotOwnerId === ownerId);
-      const ms = state.byMember[ownerId] || { totalPt: 0, streakDays: 0, lastTitle: "" };
-      const v = day[ownerId];
-      return {
-        name: m?.name || ownerId,
-        calls: v?.calls || 0,
-        minutes: v?.minutes || 0,
-        deals: v?.deals || 0,
-        deltaPt: v?.deltaPt || 0,
-        totalPt: ms.totalPt || 0,
-        title: ms.lastTitle || "",
-        streakDays: ms.streakDays || 0
-      };
-    })
-    .sort((a, b) => b.totalPt - a.totalPt);
-  res.send(buildHtml({ title: `Dashboard ${date}`, date, rows, dates }));
+// ──────────────────────────────────────────────────────────────
+// 404 / エラーハンドラ
+// ──────────────────────────────────────────────────────────────
+app.use((_req, res) => res.status(404).json({ error: "not_found" }));
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "internal_error" });
 });
 
-// Webhook 受け口（仕様どおり）
-app.post("/webhooks/hubspot", handleHubspotWebhook);
-app.post("/webhooks/zoom", handleZoomWebhook);
-
-// ===== 起動制御 =====
-export function start() {
-  const server = app.listen(PORT, () => {
-    console.log(`[web] listening on http://localhost:${PORT}`);
-  });
-  return server;
-}
-
-const isJest = Boolean(process.env.JEST_WORKER_ID);
-if (!isJest && process.env.NODE_ENV !== "test" && require.main === module) {
-  start();
-}
+// ──────────────────────────────────────────────────────────────
+// 起動
+// ──────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`🚀 gamify-web listening on :${PORT} (TZ=${TZ})`);
+});

@@ -1,31 +1,27 @@
 import fs from "fs";
 import path from "path";
 
-const filePath = path.resolve(process.cwd(), "data", "processed.json");
+const FILE = path.resolve("data/processed.json");
 
-type Store = Record<string, boolean>;
-
-function load(): Store {
+function load(): Record<string, boolean> {
   try {
-    if (!fs.existsSync(filePath)) return {};
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (!fs.existsSync(FILE)) return {};
+    return JSON.parse(fs.readFileSync(FILE, "utf-8"));
   } catch {
     return {};
   }
 }
-
-function save(store: Store) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(store, null, 2), "utf-8");
+function save(obj: Record<string, boolean>) {
+  fs.mkdirSync(path.dirname(FILE), { recursive: true });
+  fs.writeFileSync(FILE, JSON.stringify(obj, null, 2), "utf-8");
 }
 
-export function isProcessed(key: string) {
-  const s = load();
-  return !!s[key];
+export function isProcessed(key: string): boolean {
+  const m = load();
+  return Boolean(m[key]);
 }
-
 export function markProcessed(key: string) {
-  const s = load();
-  s[key] = true;
-  save(s);
+  const m = load();
+  m[key] = true;
+  save(m);
 }

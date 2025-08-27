@@ -1,151 +1,163 @@
-import { Request, Response } from "express";
+import express, { Request, Response } from "express";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import yaml from "js-yaml";
-import dayjs from "dayjs";
+import { RateLimiterMemory } from "rate-limiter-flexible";
 
-import { buildUserLookup } from "../utils/users";
-import { isProcessed, markProcessed } from "../utils/idempotency";
-import { sendChatworkMessage } from "../connectors/chatwork";
-import {
-  addXpForKpi,
-  addNewAppointment,
-  HabiticaCred,
-} from "../connectors/habitica";
+const router = express.Router();
 
+// ====== Settings ======
+const DATA_DIR = path.resolve("data");
+const EVENTS_DIR = path.join(DATA_DIR, "events");
 const HUBSPOT_SECRET = process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET || "";
 const ZOOM_SECRET = process.env.ZOOM_WEBHOOK_SECRET_TOKEN || "";
+const MOCK_MODE = (process.env.MOCK_MODE || "false").toLowerCase() === "true";
 
-const goals = yaml.load(
-  fs.readFileSync(path.resolve(process.cwd(), "config/goals.yml"), "utf-8")
-) as any;
+// 60 req/min
+const limiter = new RateLimiterMemory({ points: 60, duration: 60 });
 
-function ensureDir(p: string) {
-  fs.mkdirSync(p, { recursive: true });
+// Dedup (in-memory)
+const SEEN_MAX = 2000;
+const seen = new Map<string, number>();
+function dedupeKeyFor(provider: string, rawBody: Buffer, headerSig: string, extra?: string) {
+  const h = crypto.createHash("sha256");
+  h.update(provider);
+  h.update(headerSig || "");
+  if (extra) h.update(extra);
+  h.update(rawBody);
+  return h.digest("hex");
 }
-
-function appendJsonl(filePath: string, obj: any) {
-  ensureDir(path.dirname(filePath));
-  fs.appendFileSync(filePath, JSON.stringify(obj) + "\n", "utf-8");
-}
-
-function validateHubspot(req: Request): boolean {
-  if (!HUBSPOT_SECRET) return true;
-  const payload = (req as any).rawBody ?? JSON.stringify(req.body);
-  const digest = crypto.createHmac("sha256", HUBSPOT_SECRET).update(payload).digest("hex");
-  const signature = String(req.headers["x-hubspot-signature"] || "");
-  return digest === signature;
-}
-
-function validateZoom(req: Request): boolean {
-  if (!ZOOM_SECRET) return true;
-  const token = String(req.headers["x-zm-signature"] || "");
-  return token === ZOOM_SECRET;
-}
-
-/** HubSpot Webhook（新規アポ判定） */
-export async function handleHubspotWebhook(req: Request, res: Response) {
-  if (!validateHubspot(req)) return res.status(401).send("Invalid signature");
-
-  const event = req.body || {};
-  const objectId = String(event.objectId ?? event.eventId ?? "");
-  if (!objectId) return res.status(400).send("No objectId");
-
-  if (isProcessed(objectId)) return res.status(200).send("Duplicate");
-  markProcessed(objectId);
-
-  const { byHubSpot } = buildUserLookup();
-
-  if (event.subscriptionType === "engagement.created" && event.objectType === "CALL") {
-    const props = event.properties || {};
-    const disposition = String(props.hs_call_disposition ?? "");
-    const ownerId = String(props.hs_owner_id ?? "");
-    const ts = props.hs_timestamp || event.occurredAt || Date.now();
-
-    const user = byHubSpot[ownerId];
-    if (!user) {
-      console.warn("[HubSpot] unknown owner:", ownerId);
-      return res.status(200).send("Unknown owner");
-    }
-
-    const values = (process.env.HUBSPOT_NEW_APPOINT_VALUES || "新規アポ,Appointment Booked")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
-
-    if (values.includes(disposition)) {
-      const cred: HabiticaCred = { userId: user.habitica_user_id, apiToken: user.habitica_api_token };
-      await addNewAppointment(cred, 1);
-
-      // Chatwork通知
-      const xp = goals?.points?.new_appoint?.pt_per_unit ?? 20;
-      await sendChatworkMessage(`🎉 ${user.display_name} が新規アポを獲得！ (+${xp}XP)`);
-
-      // イベントログ
-      appendJsonl(
-        path.resolve(process.cwd(), "data/events/hubspot_appointments.jsonl"),
-        {
-          type: "new_appointment",
-          owner_id: ownerId,
-          canonical_user_id: user.canonical_user_id,
-          display_name: user.display_name,
-          disposition,
-          occurred_at: dayjs(Number(ts)).toISOString(),
-          object_id: objectId,
-        }
-      );
-    }
+function markSeen(key: string): boolean {
+  if (seen.has(key)) return true;
+  seen.set(key, Date.now());
+  if (seen.size > SEEN_MAX) {
+    const oldest = [...seen.entries()].sort((a, b) => a[1] - b[1]).slice(0, Math.max(0, seen.size - SEEN_MAX));
+    for (const [k] of oldest) seen.delete(k);
   }
-
-  return res.status(200).send("OK");
+  return false;
+}
+function safeEq(a: string, b: string) {
+  const ab = Buffer.from(a || "", "utf8");
+  const bb = Buffer.from(b || "", "utf8");
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
 }
 
-/** Zoom Phone Webhook（架電/通話時間） */
-export async function handleZoomWebhook(req: Request, res: Response) {
-  if (!validateZoom(req)) return res.status(401).send("Invalid signature");
-
-  const { event, payload } = req.body || {};
-  if (event !== "call.ended") return res.status(200).send("Ignored");
-
-  const call = payload?.object || {};
-  const callId = String(call.call_id || "");
-  if (!callId) return res.status(400).send("No call_id");
-
-  if (isProcessed(callId)) return res.status(200).send("Duplicate");
-  markProcessed(callId);
-
-  const { byZoom } = buildUserLookup();
-  const user = byZoom[String(call.user_id || "")];
-  if (!user) {
-    console.warn("[Zoom] unknown user_id:", call.user_id);
-    return res.status(200).send("Unknown user");
-  }
-
-  if (String(call.direction) !== "outbound") {
-    return res.status(200).send("OK"); // 受電は対象外
-  }
-
-  const durationSec = Number(call.duration || 0);
-  const minutes = Math.floor(durationSec / 60);
-  const calls = 1;
-
-  const cred: HabiticaCred = { userId: user.habitica_user_id, apiToken: user.habitica_api_token };
-  await addXpForKpi(cred, calls, minutes, 5);
-
-  // イベントログ
-  appendJsonl(
-    path.resolve(process.cwd(), "data/events/zoom_calls.jsonl"),
-    {
-      type: "outbound_call",
-      zoom_user_id: call.user_id,
-      canonical_user_id: user.canonical_user_id,
-      display_name: user.display_name,
-      call_id: callId,
-      duration_sec: durationSec,
-      end_time: call.end_time || null
-    }
-  );
-
-  return res.status(200).send("OK");
+function ensureDirs() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(EVENTS_DIR)) fs.mkdirSync(EVENTS_DIR, { recursive: true });
 }
+function appendJsonl(file: string, obj: any) {
+  fs.appendFileSync(file, JSON.stringify(obj) + "\n", { encoding: "utf8" });
+}
+
+// Raw body（server.ts 側で req.rawBody を設定している前提。無ければフォールバック）
+function getRawBody(req: any): Buffer {
+  if (req.rawBody && Buffer.isBuffer(req.rawBody)) return req.rawBody as Buffer;
+  return Buffer.from(JSON.stringify(req.body || {}), "utf8");
+}
+
+// ====== Signature Verifiers ======
+// HubSpot v3: base = `${method}${fullUrl}${body}` → HMAC-SHA256(secret) → base64
+function verifyHubSpotV3(req: Request, raw: Buffer) {
+  const sigHeader = req.get("X-HubSpot-Signature-v3") || "";
+  if (!HUBSPOT_SECRET) return false;
+  const method = (req.method || "POST").toUpperCase();
+  const host = req.get("x-forwarded-host") || req.get("host");
+  const proto = req.get("x-forwarded-proto") || req.protocol || "https";
+  const fullUrl = `${proto}://${host}${req.originalUrl}`;
+  const base = `${method}${fullUrl}${raw.toString("utf8")}`;
+  const mac = crypto.createHmac("sha256", HUBSPOT_SECRET).update(base).digest("base64");
+  return safeEq(mac, sigHeader);
+}
+
+// Zoom: 代表的な2方式を試行
+function verifyZoom(req: Request, raw: Buffer) {
+  const sigHeader = req.get("x-zm-signature") || "";
+  const ts = req.get("x-zm-request-timestamp") || "";
+  if (!ZOOM_SECRET || !sigHeader) return false;
+  const rawStr = raw.toString("utf8");
+  const try1 = crypto.createHmac("sha256", ZOOM_SECRET).update(`${ts}${rawStr}`).digest("base64");
+  if (safeEq(sigHeader, try1)) return true;
+  const try2 = crypto.createHmac("sha256", ZOOM_SECRET).update(`v0:${ts}:${rawStr}`).digest("base64");
+  if (safeEq(sigHeader, try2)) return true;
+  return false;
+}
+
+async function guardRate(_req: Request, res: Response) {
+  try {
+    await limiter.consume("webhooks");
+    return true;
+  } catch {
+    res.status(429).json({ ok: false, error: "rate_limited" });
+    return false;
+  }
+}
+
+// ====== Routes ======
+router.post("/hubspot", async (req: Request, res: Response) => {
+  if (!(await guardRate(req, res))) return;
+
+  const raw = getRawBody(req);
+  const ok = MOCK_MODE ? true : verifyHubSpotV3(req, raw);
+  if (!ok) return res.status(401).json({ ok: false, error: "invalid_signature" });
+
+  ensureDirs();
+  const now = new Date().toISOString();
+  const events = Array.isArray(req.body) ? req.body : [req.body];
+
+  let wrote = 0;
+  for (const ev of events) {
+    const evId: string =
+      ev?.eventId || ev?.id || crypto.createHash("sha256").update(JSON.stringify(ev)).digest("hex");
+    const key = dedupeKeyFor("hubspot", raw, req.get("X-HubSpot-Signature-v3") || "", evId);
+    if (markSeen(key)) continue;
+
+    const out = {
+      provider: "hubspot",
+      receivedAt: now,
+      eventId: evId,
+      payload: ev,
+      headers: { "x-hubspot-signature-v3": req.get("X-HubSpot-Signature-v3") },
+    };
+    appendJsonl(path.join(EVENTS_DIR, "hubspot.jsonl"), out);
+    wrote++;
+  }
+  res.json({ ok: true, wrote });
+});
+
+router.post("/zoom", async (req: Request, res: Response) => {
+  if (!(await guardRate(req, res))) return;
+
+  const raw = getRawBody(req);
+  const ok = MOCK_MODE ? true : verifyZoom(req, raw);
+  if (!ok) return res.status(401).json({ ok: false, error: "invalid_signature" });
+
+  ensureDirs();
+  const now = new Date().toISOString();
+  const ev = req.body || {};
+  const evId: string =
+    ev?.payload?.object?.uuid ||
+    ev?.event_ts?.toString?.() ||
+    crypto.createHash("sha256").update(JSON.stringify(ev)).digest("hex");
+
+  const key = dedupeKeyFor("zoom", raw, req.get("x-zm-signature") || "", evId);
+  if (!markSeen(key)) {
+    const out = {
+      provider: "zoom",
+      receivedAt: now,
+      eventId: evId,
+      payload: ev,
+      headers: {
+        "x-zm-signature": req.get("x-zm-signature"),
+        "x-zm-request-timestamp": req.get("x-zm-request-timestamp"),
+      },
+    };
+    appendJsonl(path.join(EVENTS_DIR, "zoom.jsonl"), out);
+    return res.json({ ok: true, wrote: 1 });
+  }
+  res.json({ ok: true, wrote: 0, deduped: true });
+});
+
+router.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+export default router;
