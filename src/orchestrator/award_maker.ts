@@ -1,8 +1,7 @@
-import { sendChatwork } from "../connectors/chatwork";
+import { sendChatworkMessage } from "../connectors/chatwork";
 import { createTodo, completeTask } from "../connectors/habitica";
 import { resolveHabiticaCred } from "../utils/users";
 import members from "../../config/members.json";
-
 /**
  * メーカー賞の授与演出
  * @param makerCounts 例: { "A社": 5, "B社": 3 }
@@ -20,12 +19,12 @@ export async function awardMakerPrize(
   const topOwnerIds = holders[topMaker] || [];
   const names = topOwnerIds.map(id => (members as any)[String(id)] || `Owner:${id}`).join(", ");
 
-  // Chatwork告知（任意）
+  // Chatwork告知（ゲートはコネクタ側で ENABLE_CHATWORK を参照）
   try {
-    await sendChatwork?.(
+    await sendChatworkMessage(
       `[info][title]🏆 ⚙メーカー賞 授与[/title]メーカー: ${topMaker}\n件数: ${topCount}\n受賞者: ${names}\n起点: 日次集計[/info]`
     );
-  } catch {/* noop */}
+  } catch { /* noop */ }
 
   // Habiticaで受賞演出（To-Do作成→即完了）
   for (const ownerId of topOwnerIds) {
