@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "start": "node dist/scheduler/cron.js",
+    "start": "node dist/web/server.js",
     "start:dev": "ts-node src/scheduler/cron.ts",
     "run:once": "ts-node src/orchestrator/index.ts",
     "run:once:dist": "node dist/orchestrator/index.js",
@@ -22,7 +22,8 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "members:sync": "ts-node tools/resolve_owner_ids.ts",
-    "members:sync:dist": "node dist/tools/resolve_owner_ids.js"
+    "members:sync:dist": "node dist/tools/resolve_owner_ids.js",
+    "start:cron": "node dist/scheduler/cron.js"
   },
   "keywords": [
     "habitica",
@@ -53,6 +54,7 @@
     "@types/jest": "^29.5.12",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.3.0",
+    "@types/node-cron": "^3.0.11",
     "@types/node-fetch": "^2.6.13",
     "@types/supertest": "^6.0.3",
     "jest": "^29.7.0",
