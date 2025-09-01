@@ -1,8 +1,9 @@
-members:
-  - key: sato
-    name: 福田悠人
-    hubspot_owner_id: "123456"   # 文字列で
-    habitica_user_id: "2a5376b2-f44b-498d-88ed-29cebf1c3193"
-    habitica_api_token: "a7e14b60-cf8e-4c5c-b423-a38a6438fd2e"
-
-
+- code: SELF
+  name: YUTO FUKUDA
+  hubspot:
+    email: "fukuda@wbisbi.co.jp"   
+  habitica:
+    user:   "${HABITICA_OWNER_ID}"
+    token:  "${HABITICA_API_TOKEN}"
+    client: "${HABITICA_X_CLIENT}"
+  chatwork_room_id: null

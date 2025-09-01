@@ -2,5 +2,12 @@
   "APC-1": true,
   "APO-1": true,
   "APO-2": true,
-  "APO-3": true
+  "APO-3": true,
+  "zoom:smoke": true,
+  "zoom:confirm": true,
+  "zoom:demo-call": true,
+  "apo:demo-apo-1": true,
+  "zoom:sigtest-1756299364": true,
+  "zoom:sigtest-1756355650": true,
+  "apo:888777": true
 }
