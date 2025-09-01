@@ -23,7 +23,9 @@
     "test:watch": "jest --watch",
     "members:sync": "ts-node tools/resolve_owner_ids.ts",
     "members:sync:dist": "node dist/tools/resolve_owner_ids.js",
-    "start:cron": "node dist/scheduler/cron.js"
+    "start:cron": "node dist/scheduler/cron.js",
+    "start:web": "node dist/web/server.js",
+    "start:both": "concurrently -k -n web,cron -c auto \"node dist/web/server.js\" \"node dist/scheduler/cron.js\""
   },
   "keywords": [
     "habitica",
@@ -38,6 +40,7 @@
   },
   "dependencies": {
     "axios": "^1.11.0",
+    "concurrently": "^9.2.1",
     "csv-parse": "^6.1.0",
     "dayjs": "^1.11.13",
     "dotenv": "^17.2.1",
