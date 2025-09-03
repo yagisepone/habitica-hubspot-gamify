@@ -1,145 +1,250 @@
-// src/web/server.ts
-import "dotenv/config";
-import fs from "fs";
-import path from "path";
-import express, { Request, Response, NextFunction } from "express";
-import { rawBodySaver, requireZoomSignature } from "./server/zoomAuth";
-import { registerWebhooks } from "../handlers/webhooks"; // ← HubSpot v3 受け口
+// server.ts  (place this as src/web/server.ts)
+import express, { Request, Response } from "express";
+import crypto from "crypto";
 
-// ──────────────────────────────────────────────────────────────
-// 基本設定
-// ──────────────────────────────────────────────────────────────
-const PORT = Number(process.env.PORT || 3000);
-const TZ = process.env.TZ || "Asia/Tokyo";
+/**
+ * habitica-hubspot-gamify / production server
+ *
+ * Routes
+ * - GET  /healthz            : liveness
+ * - GET  /support            : placeholder page (OK to keep)
+ * - GET  /oauth/callback     : HubSpot OAuth token exchange (permanent fix)
+ * - POST /webhooks/hubspot   : HubSpot Webhooks v3 (signature required)
+ * - GET  /debug/last         : last webhook + oauth status (Bearer required)
+ *
+ * Required ENVs (Render → Environment):
+ *   PORT=10000
+ *   TZ=Asia/Tokyo
+ *   AUTH_TOKEN=your-long-random-token
+ *
+ *   // for signature verification (App Secret)
+ *   HUBSPOT_WEBHOOK_SIGNING_SECRET=<App Secret>
+ *   // for OAuth token exchange
+ *   HUBSPOT_CLIENT_ID=<Client ID>
+ *   HUBSPOT_APP_SECRET=<App Secret>
+ *   // (your project currently uses HUBSPOT_CLIENT_SECRET; we accept both)
+ *   HUBSPOT_CLIENT_SECRET=<App Secret>
+ *
+ *   // redirect URI registered in HubSpot app (Auth → Redirect URL)
+ *   HUBSPOT_REDIRECT_URI=https://sales-gamify.onrender.com/oauth/callback
+ *
+ * Notes:
+ * - Node 18+ (global fetch available)
+ * - HubSpot v3 signature = HMAC-SHA256(base64) of:
+ *     METHOD + requestUri + body + x-hubspot-request-timestamp
+ */
 
-// 基本認証（UI保護用）
-const BASIC_USER = process.env.BASIC_USER || "";
-const BASIC_PASS = process.env.BASIC_PASS || "";
-
-// データ置き場（イベント保存など）
-const DATA_DIR = path.join(process.cwd(), "data");
-const EVENTS_DIR = path.join(DATA_DIR, "events");
-fs.mkdirSync(EVENTS_DIR, { recursive: true });
-
-// ──────────────────────────────────────────────────────────────
-// アプリ初期化
-// ──────────────────────────────────────────────────────────────
 const app = express();
+app.set("x-powered-by", false);
 app.set("trust proxy", true);
 
-// ★ HubSpot v3 署名で必要な「生文字列」を保持しつつ JSON パース
-//   zoomAuth の rawBodySaver は (req, _res, buf) => { req.rawBody = buf.toString("utf8"); } を想定
-app.use(express.json({ verify: rawBodySaver }));
+// ===== env =====
+const PORT = Number(process.env.PORT || 10000);
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 
-// 簡易アクセスログ（必要に応じて morgan/pino に置換可）
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} from ${req.ip}`);
-  next();
-});
+// signature secret (prefer dedicated var, but fall back to App Secret if needed)
+const WEBHOOK_SECRET =
+  process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET ||
+  process.env.HUBSPOT_APP_SECRET ||
+  process.env.HUBSPOT_CLIENT_SECRET ||
+  "";
 
-// ──────────────────────────────────────────────────────────────
-// 公開エンドポイント（BASIC不要）
-// ──────────────────────────────────────────────────────────────
-app.get("/healthz", (_req, res) =>
-  res.status(200).json({ ok: true, tz: TZ, now: new Date().toISOString() })
+// OAuth envs (accept both *_APP_SECRET and *_CLIENT_SECRET)
+const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
+const HUBSPOT_APP_SECRET =
+  process.env.HUBSPOT_APP_SECRET || process.env.HUBSPOT_CLIENT_SECRET || "";
+
+const HUBSPOT_REDIRECT_URI =
+  process.env.HUBSPOT_REDIRECT_URI ||
+  "https://sales-gamify.onrender.com/oauth/callback";
+
+// ===== raw body capture for signature =====
+app.use(
+  express.json({
+    verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
+      (req as any).rawBody = Buffer.from(buf);
+    },
+  })
 );
 
-app.get("/legal/privacy", (_req, res) => {
-  res.status(200).type("text/plain").send("Privacy Policy (placeholder).");
-});
-app.get("/legal/terms", (_req, res) => {
-  res.status(200).type("text/plain").send("Terms of Service (placeholder).");
-});
-app.get("/support", (_req, res) => {
-  res.status(200).type("text/plain").send("Support page (placeholder).");
-});
-
-// ──────────────────────────────────────────────────────────────
-// BASIC認証（UIのみ保護）
-//   - /webhooks/*, /healthz, /legal/*, /support は除外
-// ──────────────────────────────────────────────────────────────
-function uiBasicGuard(req: Request, res: Response, next: NextFunction) {
-  const open = [/^\/webhooks\//, /^\/healthz$/, /^\/legal\/(privacy|terms)$/, /^\/support$/].some((r) =>
-    r.test(req.path)
-  );
-  if (open) return next();
-
-  if (!BASIC_USER || !BASIC_PASS) return next(); // 認証未設定なら素通り（運用では設定推奨）
-
-  const h = String(req.headers.authorization || "");
-  if (!h.startsWith("Basic ")) {
-    res.setHeader("WWW-Authenticate", 'Basic realm="Restricted"');
-    return res.status(401).send("Authentication required.");
-  }
-  const [, base64] = h.split(" ");
-  const decoded = Buffer.from(base64, "base64").toString("utf8");
-  const sep = decoded.indexOf(":");
-  const user = decoded.slice(0, sep);
-  const pass = decoded.slice(sep + 1);
-
-  if (user === BASIC_USER && pass === BASIC_PASS) return next();
-
-  res.setHeader("WWW-Authenticate", 'Basic realm="Restricted"');
-  return res.status(401).send("Unauthorized");
+// ===== in-memory stores (replace with DB in production if needed) =====
+interface LastEvent {
+  at?: string;
+  path?: string;
+  verified?: boolean;
+  note?: string;
+  headers?: Record<string, string | undefined>;
+  body?: any;
 }
-app.use(uiBasicGuard);
+const lastEvent: LastEvent = {};
 
-// ──────────────────────────────────────────────────────────────
-// Webhooks（BASIC不要）
-// ──────────────────────────────────────────────────────────────
+interface OAuthState {
+  at?: string;
+  hub_id?: number;
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+}
+const oauth: OAuthState = {};
 
-// ✅ HubSpot Webhook v3（Developer App / Client secret & Private App / signing secret 両対応）
-//   実体は ../handlers/webhooks.ts の handleHubSpotWebhook に実装。
-//   署名計算は (method + uri + body + timestamp) を HMAC-SHA256(secret)→Base64。
-//   secret は HUBSPOT_WEBHOOK_SIGNING_SECRET が無ければ HUBSPOT_CLIENT_SECRET を使用。
-registerWebhooks(app);
-console.log("[web] webhook-ready (HubSpot v3, rawBody on)");
+function log(...args: any[]) {
+  console.log("[web]", ...args);
+}
 
-// ✅ Zoom Webhook（既存：署名必須）
-app.post("/webhooks/zoom", requireZoomSignature, (req: Request, res: Response) => {
-  try {
-    const line = JSON.stringify({ received_at: new Date().toISOString(), ...req.body }) + "\n";
-    fs.appendFileSync(path.join(EVENTS_DIR, "zoom_calls.jsonl"), line);
-  } catch (e) {
-    console.error("Failed to write event:", e);
+function requireBearer(req: Request, res: Response): boolean {
+  const auth = req.header("authorization") || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  if (!AUTH_TOKEN) {
+    res.status(500).json({ ok: false, error: "Server missing AUTH_TOKEN" });
+    return false;
   }
-  return res.status(200).json({ ok: true });
+  if (token !== AUTH_TOKEN) {
+    res.status(401).json({ ok: false, error: "Authentication required" });
+    return false;
+  }
+  return true;
+}
+
+function record(
+  req: Request & { rawBody?: Buffer },
+  verified: boolean,
+  note: string
+) {
+  lastEvent.at = new Date().toISOString();
+  lastEvent.path = req.originalUrl;
+  lastEvent.verified = verified;
+  lastEvent.note = note;
+  lastEvent.headers = {
+    "x-hubspot-signature-v3": req.header("x-hubspot-signature-v3") || undefined,
+    "x-hubspot-request-timestamp":
+      req.header("x-hubspot-request-timestamp") || undefined,
+    "content-type": req.header("content-type") || undefined,
+    "user-agent": req.header("user-agent") || undefined,
+  };
+  lastEvent.body = (req as any).body;
+  log(`received path=${req.originalUrl} verified=${verified} note=${note}`);
+}
+
+function safeTimingEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+/** HubSpot Webhook v3 signature verify */
+function verifyHubSpotV3(
+  req: Request & { rawBody?: Buffer },
+  appSecret: string
+): boolean {
+  if (!appSecret) return false;
+  const sig = req.header("x-hubspot-signature-v3") || "";
+  const ts = req.header("x-hubspot-request-timestamp") || "";
+  if (!sig || !ts) return false;
+
+  const method = req.method.toUpperCase();
+  const requestUri = req.originalUrl; // e.g. /webhooks/hubspot?foo=1
+  const body = (req.rawBody || Buffer.from("")).toString("utf8");
+  const base = method + requestUri + body + ts;
+  const digest = crypto.createHmac("sha256", appSecret).update(base).digest("base64");
+  return safeTimingEqual(digest, sig);
+}
+
+// ===== routes =====
+app.get("/healthz", (_req, res) => {
+  res.json({ ok: true, tz: process.env.TZ || "Asia/Tokyo", now: new Date().toISOString() });
 });
 
-// ──────────────────────────────────────────────────────────────
-// UIルート（ダッシュボード等）
-// ──────────────────────────────────────────────────────────────
-app.get("/", (_req, res) => {
-  res
-    .status(200)
-    .type("text/html")
-    .send(`<!doctype html>
-<html lang="ja"><meta charset="utf-8">
-<title>Gamify Dashboard</title>
-<body style="font-family:system-ui;padding:24px">
-  <h1>Gamify Dashboard</h1>
-  <p>Server time: ${new Date().toLocaleString("ja-JP", { timeZone: TZ })}</p>
-  <ul>
-    <li><a href="/healthz">/healthz</a></li>
-    <li><a href="/support">/support</a></li>
-    <li><a href="/legal/privacy">/legal/privacy</a></li>
-    <li><a href="/legal/terms">/legal/terms</a></li>
-  </ul>
-</body></html>`);
+// keep existing placeholder
+app.get("/support", (_req, res) => {
+  res.type("text/plain").send("Support page (placeholder).");
 });
 
-// ──────────────────────────────────────────────────────────────
-// 404 / エラーハンドラ
-// ──────────────────────────────────────────────────────────────
-app.use((_req, res) => res.status(404).json({ error: "not_found" }));
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({ error: "internal_error" });
+// OAuth callback: code -> token exchange
+app.get("/oauth/callback", async (req: Request, res: Response) => {
+  const code = String(req.query.code || "");
+  if (!code) return res.status(400).type("text/plain").send("missing code");
+  if (!HUBSPOT_CLIENT_ID || !HUBSPOT_APP_SECRET) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("server missing HUBSPOT_CLIENT_ID/HUBSPOT_APP_SECRET");
+  }
+
+  try {
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: HUBSPOT_CLIENT_ID,
+      client_secret: HUBSPOT_APP_SECRET,
+      redirect_uri: HUBSPOT_REDIRECT_URI,
+      code,
+    });
+
+    const r = await fetch("https://api.hubapi.com/oauth/v1/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+
+    const json = await r.json();
+    if (!r.ok) {
+      console.error("[oauth] token exchange failed:", json);
+      return res.status(502).type("text/plain").send("token exchange failed");
+    }
+
+    // store in memory (replace with DB if you need persistence)
+    oauth.at = new Date().toISOString();
+    oauth.hub_id = json.hub_id;
+    oauth.access_token = json.access_token;
+    oauth.refresh_token = json.refresh_token;
+    oauth.expires_in = json.expires_in;
+
+    console.log("[oauth] token exchange ok hub_id=", json.hub_id);
+    res
+      .type("text/plain")
+      .send("Connected! You can close this window. (OAuth token issued)");
+  } catch (e) {
+    console.error(e);
+    res.status(500).type("text/plain").send("token exchange error");
+  }
 });
 
-// ──────────────────────────────────────────────────────────────
-// 起動
-// ──────────────────────────────────────────────────────────────
+// Webhook endpoint (signature required)
+app.post(
+  "/webhooks/hubspot",
+  (req: Request & { rawBody?: Buffer }, res: Response) => {
+    const ok = verifyHubSpotV3(req, WEBHOOK_SECRET);
+    if (!ok) {
+      record(req, false, "invalid-signature");
+      return res.status(401).json({ ok: false, error: "invalid signature" });
+    }
+
+    // TODO: call your real handler here (Habitica/Chatwork etc.)
+    // handleHubSpotEvents(req.body)
+
+    record(req, true, "hubspot-event");
+    const received = Array.isArray(req.body) ? req.body.length : 1;
+    res.json({ ok: true, received });
+  }
+);
+
+// Debug endpoint (Bearer required)
+app.get("/debug/last", (req: Request, res: Response) => {
+  if (!requireBearer(req, res)) return;
+  if (!lastEvent.at && !oauth.at) {
+    return res.status(404).json({ ok: false, error: "not_found" });
+  }
+  res.json({
+    ok: true,
+    last_event: lastEvent.at ? lastEvent : null,
+    oauth_status: oauth.at
+      ? { at: oauth.at, hub_id: oauth.hub_id, has_access_token: !!oauth.access_token }
+      : null,
+  });
+});
+
+// boot
 app.listen(PORT, () => {
-  console.log(`🚀 gamify-web listening on :${PORT} (TZ=${TZ})`);
+  log(`gamify-web listening on :${PORT} (TZ=${process.env.TZ || "Asia/Tokyo"})`);
+  log(`webhook-ready (HubSpot v3, rawBody on, redirect=${HUBSPOT_REDIRECT_URI})`);
 });
