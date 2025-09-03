@@ -10,7 +10,7 @@ import { handleHubSpotWebhook } from "../handlers/webhooks";
  * - GET  /healthz
  * - GET  /support
  * - GET  /oauth/callback
- * - POST /webhooks/hubspot   (v3 signature required; verified here → 本体ハンドラへ委譲)
+ * - POST /webhooks/hubspot   (v3 signature required; verified here → handlerへ委譲)
  * - GET  /debug/last         (Bearer required)
  */
 
@@ -22,14 +22,14 @@ app.set("trust proxy", true);
 const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 
-// signature secret (prefer dedicated var, but fall back to App Secret if needed)
+// signature secret（Private App の Signing Secret があれば優先。なければ App Secret を使用）
 const WEBHOOK_SECRET =
   process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET ||
   process.env.HUBSPOT_APP_SECRET ||
   process.env.HUBSPOT_CLIENT_SECRET ||
   "";
 
-// OAuth envs
+// OAuth envs（CLIENT_SECRET と APP_SECRET は実質同値なのでどちらでもOK）
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
   process.env.HUBSPOT_APP_SECRET || process.env.HUBSPOT_CLIENT_SECRET || "";
@@ -37,11 +37,10 @@ const HUBSPOT_REDIRECT_URI =
   process.env.HUBSPOT_REDIRECT_URI ||
   "https://sales-gamify.onrender.com/oauth/callback";
 
-// ===== raw body capture for signature (keep *exact* payload) =====
+// ===== raw body capture for signature (HubSpot は生ボディで署名するため必須) =====
 app.use(
   express.json({
     verify: (req: Request & { rawBody?: string }, _res, buf) => {
-      // 文字列として保持（Buffer/文字列どちらで参照されてもOK）
       (req as any).rawBody = buf.toString("utf8");
     },
   })
@@ -115,44 +114,36 @@ function safeTimingEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-/** improved v3 verifier (slash-normalization + debug) */
+/** HubSpot v3 verifier（クエリ有無 & 末尾スラッシュ有無の全パターンで検証） */
 function verifyHubSpotV3(
   req: Request & { rawBody?: string },
   appSecret: string
-): { ok: boolean; debug?: any } {
-  if (!appSecret) return { ok: false, debug: { reason: "missing secret" } };
+): { ok: boolean; matched?: string; tried: string[] } {
+  if (!appSecret) return { ok: false, tried: ["<missing secret>"] };
 
-  const sig = req.header("x-hubspot-signature-v3") || "";
-  const ts  = req.header("x-hubspot-request-timestamp") || "";
-  if (!sig || !ts) return { ok: false, debug: { reason: "missing header", sig, ts } };
+  const sig = req.get("X-HubSpot-Signature-v3") || "";
+  const ts = req.get("X-HubSpot-Request-Timestamp") || "";
+  if (!sig || !ts) return { ok: false, tried: ["<missing headers>"] };
 
   const method = req.method.toUpperCase();
-  const requestUri = req.originalUrl || req.url || "/webhooks/hubspot"; // クエリ付き
-  const requestUriNoSlash = requestUri.endsWith("/")
-    ? requestUri.slice(0, -1)
-    : requestUri + "/";
+  const full = req.originalUrl || req.url || "/webhooks/hubspot";
+  const [pathOnly] = full.split("?");
 
-  const body = (req.rawBody || "");
-  const base1 = method + requestUri        + body + ts;
-  const base2 = method + requestUriNoSlash + body + ts;
+  // 4候補：full, full(末尾/付与), pathOnly, pathOnly(末尾/付与)
+  const withSlash = full.endsWith("/") ? full : full + "/";
+  const pathWithSlash = pathOnly.endsWith("/") ? pathOnly : pathOnly + "/";
+  const candidates = [full, withSlash, pathOnly, pathWithSlash];
 
-  const digest1 = crypto.createHmac("sha256", appSecret).update(base1).digest("base64");
-  const digest2 = crypto.createHmac("sha256", appSecret).update(base2).digest("base64");
+  const body = req.rawBody || "";
+  const tried: string[] = [];
 
-  const ok = safeTimingEqual(digest1, sig) || safeTimingEqual(digest2, sig);
-
-  return {
-    ok,
-    debug: ok
-      ? { matched: safeTimingEqual(digest1, sig) ? "uri" : "uriNormalized" }
-      : {
-          reason: "mismatch",
-          sig_first12: sig.slice(0, 12),
-          calc1_first12: digest1.slice(0, 12),
-          calc2_first12: digest2.slice(0, 12),
-          method, requestUri, requestUriNoSlash, ts
-        }
-  };
+  for (const uri of candidates) {
+    const base = method + uri + body + ts;
+    const digest = crypto.createHmac("sha256", appSecret).update(base).digest("base64");
+    tried.push(`${uri} :: ${digest.slice(0, 12)}`);
+    if (safeTimingEqual(digest, sig)) return { ok: true, matched: uri, tried };
+  }
+  return { ok: false, tried };
 }
 
 // ===== routes =====
@@ -216,13 +207,12 @@ app.post(
   async (req: Request & { rawBody?: string }, res: Response) => {
     const v = verifyHubSpotV3(req, WEBHOOK_SECRET);
     if (!v.ok) {
-      record(req, false, "invalid-signature", v.debug);
+      record(req, false, "invalid-signature", { tried: v.tried });
       return res.status(401).json({ ok: false, error: "invalid signature" });
     }
 
-    // 検証OKを伝達しつつ、本体処理に委譲
-    (req as any).__verified = true;
-    record(req, true, "hubspot-event");
+    // 検証OKを記録してから、本体処理へ
+    record(req, true, "hubspot-event", { matched: v.matched });
     return handleHubSpotWebhook(req, res, () => undefined);
   }
 );
