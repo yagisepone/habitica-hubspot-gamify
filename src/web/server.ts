@@ -1,4 +1,3 @@
-// src/web/server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 
@@ -453,10 +452,20 @@ function resolveActor(ev: Normalized): { name: string; email?: string } {
   return { name: display, email: finalEmail };
 }
 
+// ---- Habitica: 対象ユーザーの資格情報を引く（任意でユーザー別加算） --------
+type HabiticaCred = { userId: string; apiToken: string };
+function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
+  const map = safeParse<Record<string, HabiticaCred>>(HABITICA_USERS_JSON);
+  if (!map) return undefined;
+  if (email && map[email]) return map[email];
+  return undefined;
+}
+
 // ---- Habitica: アポ演出（To-Do→即完了） -----------------------------------
 async function awardXpForAppointment(ev: Normalized) {
   const when = fmtJST(ev.occurredAt);
   const who = resolveActor(ev);
+  const cred = getHabiticaCredFor(who.email);
   const msg = `[XP] appointment scheduled (source=${ev.source}) callId=${ev.callId} at=${when} by=${who.name}`;
   if (DRY_RUN) {
     log(`${msg} (DRY_RUN)`);
@@ -465,10 +474,12 @@ async function awardXpForAppointment(ev: Normalized) {
   try {
     const todo = await createTodo(
       `🟩 新規アポ（${who.name}）`,
-      `HubSpot：成果=新規アポ\nsource=${ev.source}\ncallId=${ev.callId}`
+      `HubSpot：成果=新規アポ\nsource=${ev.source}\ncallId=${ev.callId}`,
+      undefined,
+      cred
     );
     const id = (todo as any)?.id;
-    if (id) await completeTask(id);
+    if (id) await completeTask(id, cred);
     log(msg);
   } catch (e: any) {
     console.error("[habitica] failed:", e?.message || e);
@@ -481,7 +492,6 @@ function formatChatworkMessage(ev: Normalized) {
   const cid = ev.callId ?? "-";
   const who = resolveActor(ev);
 
-  // ご要望のトーンに合わせた Chatwork メッセージ（info枠）
   return [
     "[info]",
     "[title]皆さんお疲れ様です！[/title]",
@@ -491,18 +501,14 @@ function formatChatworkMessage(ev: Normalized) {
     `• 発生 : ${when}`,
     `• 通話ID : ${cid}`,
     `• ルート : ${ev.source === "v3" ? "Developer Webhook(v3)" : "Workflow Webhook"}`,
-    // email を出したい場合は下行のコメントを外す
-    // (who.email ? `• 担当 : ${who.email}` : undefined),
     "[/info]",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  ].join("\n");
 }
 
 async function notifyChatworkAppointment(ev: Normalized) {
   const text = formatChatworkMessage(ev);
   if (DRY_RUN) {
-    log(`[Chatwork] (DRY_RUN)`, text.replace(/\n/g, " | "));
+    log(`[Chatwork] (DRY_RUN) ${text.replace(/\n/g, " | ")}`);
     return;
   }
   try {

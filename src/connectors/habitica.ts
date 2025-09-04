@@ -5,7 +5,7 @@ export type HabiticaCred = { userId: string; apiToken: string };
 function headers(cred?: HabiticaCred) {
   const user = cred?.userId ?? process.env.HABITICA_USER_ID;
   const key  = cred?.apiToken ?? process.env.HABITICA_API_TOKEN;
-  if (!user || !key) return null; 
+  if (!user || !key) return null; // 未設定は安全スキップ
   const xcli = process.env.HABITICA_X_CLIENT || `${user}-gamify`;
   return {
     "Content-Type": "application/json",
