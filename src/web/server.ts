@@ -4,25 +4,33 @@ import crypto from "crypto";
 
 /**
  * === habitica-hubspot-gamify : Web server (Render 用) ===
- *
- * 主要エンドポイント
  * - GET  /healthz
  * - GET  /support
- * - GET  /oauth/callback        // (任意) OAuth コールバック
- * - POST /webhooks/hubspot      // HubSpot Webhook v3（署名検証して 204 即時 ACK）
- * - GET  /debug/last            // 直近受信イベントの確認（Bearer 必須）
- * - GET  /debug/secret-hint     // 署名シークレットの “ヒント” 表示（漏洩防止のためハッシュのみ／Bearer 必須）
+ * - GET  /oauth/callback
+ * - POST /webhooks/hubspot   // HubSpot Webhook v3: 署名検証→204即ACK
+ * - GET  /debug/last         // 直近受信イベント（Bearer必須）
+ * - GET  /debug/secret-hint  // シークレットのヒント（Bearer必須）
  */
 
-// ------------------------------------------------------------------
-// Express 初期化
-// ------------------------------------------------------------------
+type ReqWithRaw = Request & { rawBody?: string };
+
 const app = express();
 app.set("x-powered-by", false);
 app.set("trust proxy", true);
 
-// JSON は他の経路で使いたい場合に備えて残す（/webhooks は raw を別途設定）
-app.use(express.json());
+/**
+ * 重要：ここで JSON をパースすると同時に「生の文字列」も保持する。
+ * これを使って HMAC を計算するので、/webhooks に別の bodyParser は不要。
+ */
+app.use(
+  express.json({
+    verify: (req: ReqWithRaw, _res, buf) => {
+      // HubSpotは application/json。生のJSON文字列を保存。
+      req.rawBody = buf.toString("utf8");
+    },
+    limit: "5mb",
+  })
+);
 
 // ------------------------------------------------------------------
 // 環境変数
@@ -30,19 +38,14 @@ app.use(express.json());
 const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 
-/**
- * Webhook 署名シークレット（優先順）
- * - Private App … HUBSPOT_WEBHOOK_SIGNING_SECRET
- * - Public App  … HUBSPOT_CLIENT_SECRET（＝画面の「クライアントシークレット」）
- *   ※ 一部環境では HUBSPOT_APP_SECRET と表記される場合があるのでフォールバック
- */
+/** Webhook 署名シークレット（優先順） */
 const WEBHOOK_SECRET =
   process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET ||
   process.env.HUBSPOT_CLIENT_SECRET ||
   process.env.HUBSPOT_APP_SECRET ||
   "";
 
-// OAuth（任意）
+/** OAuth（任意） */
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
   process.env.HUBSPOT_APP_SECRET || process.env.HUBSPOT_CLIENT_SECRET || "";
@@ -53,12 +56,10 @@ const HUBSPOT_REDIRECT_URI =
 // ------------------------------------------------------------------
 // ユーティリティ
 // ------------------------------------------------------------------
-function log(...args: any[]) {
-  console.log("[web]", ...args);
-}
+const log = (...a: any[]) => console.log("[web]", ...a);
+
 function requireBearer(req: Request, res: Response): boolean {
-  const auth = req.header("authorization") || "";
-  const token = auth.replace(/^Bearer\s+/i, "");
+  const token = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
   if (!AUTH_TOKEN) {
     res.status(500).json({ ok: false, error: "Server missing AUTH_TOKEN" });
     return false;
@@ -70,13 +71,13 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 function timingEqual(a: string, b: string): boolean {
-  const A = Buffer.from(a, "utf8");
-  const B = Buffer.from(b, "utf8");
+  const A = Buffer.from(a);
+  const B = Buffer.from(b);
   return A.length === B.length && crypto.timingSafeEqual(A, B);
 }
 
 // ------------------------------------------------------------------
-// 直近イベントの保存（デバッグ用）
+// 直近イベント（デバッグ用）
 // ------------------------------------------------------------------
 interface LastEvent {
   at?: string;
@@ -90,16 +91,16 @@ interface LastEvent {
 const lastEvent: LastEvent = {};
 
 // ------------------------------------------------------------------
-// ヘルスチェック / サポート
+// ヘルス/サポート
 // ------------------------------------------------------------------
-app.get("/healthz", (_req, res) => {
+app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
-  });
-});
+  })
+);
 app.get("/support", (_req, res) => res.type("text/plain").send("Support page (placeholder)."));
 
 // ------------------------------------------------------------------
@@ -140,81 +141,85 @@ app.get("/oauth/callback", async (req, res) => {
 });
 
 // ------------------------------------------------------------------
-// HubSpot Webhook (v3) — 署名検証：METHOD + originalUrl + RAW + TIMESTAMP
-// ※ 204 を即返却（HubSpot 推奨）
+// HubSpot Webhook v3
+// HMAC-SHA256(secret, METHOD + REQUEST_URI + RAW_BODY + TIMESTAMP) を Base64
+// REQUEST_URI はクエリ付きパス。末尾スラッシュの揺れも吸収。
+// 204 を即返却（HubSpot推奨）。署名NGでも 204。
 // ------------------------------------------------------------------
-app.post(
-  "/webhooks/hubspot",
-  // 生バイトで受け取る
-  express.raw({ type: "*/*", limit: "5mb" }),
-  async (req: Request, res: Response) => {
-    const method = req.method.toUpperCase();
-    const url = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
-    const raw: Buffer = Buffer.isBuffer((req as any).body)
-      ? (req as any).body
-      : Buffer.from(String((req as any).body ?? ""), "utf8");
+app.post("/webhooks/hubspot", (req: ReqWithRaw, res: Response) => {
+  const secret = WEBHOOK_SECRET;
 
-    const ts = req.header("x-hubspot-request-timestamp") || "";
-    const sig = req.header("x-hubspot-signature-v3") || "";
+  const sig = req.header("x-hubspot-signature-v3") || "";
+  const ts = req.header("x-hubspot-request-timestamp") || "";
+  const method = (req.method || "POST").toUpperCase();
 
-    // 基底データをバッファで正確に連結（エンコーディング差を排除）
-    const base = Buffer.concat([
-      Buffer.from(method, "utf8"),
-      Buffer.from(url, "utf8"),
-      raw,
-      Buffer.from(ts, "utf8"),
-    ]);
-    const calc = crypto.createHmac("sha256", WEBHOOK_SECRET).update(base).digest("base64");
-    const verified = timingEqual(sig, calc);
+  const withQuery = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
+  const urlObj = new URL(withQuery, "http://dummy.local");
+  const pathOnly = urlObj.pathname;
+  const norm = (u: string) => (u.endsWith("/") ? u.slice(0, -1) : u + "/");
 
-    // 204 即時 ACK（成功/失敗に関わらず）
-    res.status(204).end();
+  const raw = req.rawBody ?? ""; // ここが生の JSON 文字列
 
-    // 以降は保存と非同期処理（ログ用）
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(raw.toString("utf8"));
-    } catch {
-      parsed = null;
-    }
+  const bases = [
+    method + withQuery + raw + ts,
+    method + norm(withQuery) + raw + ts,
+    method + pathOnly + raw + ts,
+    method + norm(pathOnly) + raw + ts,
+  ];
+  const digests = bases.map((b) => crypto.createHmac("sha256", secret).update(b).digest("base64"));
+  const hit = digests.findIndex((d) => timingEqual(d, sig));
+  const verified = hit >= 0;
 
-    lastEvent.at = new Date().toISOString();
-    lastEvent.path = url;
-    lastEvent.verified = verified;
-    lastEvent.note = verified ? "hubspot-event" : "invalid-signature";
-    lastEvent.headers = {
-      "x-hubspot-signature-v3": sig || undefined,
-      "x-hubspot-request-timestamp": ts || undefined,
-      "content-type": req.header("content-type") || undefined,
-      "user-agent": req.header("user-agent") || undefined,
-    };
-    lastEvent.body = parsed;
-    lastEvent.sig_debug = {
-      method,
-      url,
-      header12: sig.slice(0, 12),
-      calc12: calc.slice(0, 12),
-      // 調査が必要なら以下を一時的に出す（通常は無効のままでOK）
-      // raw_b64: raw.toString("base64"),
-      // base_b64: base.toString("base64"),
-    };
+  // HubSpotには即ACK
+  res.status(204).end();
 
-    log(`received path=${url} verified=${verified} note=${lastEvent.note}`);
-    if (verified && Array.isArray(parsed)) {
-      log(`accepted events: ${parsed.length}`);
-      // TODO: 必要ならキュー投入／DB書き込みなど
-    }
+  // デバッグ保存（表示用にbodyもJSON化しておく）
+  let parsed: any = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch {
+    parsed = null;
   }
-);
+
+  lastEvent.at = new Date().toISOString();
+  lastEvent.path = withQuery;
+  lastEvent.verified = verified;
+  lastEvent.note = verified ? "hubspot-event" : "invalid-signature";
+  lastEvent.headers = {
+    "x-hubspot-signature-v3": sig || undefined,
+    "x-hubspot-request-timestamp": ts || undefined,
+    "content-type": req.header("content-type") || undefined,
+    "user-agent": req.header("user-agent") || undefined,
+  };
+  lastEvent.body = parsed;
+  lastEvent.sig_debug = verified
+    ? { matched: ["withQuery", "withQueryNorm", "pathOnly", "pathOnlyNorm"][hit] }
+    : {
+        reason: "mismatch",
+        method,
+        withQuery,
+        pathOnly,
+        sig_first12: sig.slice(0, 12),
+        calc_first12: digests.map((d) => d.slice(0, 12)),
+      };
+
+  log(`received path=${withQuery} verified=${verified} note=${lastEvent.note}`);
+  if (verified) {
+    const count = Array.isArray(parsed) ? parsed.length : parsed ? 1 : 0;
+    log(`accepted events: ${count}`);
+    // TODO: 必要ならここで本処理（キュー/DB）を行う
+  }
+});
 
 // ------------------------------------------------------------------
-// デバッグ系
+// デバッグ
 // ------------------------------------------------------------------
 app.get("/debug/last", (req, res) => {
   if (!requireBearer(req, res)) return;
   if (!lastEvent.at) return res.status(404).json({ ok: false, error: "not_found" });
   res.json({ ok: true, last_event: lastEvent, oauth_status: null });
 });
+
 app.get("/debug/secret-hint", (req, res) => {
   if (!requireBearer(req, res)) return;
   const secret = WEBHOOK_SECRET || "";
@@ -228,7 +233,7 @@ app.get("/debug/secret-hint", (req, res) => {
 app.listen(PORT, () => {
   log(`gamify-web listening on :${PORT} (TZ=${process.env.TZ || "Asia/Tokyo"})`);
   log(
-    `webhook-ready (HubSpot v3, rawBody on, redirect=${HUBSPOT_REDIRECT_URI}, secret=${
+    `webhook-ready (HubSpot v3, rawBody=on, redirect=${HUBSPOT_REDIRECT_URI}, secret=${
       WEBHOOK_SECRET ? "present" : "MISSING"
     })`
   );
