@@ -1,5 +1,5 @@
 // src/web/server.ts
-import express, { Request, Response, NextFunction } from "express";
+import express, { Request, Response } from "express";
 import crypto from "crypto";
 
 /**
@@ -21,14 +21,8 @@ const app = express();
 app.set("x-powered-by", false);
 app.set("trust proxy", true);
 
-// JSON パーサ（署名計算用に **生のボディ** を保持）
-app.use(
-  express.json({
-    verify: (req: Request & { rawBody?: string }, _res, buf) => {
-      (req as any).rawBody = buf.toString("utf8");
-    },
-  })
-);
+// JSON は他の経路で使いたい場合に備えて残す（/webhooks は raw を別途設定）
+app.use(express.json());
 
 // ------------------------------------------------------------------
 // 環境変数
@@ -62,7 +56,6 @@ const HUBSPOT_REDIRECT_URI =
 function log(...args: any[]) {
   console.log("[web]", ...args);
 }
-
 function requireBearer(req: Request, res: Response): boolean {
   const auth = req.header("authorization") || "";
   const token = auth.replace(/^Bearer\s+/i, "");
@@ -76,71 +69,10 @@ function requireBearer(req: Request, res: Response): boolean {
   }
   return true;
 }
-
-function safeTimingEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
-}
-
-// ------------------------------------------------------------------
-// v3 署名検証
-// 公式仕様: HMAC-SHA256(secret, METHOD + REQUEST_URI + BODY + TIMESTAMP) を Base64
-// ※ REQUEST_URI はクエリ付きパス（例: /webhooks/hubspot?x=1）
-//   末尾スラッシュ差異による揺れに備えて 2 パターンも試す
-// ------------------------------------------------------------------
-function verifyHubSpotV3(
-  req: Request & { rawBody?: string },
-  secret: string
-): { ok: boolean; debug: any } {
-  if (!secret) return { ok: false, debug: { reason: "missing-secret" } };
-
-  const sig = req.header("x-hubspot-signature-v3") || "";
-  const ts = req.header("x-hubspot-request-timestamp") || "";
-  if (!sig || !ts) {
-    return { ok: false, debug: { reason: "missing-header", sig: !!sig, ts: !!ts } };
-  }
-
-  const method = (req.method || "POST").toUpperCase();
-
-  // originalUrl はクエリを含む（望ましい）。なければ url を使用。
-  const withQuery = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
-  const urlObj = new URL(withQuery, "http://dummy.local"); // パースだけ
-  const pathOnly = urlObj.pathname; // クエリ無し
-
-  // 末尾スラッシュの正規化
-  const norm = (u: string) => (u.endsWith("/") ? u.slice(0, -1) : u + "/");
-
-  const raw = req.rawBody ?? ""; // ここが “生” の JSON 文字列
-  const bases = [
-    method + withQuery + raw + ts,
-    method + norm(withQuery) + raw + ts,
-    method + pathOnly + raw + ts,
-    method + norm(pathOnly) + raw + ts,
-  ];
-
-  const digests = bases.map((b) =>
-    crypto.createHmac("sha256", secret).update(b).digest("base64")
-  );
-
-  const matchedIndex = digests.findIndex((d) => safeTimingEqual(d, sig));
-  const ok = matchedIndex >= 0;
-
-  return {
-    ok,
-    debug: ok
-      ? { matched: ["withQuery", "withQueryNorm", "pathOnly", "pathOnlyNorm"][matchedIndex] }
-      : {
-          reason: "mismatch",
-          method,
-          withQuery,
-          pathOnly,
-          ts,
-          sig_first12: sig.slice(0, 12),
-          calc_first12: digests.map((d) => d.slice(0, 12)),
-        },
-  };
+function timingEqual(a: string, b: string): boolean {
+  const A = Buffer.from(a, "utf8");
+  const B = Buffer.from(b, "utf8");
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
 }
 
 // ------------------------------------------------------------------
@@ -158,7 +90,7 @@ interface LastEvent {
 const lastEvent: LastEvent = {};
 
 // ------------------------------------------------------------------
-// ルーティング
+// ヘルスチェック / サポート
 // ------------------------------------------------------------------
 app.get("/healthz", (_req, res) => {
   res.json({
@@ -168,13 +100,12 @@ app.get("/healthz", (_req, res) => {
     hasSecret: !!WEBHOOK_SECRET,
   });
 });
+app.get("/support", (_req, res) => res.type("text/plain").send("Support page (placeholder)."));
 
-app.get("/support", (_req, res) => {
-  res.type("text/plain").send("Support page (placeholder).");
-});
-
+// ------------------------------------------------------------------
 // (任意) OAuth コールバック
-app.get("/oauth/callback", async (req: Request, res: Response) => {
+// ------------------------------------------------------------------
+app.get("/oauth/callback", async (req, res) => {
   const code = String(req.query.code || "");
   if (!code) return res.status(400).type("text/plain").send("missing code");
   if (!HUBSPOT_CLIENT_ID || !HUBSPOT_APP_SECRET) {
@@ -183,7 +114,6 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
       .type("text/plain")
       .send("server missing HUBSPOT_CLIENT_ID/HUBSPOT_APP_SECRET");
   }
-
   try {
     const params = new URLSearchParams({
       grant_type: "authorization_code",
@@ -202,76 +132,94 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
       console.error("[oauth] exchange failed:", json);
       return res.status(502).type("text/plain").send("token exchange failed");
     }
-    res
-      .type("text/plain")
-      .send("Connected! You can close this window. (OAuth token issued)");
+    res.type("text/plain").send("Connected! You can close this window. (OAuth token issued)");
   } catch (e) {
     console.error(e);
     res.status(500).type("text/plain").send("token exchange error");
   }
 });
 
-// HubSpot Webhook 本体（ここで v3 署名を検証 → 204で即時ACK）
+// ------------------------------------------------------------------
+// HubSpot Webhook (v3) — 署名検証：METHOD + originalUrl + RAW + TIMESTAMP
+// ※ 204 を即返却（HubSpot 推奨）
+// ------------------------------------------------------------------
 app.post(
   "/webhooks/hubspot",
-  async (req: Request & { rawBody?: string }, res: Response, _next: NextFunction) => {
-    const v = verifyHubSpotV3(req, WEBHOOK_SECRET);
+  // 生バイトで受け取る
+  express.raw({ type: "*/*", limit: "5mb" }),
+  async (req: Request, res: Response) => {
+    const method = req.method.toUpperCase();
+    const url = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
+    const raw: Buffer = Buffer.isBuffer((req as any).body)
+      ? (req as any).body
+      : Buffer.from(String((req as any).body ?? ""), "utf8");
 
-    // デバッグ保存
+    const ts = req.header("x-hubspot-request-timestamp") || "";
+    const sig = req.header("x-hubspot-signature-v3") || "";
+
+    // 基底データをバッファで正確に連結（エンコーディング差を排除）
+    const base = Buffer.concat([
+      Buffer.from(method, "utf8"),
+      Buffer.from(url, "utf8"),
+      raw,
+      Buffer.from(ts, "utf8"),
+    ]);
+    const calc = crypto.createHmac("sha256", WEBHOOK_SECRET).update(base).digest("base64");
+    const verified = timingEqual(sig, calc);
+
+    // 204 即時 ACK（成功/失敗に関わらず）
+    res.status(204).end();
+
+    // 以降は保存と非同期処理（ログ用）
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(raw.toString("utf8"));
+    } catch {
+      parsed = null;
+    }
+
     lastEvent.at = new Date().toISOString();
-    lastEvent.path = req.originalUrl || req.url;
-    lastEvent.verified = v.ok;
-    lastEvent.note = v.ok ? "hubspot-event" : "invalid-signature";
+    lastEvent.path = url;
+    lastEvent.verified = verified;
+    lastEvent.note = verified ? "hubspot-event" : "invalid-signature";
     lastEvent.headers = {
-      "x-hubspot-signature-v3": req.header("x-hubspot-signature-v3") || undefined,
-      "x-hubspot-request-timestamp": req.header("x-hubspot-request-timestamp") || undefined,
+      "x-hubspot-signature-v3": sig || undefined,
+      "x-hubspot-request-timestamp": ts || undefined,
       "content-type": req.header("content-type") || undefined,
       "user-agent": req.header("user-agent") || undefined,
     };
-    lastEvent.body = (req as any).body;
-    lastEvent.sig_debug = v.debug;
+    lastEvent.body = parsed;
+    lastEvent.sig_debug = {
+      method,
+      url,
+      header12: sig.slice(0, 12),
+      calc12: calc.slice(0, 12),
+      // 調査が必要なら以下を一時的に出す（通常は無効のままでOK）
+      // raw_b64: raw.toString("base64"),
+      // base_b64: base.toString("base64"),
+    };
 
-    if (!v.ok) {
-      log(
-        `received path=${lastEvent.path} verified=false note=invalid-signature`
-      );
-      return res.status(401).json({ ok: false, error: "invalid signature" });
-    }
-
-    // === ここで 204 を先に返す（HubSpot 推奨：タイムアウト防止） ===
-    res.status(204).end();
-
-    // 以降は非同期で本処理（必要ならキューへ）
-    try {
-      // 例）受け取ったイベントをログに残すだけ
-      const payload = Array.isArray(req.body) ? req.body : [];
-      log(`accepted events: ${payload.length}`);
-      // TODO: 必要ならここでキュー投入／DB書き込みなど
-    } catch (e) {
-      console.error("[async-handler] error:", e);
+    log(`received path=${url} verified=${verified} note=${lastEvent.note}`);
+    if (verified && Array.isArray(parsed)) {
+      log(`accepted events: ${parsed.length}`);
+      // TODO: 必要ならキュー投入／DB書き込みなど
     }
   }
 );
 
-// デバッグ: 直近イベント（Bearer 必須）
-app.get("/debug/last", (req: Request, res: Response) => {
+// ------------------------------------------------------------------
+// デバッグ系
+// ------------------------------------------------------------------
+app.get("/debug/last", (req, res) => {
   if (!requireBearer(req, res)) return;
   if (!lastEvent.at) return res.status(404).json({ ok: false, error: "not_found" });
-  res.json({ ok: true, last_event: lastEvent });
+  res.json({ ok: true, last_event: lastEvent, oauth_status: null });
 });
-
-// デバッグ: シークレットの “ヒント” を返す（漏洩防止のためプレーン値は出さない）
-app.get("/debug/secret-hint", (req: Request, res: Response) => {
+app.get("/debug/secret-hint", (req, res) => {
   if (!requireBearer(req, res)) return;
   const secret = WEBHOOK_SECRET || "";
   const hash = crypto.createHash("sha256").update(secret).digest("hex");
-  res.json({
-    ok: true,
-    present: !!secret,
-    // 長さとハッシュ先頭のみ（実値は返さない）
-    length: secret.length,
-    sha256_12: hash.slice(0, 12),
-  });
+  res.json({ ok: true, present: !!secret, length: secret.length, sha256_12: hash.slice(0, 12) });
 });
 
 // ------------------------------------------------------------------
@@ -280,7 +228,7 @@ app.get("/debug/secret-hint", (req: Request, res: Response) => {
 app.listen(PORT, () => {
   log(`gamify-web listening on :${PORT} (TZ=${process.env.TZ || "Asia/Tokyo"})`);
   log(
-    `webhook-ready (v3 signature; rawBody=on; redirect=${HUBSPOT_REDIRECT_URI}; secret=${
+    `webhook-ready (HubSpot v3, rawBody on, redirect=${HUBSPOT_REDIRECT_URI}, secret=${
       WEBHOOK_SECRET ? "present" : "MISSING"
     })`
   );
