@@ -2,25 +2,23 @@
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 
-/**
- * === habitica-hubspot-gamify : Web server (Render 用) ===
- *
- * Endpoints
- * - GET  /healthz
- * - GET  /support
- * - GET  /oauth/callback
- * - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
- * - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
- * - GET  /debug/last           // requires Bearer
- * - GET  /debug/recent         // requires Bearer（直近20件）
- * - GET  /debug/secret-hint    // requires Bearer
- */
-
+// === habitica-hubspot-gamify : Web server (Render 用) =======================
+//
+// Endpoints
+// - GET  /healthz
+// - GET  /support
+// - GET  /oauth/callback
+// - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
+// - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
+// - GET  /debug/last           // requires Bearer
+// - GET  /debug/recent         // requires Bearer（直近20件）
+// - GET  /debug/secret-hint    // requires Bearer
+//
 const app = express();
 app.set("x-powered-by", false);
 app.set("trust proxy", true);
 
-// ---- body: raw を保存（必須） --------------------------------------------
+// raw body を保存（v3署名で必須）
 app.use(
   express.json({
     verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
@@ -34,7 +32,6 @@ const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const DRY_RUN = String(process.env.DRY_RUN || "1") === "1";
 
-// Developerアプリの App Secret / Client Secret など、v3署名用の秘密
 const WEBHOOK_SECRET =
   process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET ||
   process.env.HUBSPOT_APP_SECRET ||
@@ -53,14 +50,27 @@ const HUBSPOT_REDIRECT_URI =
 const PUBLIC_BASE_URL =
   (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/+$/, "");
 
-// “新規アポ”とみなす outcome 値（内部値/表示ラベルの両方を許容）
+// “新規アポ”とみなす outcome 値（内部値/表示ラベルの両方OK）
 const APPOINTMENT_VALUES = (process.env.APPOINTMENT_VALUES || "APPOINTMENT_SCHEDULED,新規アポ")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+const APPOINTMENT_SET_LOWER = new Set(APPOINTMENT_VALUES.map((v) => v.toLowerCase()));
 
 // 重複抑止TTL（秒）
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24 * 60 * 60);
+
+// 担当者名解決のための任意マップ（userId→{name,email}）
+const HUBSPOT_USER_MAP_JSON = process.env.HUBSPOT_USER_MAP_JSON || "";
+
+// （任意）担当メール→Habitica資格情報 のマップ（JSON文字列）
+// 例: HABITICA_USERS_JSON='{"alice@ex.com":{"userId":"...","apiToken":"..."}}'
+const HABITICA_USERS_JSON = process.env.HABITICA_USERS_JSON || "";
+
+// ---- External connectors ----------------------------------------------------
+// ビルド後（dist/web/server.js）から見て ../connectors/xxx.js が正解
+import { sendChatworkMessage } from "../connectors/chatwork.js";
+import { createTodo, completeTask } from "../connectors/habitica.js";
 
 // ---- Util ------------------------------------------------------------------
 function log(...args: any[]) {
@@ -96,6 +106,25 @@ function addVariants(set: Set<string>, u: string) {
     } catch {}
   };
   add(u);
+}
+function fmtJST(ms?: number | string) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return "-";
+  return new Date(n).toLocaleString("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+function safeParse<T = any>(s?: string): T | undefined {
+  try {
+    return s ? (JSON.parse(s) as T) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---- Debug store -----------------------------------------------------------
@@ -141,6 +170,7 @@ app.get("/healthz", (_req, res) => {
     hasSecret: !!WEBHOOK_SECRET,
     baseUrl: PUBLIC_BASE_URL || null,
     dryRun: DRY_RUN,
+    appointmentValues: APPOINTMENT_VALUES,
   });
 });
 app.get("/support", (_req, res) =>
@@ -201,10 +231,10 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const raw: Buffer =
     (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body ?? ""), "utf8");
 
-  // 候補URI（相対/絶対/末尾スラ・decode/環境変数ベース）を網羅
+  // 候補URI（相対/絶対/末尾スラ・decode・環境変数ベース）を網羅
   const proto =
     String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() ||
-    req.protocol ||
+    (req as any).protocol ||
     "https";
   const hostHdr = String(req.headers["x-forwarded-host"] || req.headers["host"] || "")
     .split(",")[0]
@@ -236,7 +266,7 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const hit = calc.find((c) => timingEqual(c.sig, sigHeader));
   const verified = !!hit;
 
-  // HubSpot推奨：即204返却
+  // 即204返却
   res.status(204).end();
 
   // 5分超の時刻ズレメモ
@@ -297,22 +327,21 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   // ---- 正規化＆処理（v3ボディは配列想定） -------------------------------
   if (verified && Array.isArray(parsed)) {
     for (const e of parsed) {
-      // 例：Calls の property change（将来 v3サブスクを使う場合）
-      if (
-        (String(e.subscriptionType || "").toLowerCase().includes("call") ||
-          String(e.objectType || "").toLowerCase().includes("call")) &&
-        e.propertyName === "hs_call_disposition"
-      ) {
+      // Calls の property change
+      const isCall =
+        String(e.subscriptionType || "").toLowerCase().includes("call") ||
+        String(e.objectType || "").toLowerCase().includes("call") ||
+        String(e.objectTypeId || "") === "0-48"; // 通話Object Id
+      if (isCall && e.propertyName === "hs_call_disposition") {
         await handleNormalizedEvent({
           source: "v3",
-          eventId: e.eventId ?? e.attemptNumber, // なければattemptなどで代用
+          eventId: e.eventId ?? e.attemptNumber,
           callId: e.objectId,
           outcome: e.propertyValue,
           occurredAt: e.occurredAt,
           raw: e,
         });
       }
-      // 既存：deal.propertyChange はここではXP付与しない（仕様外）
     }
   }
 });
@@ -379,36 +408,113 @@ async function handleNormalizedEvent(ev: Normalized) {
   }
   markSeen(idForDedupe);
 
-  // “新規アポ”判定
-  const isAppointment =
-    !!ev.outcome && APPOINTMENT_VALUES.some((v) => String(ev.outcome).trim() === v);
+  // “新規アポ”判定（大文字小文字を吸収）
+  const outcomeStr = String(ev.outcome ?? "").trim();
+  const isAppointment = outcomeStr && APPOINTMENT_SET_LOWER.has(outcomeStr.toLowerCase());
 
   if (isAppointment) {
     await awardXpForAppointment(ev);
     await notifyChatworkAppointment(ev);
   } else {
-    // その他のイベントは必要に応じて拡張
+    log(`non-appointment outcome=${outcomeStr || "(empty)"} source=${ev.source}`);
   }
 }
 
+// ---- だれが獲得したかを解決 ------------------------------------------------
+function extractUserIdFromRaw(raw: any): string | undefined {
+  // 例: sourceId: "userId:75172305"
+  const m = String(raw?.sourceId || "").match(/userId:(\d+)/);
+  if (m) return m[1];
+  // 他の形があればここに追加
+  return undefined;
+}
+function resolveActor(ev: Normalized): { name: string; email?: string } {
+  const raw = ev.raw || {};
+  // 1) イベントに email があれば最優先
+  const email =
+    raw.actorEmail ||
+    raw.ownerEmail ||
+    raw.userEmail ||
+    raw?.owner?.email ||
+    raw?.properties?.hs_created_by_user_id?.email;
+
+  // 2) userId → マップ解決
+  const userId = extractUserIdFromRaw(raw) || raw.userId || raw.actorId;
+  const map = safeParse<Record<string, { name?: string; email?: string }>>(HUBSPOT_USER_MAP_JSON);
+  const mapped = userId && map ? map[String(userId)] : undefined;
+
+  // 優先順位：mapped.name → emailのローカル部 → "担当者"
+  const display =
+    (mapped && mapped.name) ||
+    (email ? String(email).split("@")[0] : undefined) ||
+    "担当者";
+
+  const finalEmail = email || (mapped && mapped.email) || undefined;
+  return { name: display, email: finalEmail };
+}
+
+// ---- Habitica: アポ演出（To-Do→即完了） -----------------------------------
 async function awardXpForAppointment(ev: Normalized) {
-  const msg = `[XP] appointment scheduled (source=${ev.source}) callId=${ev.callId} eventId=${ev.eventId}`;
+  const when = fmtJST(ev.occurredAt);
+  const who = resolveActor(ev);
+  const msg = `[XP] appointment scheduled (source=${ev.source}) callId=${ev.callId} at=${when} by=${who.name}`;
   if (DRY_RUN) {
     log(`${msg} (DRY_RUN)`);
     return;
   }
-  // TODO: Habitica API 呼び出しを実装
-  log(msg);
+  try {
+    const todo = await createTodo(
+      `🟩 新規アポ（${who.name}）`,
+      `HubSpot：成果=新規アポ\nsource=${ev.source}\ncallId=${ev.callId}`
+    );
+    const id = (todo as any)?.id;
+    if (id) await completeTask(id);
+    log(msg);
+  } catch (e: any) {
+    console.error("[habitica] failed:", e?.message || e);
+  }
+}
+
+// ---- Chatwork: “誰がアポ獲得したか”を強調したモチベUP文面 -------------------
+function formatChatworkMessage(ev: Normalized) {
+  const when = fmtJST(ev.occurredAt);
+  const cid = ev.callId ?? "-";
+  const who = resolveActor(ev);
+
+  // ご要望のトーンに合わせた Chatwork メッセージ（info枠）
+  return [
+    "[info]",
+    "[title]皆さんお疲れ様です！[/title]",
+    `${who.name}さんが【新規アポ】を獲得しました🎉🎉`,
+    "ナイスコール！🌟 この調子であともう1件💪🐶",
+    "[hr]",
+    `• 発生 : ${when}`,
+    `• 通話ID : ${cid}`,
+    `• ルート : ${ev.source === "v3" ? "Developer Webhook(v3)" : "Workflow Webhook"}`,
+    // email を出したい場合は下行のコメントを外す
+    // (who.email ? `• 担当 : ${who.email}` : undefined),
+    "[/info]",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function notifyChatworkAppointment(ev: Normalized) {
-  const text = `✅ 新規アポ: callId=${ev.callId ?? "-"} source=${ev.source}`;
+  const text = formatChatworkMessage(ev);
   if (DRY_RUN) {
-    log(`[Chatwork] ${text} (DRY_RUN)`);
+    log(`[Chatwork] (DRY_RUN)`, text.replace(/\n/g, " | "));
     return;
   }
-  // TODO: Chatwork API 呼び出しを実装
-  log(`[Chatwork] ${text}`);
+  try {
+    const r = await sendChatworkMessage(text);
+    if (!r.success) {
+      console.error("[chatwork] failed", r.status, r.json);
+    } else {
+      log(`[chatwork] sent status=${r.status}`);
+    }
+  } catch (e: any) {
+    console.error("[chatwork] error", e?.message || e);
+  }
 }
 
 // ---- Debug -----------------------------------------------------------------
