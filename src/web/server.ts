@@ -2,6 +2,8 @@ import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
 import { parse as csvParse } from "csv-parse/sync";
+import fs from "fs";
+import path from "path";
 
 // === habitica-hubspot-gamify : Web server (Render 用) =======================
 //
@@ -11,11 +13,13 @@ import { parse as csvParse } from "csv-parse/sync";
 // - GET  /oauth/callback
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
+// - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Bearer任意; email + duration）★追加
 // - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart）
 // - GET  /admin/template.csv   // CSVテンプレDL
 // - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
+// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）★追加
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -182,6 +186,21 @@ function safeParse<T = any>(s?: string): T | undefined {
   }
 }
 
+// ---- JSONL logger ----------------------------------------------------------
+function ensureDir(p: string) { fs.mkdirSync(p, { recursive: true }); }
+function appendJsonl(fp: string, obj: any) {
+  ensureDir(path.dirname(fp));
+  fs.appendFileSync(fp, JSON.stringify(obj) + "\n", "utf8");
+}
+function isoDay(d?: any) {
+  const t = d ? new Date(d) : new Date();
+  const tz = "Asia/Tokyo";
+  const y = t.toLocaleString("ja-JP", { timeZone: tz, year: "numeric" });
+  const m = t.toLocaleString("ja-JP", { timeZone: tz, month: "2-digit" });
+  const da = t.toLocaleString("ja-JP", { timeZone: tz, day: "2-digit" });
+  return `${y}-${m}-${da}`;
+}
+
 // ---- Debug store -----------------------------------------------------------
 interface LastEvent {
   at?: string;
@@ -273,7 +292,6 @@ app.get("/oauth/callback", async (req, res) => {
 // ============================================================================
 // HubSpot Webhook v3
 // HMAC-SHA256(secret, METHOD + REQUEST_URI + RAW_BODY + TIMESTAMP) -> base64
-// REQUEST_URI は Target URL 全体（絶対URL）で計算される場合がある点に注意。
 // ============================================================================
 app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: Response) => {
   const method = (req.method || "POST").toUpperCase();
@@ -285,11 +303,9 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const sigHeader = req.header("x-hubspot-signature-v3") || "";
   const verHeader = (req.header("x-hubspot-signature-version") || "").toLowerCase();
 
-  // 生ボディ（検証は raw で！）
   const raw: Buffer =
     (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body ?? ""), "utf8");
 
-  // 候補URI（相対/絶対/末尾スラ・decode・環境変数ベース）を網羅
   const proto =
     String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() ||
     (req as any).protocol ||
@@ -324,10 +340,8 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const hit = calc.find((c) => timingEqual(c.sig, sigHeader));
   const verified = !!hit;
 
-  // 即204返却
   res.status(204).end();
 
-  // 5分超の時刻ズレメモ
   let tsNote: string | undefined;
   const MAX_SKEW_MS = 5 * 60 * 1000;
   const now = Date.now();
@@ -336,7 +350,6 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
     tsNote = "stale_timestamp(>5min)";
   }
 
-  // 解析用
   let parsed: any = null;
   try {
     parsed = JSON.parse(raw.toString("utf8"));
@@ -382,10 +395,9 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
 
   log(`received uri=${withQuery} verified=${verified} note=${ev.note}`);
 
-  // ---- 正規化＆処理（v3ボディは配列想定） -------------------------------
+  // ---- 正規化＆処理 -------------------------------------------------------
   if (verified && Array.isArray(parsed)) {
     for (const e of parsed) {
-      // Calls の property change
       const isCall =
         String(e.subscriptionType || "").toLowerCase().includes("call") ||
         String(e.objectType || "").toLowerCase().includes("call") ||
@@ -421,7 +433,6 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
 
 // ============================================================================
 // ワークフロー Webhooks（署名なし・Bearer検証）
-// Private App トークンが無くてもUIだけで構成できる確実ルート。
 // ============================================================================
 app.post("/webhooks/workflow", async (req: Request, res: Response) => {
   const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
@@ -476,7 +487,62 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
   return res.json({ ok: true });
 });
 
-// ====================== Phase 2: /admin/csv エンドポイント ======================
+// ============================================================================
+// Zoom/汎用 コール入口（email + durationのみでもOK）★追加
+// ============================================================================
+app.post("/webhooks/zoom", async (req: Request, res: Response) => {
+  // セキュリティ不要運用でも残せるように：AUTH_TOKENが設定されていれば検証
+  const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (AUTH_TOKEN && tok !== AUTH_TOKEN) {
+    return res.status(401).json({ ok: false, error: "auth" });
+  }
+
+  const b: any = (req as any).body || {};
+  const raw = b.payload?.object || b.object || b || {};
+  const email =
+    raw.user_email ||
+    raw.owner_email ||
+    raw.caller_email ||
+    raw.callee_email ||
+    b.email ||
+    undefined;
+
+  // duration 推定
+  const cand = [
+    raw.duration_ms,
+    raw.call_duration_ms,
+    raw.durationMs,
+    raw.duration,
+    raw.call_duration,
+    b.duration,
+  ];
+  let ms = cand.map(Number).find((x) => Number.isFinite(x)) || 0;
+  if (ms > 0 && ms < 100000) ms = ms * 1000; // 10万未満は秒とみなす
+  if (ms <= 0 && raw.start_time && raw.end_time) {
+    const st = new Date(raw.start_time).getTime();
+    const et = new Date(raw.end_time).getTime();
+    if (Number.isFinite(st) && Number.isFinite(et)) ms = Math.max(0, et - st);
+  }
+
+  const callId =
+    raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
+
+  // actor をemailで擬似
+  const whoRaw = { userEmail: email };
+
+  await handleCallDurationEvent({
+    source: "workflow",
+    eventId: b.event_id || b.eventId || callId,
+    callId,
+    durationMs: inferDurationMs(ms),
+    occurredAt: b.timestamp || raw.end_time || Date.now(),
+    raw: whoRaw,
+  });
+
+  return res.json({ ok: true, accepted: true, ms });
+});
+
+// ====================== /admin/csv エンドポイント ============================
 // Bearer必須。text/csv 直送 or multipart/form-data(file)
 // CSVヘッダ: type,email,amount,maker,id,date,notes
 // type: approval|承認 / sales|売上 / maker|メーカー
@@ -521,7 +587,6 @@ async function _handleCsvMultipart(req: Request, res: Response) {
     const bb = Busboy({ headers: req.headers });
     bb.on("file", (_name, file, info) => {
       const mt = String(info.mimeType || "").toLowerCase();
-      // “.csv”で来るブラウザは ms-excel MIME を付けることがあるため許容を広げる
       const ok =
         mt.includes("csv") ||
         mt === "text/plain" ||
@@ -599,13 +664,33 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
       if (r.type === "approval") {
         nApproval++;
         await addApproval(cred!, 1, r.notes || "CSV取り込み");
+        appendJsonl("data/events/approvals.jsonl", {
+          at: new Date().toISOString(),
+          day: isoDay(r.date),
+          email: r.email,
+          id: r.id,
+        });
       } else if (r.type === "sales") {
         nSales++;
         sumSales += Number(r.amount || 0);
         await addSales(cred!, Number(r.amount || 0), r.notes || "CSV取り込み");
+        appendJsonl("data/events/sales.jsonl", {
+          at: new Date().toISOString(),
+          day: isoDay(r.date),
+          email: r.email,
+          amount: Number(r.amount || 0),
+          id: r.id,
+        });
       } else if (r.type === "maker") {
         nMaker++;
         await addMakerAward(cred!, 1);
+        appendJsonl("data/events/maker.jsonl", {
+          at: new Date().toISOString(),
+          day: isoDay(r.date),
+          email: r.email,
+          maker: r.maker,
+          id: r.id,
+        });
       }
     } catch (e: any) {
       err++;
@@ -646,7 +731,7 @@ async function handleNormalizedEvent(ev: Normalized) {
   }
   markSeen(idForDedupe);
 
-  // “新規アポ”判定（大文字小文字を吸収）
+  // “新規アポ”判定
   const outcomeStr = String(ev.outcome ?? "").trim();
   const isAppointment = outcomeStr && APPOINTMENT_SET_LOWER.has(outcomeStr.toLowerCase());
 
@@ -660,7 +745,6 @@ async function handleNormalizedEvent(ev: Normalized) {
 
 // ---- だれが獲得したかを解決 ------------------------------------------------
 function extractUserIdFromRaw(raw: any): string | undefined {
-  // 例: sourceId: "userId:75172305"
   const m = String(raw?.sourceId || "").match(/userId:(\d+)/);
   if (m) return m[1];
   return undefined;
@@ -672,7 +756,8 @@ function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: str
     raw.ownerEmail ||
     raw.userEmail ||
     raw?.owner?.email ||
-    raw?.properties?.hs_created_by_user_id?.email;
+    raw?.properties?.hs_created_by_user_id?.email ||
+    raw?.userEmail;
 
   const userId = extractUserIdFromRaw(raw) || raw.userId || raw.actorId;
   const map = safeParse<Record<string, { name?: string; email?: string }>>(HUBSPOT_USER_MAP_JSON);
@@ -729,6 +814,14 @@ async function awardXpForAppointment(ev: Normalized) {
     const id = (todo as any)?.id;
     if (id) await completeTask(id, cred);
     log(msg);
+
+    // ログ
+    appendJsonl("data/events/appointments.jsonl", {
+      at: new Date().toISOString(),
+      day: isoDay(ev.occurredAt),
+      callId: ev.callId,
+      actor: who,
+    });
   } catch (e: any) {
     console.error("[habitica] failed:", e?.message || e);
   }
@@ -749,7 +842,7 @@ function inferDurationMs(v: any): number {
   return n >= 100000 ? Math.floor(n) : Math.floor(n * 1000);
 }
 function computeCallXp(ms: number): number {
-  const base = CALL_XP_PER_CALL;
+  const base = CALL_XP_PER_CALL; // 0秒でも+1カウント
   const extra = ms > 0 ? Math.floor(ms / CALL_XP_UNIT_MS) * CALL_XP_PER_5MIN : 0;
   return base + extra;
 }
@@ -774,6 +867,17 @@ async function awardXpForCallDuration(ev: CallDurEv) {
     const id = (todo as any)?.id;
     if (id) await completeTask(id, cred);
     log(`[call] xp=${xp} ms=${ev.durationMs} by=${who.name} at=${when}`);
+
+    // ログ
+    appendJsonl("data/events/calls.jsonl", {
+      at: new Date().toISOString(),
+      day: isoDay(ev.occurredAt),
+      callId: ev.callId,
+      ms: ev.durationMs,
+      xp: computeCallXp(ev.durationMs),
+      actor: who,
+    });
+
     if (CALL_CHATWORK_NOTIFY) {
       const msg = [
         "[info]",
@@ -800,7 +904,7 @@ async function handleCallDurationEvent(ev: CallDurEv) {
   await awardXpForCallDuration(ev);
 }
 
-// ---- Chatwork: “誰がアポ獲得したか”を強調したモチベUP文面 -------------------
+// ---- Chatwork: “誰がアポ獲得したか”演出 -----------------------------------
 function formatChatworkMessage(ev: Normalized) {
   const when = fmtJST(ev.occurredAt);
   const cid = ev.callId ?? "-";
@@ -983,6 +1087,73 @@ function hostAllowed(u: string): boolean {
     return false;
   }
 }
+
+// ====================== ダッシュボード（今日/昨日） ==========================
+app.get("/admin/dashboard", (_req, res) => {
+  function readJsonl(fp: string): any[] {
+    try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); }
+    catch { return []; }
+  }
+  const today = isoDay();
+  const yest = (()=>{ const d=new Date(); d.setDate(d.getDate()-1); return isoDay(d); })();
+  const files = {
+    calls: readJsonl("data/events/calls.jsonl"),
+    appts: readJsonl("data/events/appointments.jsonl"),
+    apprs: readJsonl("data/events/approvals.jsonl"),
+    sales: readJsonl("data/events/sales.jsonl"),
+  };
+  function agg(day: string) {
+    const by: Record<string, any> = {};
+    const nameOf = (a:any)=> a?.actor?.name || (a?.email?.split?.("@")[0]) || "担当者";
+    for (const a of files.calls.filter(x=>x.day===day)) {
+      const k = nameOf(a); by[k] ??= { name:k, calls:0, min:0, appts:0, apprs:0, sales:0 };
+      by[k].calls += 1; by[k].min += Math.round((a.ms||0)/60000);
+    }
+    for (const a of files.appts.filter(x=>x.day===day)) {
+      const k = nameOf(a); by[k] ??= { name:k, calls:0, min:0, appts:0, apprs:0, sales:0 };
+      by[k].appts += 1;
+    }
+    for (const a of files.apprs.filter(x=>x.day===day)) {
+      const k = nameOf(a); by[k] ??= { name:k, calls:0, min:0, appts:0, apprs:0, sales:0 };
+      by[k].apprs += 1;
+    }
+    for (const a of files.sales.filter(x=>x.day===day)) {
+      const k = nameOf(a); by[k] ??= { name:k, calls:0, min:0, appts:0, apprs:0, sales:0 };
+      by[k].sales += Number(a.amount||0);
+    }
+    for (const k of Object.keys(by)) {
+      const v = by[k]; v.rate = v.appts>0 ? Math.round((v.apprs/v.appts)*100) : 0;
+    }
+    return Object.values(by).sort((a:any,b:any)=>a.name.localeCompare(b.name));
+  }
+  const T = agg(today), Y = agg(yest);
+
+  const Row = (r:any)=> `<tr>
+    <td>${r.name}</td><td style="text-align:right">${r.calls}</td>
+    <td style="text-align:right">${r.min}</td>
+    <td style="text-align:right">${r.appts}</td>
+    <td style="text-align:right">${r.apprs}</td>
+    <td style="text-align:right">${r.rate}%</td>
+    <td style="text-align:right">¥${(r.sales||0).toLocaleString()}</td></tr>`;
+
+  const html = `<!doctype html><meta charset="utf-8">
+  <title>ダッシュボード</title>
+  <style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:2rem}
+  table{border-collapse:collapse;min-width:720px}
+  th,td{border:1px solid #ddd;padding:.5rem .6rem}
+  th{background:#f7f7f7}
+  h2{margin-top:2rem}
+  </style>
+  <h1>ダッシュボード</h1>
+  <h2>本日 ${today}</h2>
+  <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
+  <tbody>${T.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
+  <h2>前日 ${yest}</h2>
+  <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
+  <tbody>${Y.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>`;
+  res.type("html").send(html);
+});
 
 // ---- Debug -----------------------------------------------------------------
 app.get("/debug/last", (req, res) => {
