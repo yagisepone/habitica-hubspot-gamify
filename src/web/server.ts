@@ -527,8 +527,16 @@ app.post("/webhooks/zoom", async (req: Request, res: Response) => {
   const callId =
     raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
 
-  // actor をemailで擬似
-  const whoRaw = { userEmail: email };
+  // actor をemailで擬似（名前は resolveActor 側で補強）
+  const whoRaw = {
+    userEmail: email,
+    user_name:
+      raw.user_name ||
+      raw.caller_name ||
+      raw.callee_name ||
+      raw.participant?.user_name ||
+      raw.owner_name,
+  };
 
   await handleCallDurationEvent({
     source: "workflow",
@@ -749,6 +757,15 @@ function extractUserIdFromRaw(raw: any): string | undefined {
   if (m) return m[1];
   return undefined;
 }
+
+// HABITICA_USERS_JSON から「email -> 表示名(name)」を任意で拾う（存在すれば採用）
+const __HAB_RAW = safeParse<Record<string, any>>(HABITICA_USERS_JSON) || {};
+const HAB_EMAIL_NAME_MAP: Record<string, string> = {};
+for (const [k, v] of Object.entries(__HAB_RAW)) {
+  const nm = (v as any)?.name;
+  if (nm) HAB_EMAIL_NAME_MAP[String(k).toLowerCase()] = String(nm);
+}
+
 function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: string; email?: string } {
   const raw = ev.raw || {};
   const email =
@@ -763,8 +780,17 @@ function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: str
   const map = safeParse<Record<string, { name?: string; email?: string }>>(HUBSPOT_USER_MAP_JSON);
   const mapped = userId && map ? map[String(userId)] : undefined;
 
+  // Zoom 等の名前フィールドも拾う
+  const nameFromPayload =
+    raw.user_name || raw.caller_name || raw.callee_name || raw?.participant?.user_name || raw.owner_name;
+
+  const emailLower = email ? String(email).toLowerCase() : undefined;
+  const nameFromHab = emailLower ? HAB_EMAIL_NAME_MAP[emailLower] : undefined;
+
   const display =
     (mapped && mapped.name) ||
+    nameFromPayload ||
+    nameFromHab ||
     (email ? String(email).split("@")[0] : undefined) ||
     "担当者";
 
