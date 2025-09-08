@@ -11,11 +11,11 @@ import { parse as csvParse } from "csv-parse/sync";
 // - GET  /oauth/callback
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
-// - POST /admin/csv            // CSV取り込み（CSV_PUBLIC=1なら誰でも; それ以外はBearer）
+// - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart）
 // - GET  /admin/template.csv   // CSVテンプレDL
-// - GET  /admin/upload         // 手動アップロードUI（CSV_PUBLIC=1ならトークンUI非表示）
-// - GET  /admin/files          // CSVカタログ一覧（CSV_PUBLIC=1なら誰でも）※任意
-// - POST /admin/import-url     // URLのCSVを取り込み（CSV_PUBLIC=1なら誰でも）※任意
+// - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
+// - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
+// - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -33,15 +33,23 @@ app.use(
   })
 );
 
+// === 追加: CORS（/admin 配下だけ許可、Habitica/Tampermonkey から叩けるように） ===
+app.use((req, res, next) => {
+  if (req.path.startsWith("/admin/")) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    if (req.method === "OPTIONS") return res.status(204).end();
+  }
+  next();
+});
+
 // ---- Env -------------------------------------------------------------------
 const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const DRY_RUN = String(process.env.DRY_RUN || "1") === "1";
 
-// ★ CSV公開モード（1でCSV系は認証スキップ）
-const CSV_PUBLIC = String(process.env.CSV_PUBLIC || "0") === "1";
-
-// CSVアップロードを許可する追加トークン（カンマ区切り）
+// CSVアップロードを許可する追加トークン（社長用など、カンマ区切り）
 const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "")
   .split(",")
   .map((s) => s.trim())
@@ -125,8 +133,6 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 function requireBearerCsv(req: Request, res: Response): boolean {
-  // 公開モードなら認証スキップ
-  if (CSV_PUBLIC) return true;
   const auth = req.header("authorization") || "";
   const token = auth.replace(/^Bearer\s+/i, "");
   if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length === 0) {
@@ -223,7 +229,6 @@ app.get("/healthz", (_req, res) => {
     appointmentValues: APPOINTMENT_VALUES,
     habiticaUserCount: Object.keys(habMap).length,
     callXp: { perCall: CALL_XP_PER_CALL, per5min: CALL_XP_PER_5MIN, unitMs: CALL_XP_UNIT_MS },
-    csvPublic: CSV_PUBLIC,
   });
 });
 app.get("/support", (_req, res) =>
@@ -472,7 +477,7 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
 });
 
 // ====================== Phase 2: /admin/csv エンドポイント ======================
-// CSV_PUBLIC=1 のときは認証不要。それ以外は Bearer 必須。
+// Bearer必須。text/csv 直送 or multipart/form-data(file)
 // CSVヘッダ: type,email,amount,maker,id,date,notes
 // type: approval|承認 / sales|売上 / maker|メーカー
 
@@ -593,14 +598,14 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
       const cred = getHabiticaCredFor(r.email);
       if (r.type === "approval") {
         nApproval++;
-        await addApproval(cred as any, 1, r.notes || "CSV取り込み");
+        await addApproval(cred!, 1, r.notes || "CSV取り込み");
       } else if (r.type === "sales") {
         nSales++;
         sumSales += Number(r.amount || 0);
-        await addSales(cred as any, Number(r.amount || 0), r.notes || "CSV取り込み");
+        await addSales(cred!, Number(r.amount || 0), r.notes || "CSV取り込み");
       } else if (r.type === "maker") {
         nMaker++;
-        await addMakerAward(cred as any, 1);
+        await addMakerAward(cred!, 1);
       }
     } catch (e: any) {
       err++;
@@ -658,12 +663,10 @@ function extractUserIdFromRaw(raw: any): string | undefined {
   // 例: sourceId: "userId:75172305"
   const m = String(raw?.sourceId || "").match(/userId:(\d+)/);
   if (m) return m[1];
-  // 他の形があればここに追加
   return undefined;
 }
 function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: string; email?: string } {
   const raw = ev.raw || {};
-  // 1) イベントに email があれば最優先
   const email =
     raw.actorEmail ||
     raw.ownerEmail ||
@@ -671,12 +674,10 @@ function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: str
     raw?.owner?.email ||
     raw?.properties?.hs_created_by_user_id?.email;
 
-  // 2) userId → マップ解決
   const userId = extractUserIdFromRaw(raw) || raw.userId || raw.actorId;
   const map = safeParse<Record<string, { name?: string; email?: string }>>(HUBSPOT_USER_MAP_JSON);
   const mapped = userId && map ? map[String(userId)] : undefined;
 
-  // 優先順位：mapped.name → emailのローカル部 → "担当者"
   const display =
     (mapped && mapped.name) ||
     (email ? String(email).split("@")[0] : undefined) ||
@@ -745,7 +746,6 @@ type CallDurEv = {
 function inferDurationMs(v: any): number {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  // 1e5以上はmsとみなす（それ以外はsec→ms）
   return n >= 100000 ? Math.floor(n) : Math.floor(n * 1000);
 }
 function computeCallXp(ms: number): number {
@@ -826,7 +826,7 @@ async function notifyChatworkAppointment(ev: Normalized) {
     return;
   }
   try {
-    const r = await sendChatworkMessage(text as any);
+    const r = await sendChatworkMessage(text);
     if (!(r as any).success) {
       console.error("[chatwork] failed", (r as any).status, (r as any).json);
     } else {
@@ -899,12 +899,12 @@ app.get("/admin/upload", (_req, res) => {
     <label>Base URL</label>
     <input id="base" size="40" value="${PUBLIC_BASE_URL || ""}" placeholder="https://..."/>
   </div>
-  <div class="row" id="tokenRow">
+  <div class="row">
     <label>AUTH_TOKEN</label>
     <input id="token" size="40" placeholder="Bearer用トークン" />
     <button id="save">保存</button><span id="saved" class="hint"></span>
   </div>
-  <p class="hint" id="hint">※ TokenとBase URLはブラウザのlocalStorageに保存されます（サーバには送信されません）。</p>
+  <p class="hint">※ TokenとBase URLはブラウザのlocalStorageに保存されます（サーバには送信されません）。</p>
 </div>
 <div class="card">
   <h3>ファイルを選んでアップロード</h3>
@@ -922,10 +922,8 @@ app.get("/admin/upload", (_req, res) => {
 </div>
 <div id="out" class="card mono"></div>
 <script>
-const PUBLIC = ${CSV_PUBLIC ? "true" : "false"};
 const qs=(s)=>document.querySelector(s);
 const baseEl=qs('#base'), tokenEl=qs('#token'), out=qs('#out'), saved=qs('#saved');
-const tokenRow=qs('#tokenRow'), hintEl=qs('#hint');
 function load(){
   baseEl.value = localStorage.getItem('adm_base') || baseEl.value;
   tokenEl.value = localStorage.getItem('adm_token') || '';
@@ -934,28 +932,18 @@ function load(){
   if(p.get('token')){ tokenEl.value = p.get('token'); changed=true; }
   if(changed){ save(); history.replaceState({}, '', location.pathname); }
   if(p.get('auto')==='1'){ qs('#file').click(); }
-  if(PUBLIC){
-    if(tokenRow) tokenRow.style.display = 'none';
-    if(hintEl) hintEl.textContent = '※ 公開モード（トークン不要）。Base URL のみ設定してください。';
-  }
 }
 function save(){ localStorage.setItem('adm_base', baseEl.value.trim()); localStorage.setItem('adm_token', tokenEl.value.trim()); saved.textContent='保存しました'; setTimeout(()=>saved.textContent='',1500); }
 function pr(x){ out.textContent = typeof x==='string' ? x : JSON.stringify(x,null,2); }
 async function postCsvRaw(text){
-  const base=baseEl.value.trim(); const tok=tokenEl.value.trim();
-  if(!base) return pr('Baseを入力');
-  const headers = PUBLIC ? {'Content-Type':'text/csv'} : {'Content-Type':'text/csv','Authorization':'Bearer '+tok};
-  if(!PUBLIC && !tok) return pr('Tokenを入力');
-  const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers, body:text });
+  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
+  const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers:{'Content-Type':'text/csv','Authorization':'Bearer '+tok}, body:text });
   const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
 }
 async function postCsvFile(file){
-  const base=baseEl.value.trim(); const tok=tokenEl.value.trim();
-  if(!base) return pr('Baseを入力');
+  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
   const fd=new FormData(); fd.append('file', file, file.name);
-  const headers = PUBLIC ? {} : {'Authorization':'Bearer '+tok};
-  if(!PUBLIC && !tok) return pr('Tokenを入力');
-  const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers, body:fd });
+  const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers:{'Authorization':'Bearer '+tok}, body:fd });
   const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
 }
 qs('#save').onclick=save;
