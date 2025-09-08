@@ -162,6 +162,7 @@ function markSeen(id?: string | number | null) {
 
 // ---- Health / Support ------------------------------------------------------
 app.get("/healthz", (_req, res) => {
+  const habMap = buildHabiticaMap(HABITICA_USERS_JSON);
   res.json({
     ok: true,
     tz: process.env.TZ || "Asia/Tokyo",
@@ -170,6 +171,7 @@ app.get("/healthz", (_req, res) => {
     baseUrl: PUBLIC_BASE_URL || null,
     dryRun: DRY_RUN,
     appointmentValues: APPOINTMENT_VALUES,
+    habiticaUserCount: Object.keys(habMap).length,
   });
 });
 app.get("/support", (_req, res) =>
@@ -452,16 +454,26 @@ function resolveActor(ev: Normalized): { name: string; email?: string } {
   return { name: display, email: finalEmail };
 }
 
-// ---- Habitica: 対象ユーザーの資格情報を引く（任意でユーザー別加算） --------
+// ---- Habitica: 担当メール→資格情報マップ（起動時に正規化） -----------------
 type HabiticaCred = { userId: string; apiToken: string };
+
+function buildHabiticaMap(jsonStr: string): Record<string, HabiticaCred> {
+  const parsed = safeParse<Record<string, HabiticaCred>>(jsonStr) || {};
+  const out: Record<string, HabiticaCred> = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (!v || !v.userId || !v.apiToken) continue;
+    out[String(k).toLowerCase()] = { userId: String(v.userId), apiToken: String(v.apiToken) };
+  }
+  return out;
+}
+const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
+
 function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
-  const map = safeParse<Record<string, HabiticaCred>>(HABITICA_USERS_JSON);
-  if (!map) return undefined;
-  if (email && map[email]) return map[email];
-  return undefined;
+  if (!email) return undefined;
+  return HAB_MAP[email.toLowerCase()];
 }
 
-// ---- Habitica: アポ演出（To-Do→即完了） -----------------------------------
+// ---- Habitica: アポ演出（To-Do→即完了・個人優先/無ければ共通） -------------
 async function awardXpForAppointment(ev: Normalized) {
   const when = fmtJST(ev.occurredAt);
   const who = resolveActor(ev);
@@ -555,6 +567,7 @@ app.listen(PORT, () => {
       "|"
     )})`
   );
+  log(`[habitica] user map loaded: ${Object.keys(HAB_MAP).length} users`);
 });
 
 export {};

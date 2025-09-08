@@ -5,8 +5,11 @@ export type HabiticaCred = { userId: string; apiToken: string };
 function headers(cred?: HabiticaCred) {
   const user = cred?.userId ?? process.env.HABITICA_USER_ID;
   const key  = cred?.apiToken ?? process.env.HABITICA_API_TOKEN;
-  if (!user || !key) return null; // 未設定は安全スキップ
-  const xcli = process.env.HABITICA_X_CLIENT || `${user}-gamify`;
+  if (!user || !key) {
+    console.warn("[habitica] WARN: missing credentials (user or apiToken). skip.");
+    return null; // 未設定は安全スキップ
+  }
+  const xcli = process.env.HABITICA_X_CLIENT || `sales-gamify`;
   return {
     "Content-Type": "application/json",
     "x-api-user": user,
@@ -28,6 +31,7 @@ export async function createTodo(
   const body: any = { text: title, type: "todo", notes: note || "" };
   if (dateISO) body.date = dateISO;
 
+  console.log(`[habitica] createTodo title="${title}" user=${cred?.userId ?? "(common)"}`);
   const res = await fetch(`${BASE}/tasks/user`, {
     method: "POST",
     headers: h,
@@ -41,6 +45,7 @@ export async function createTodo(
 export async function completeTask(taskId: string, cred?: HabiticaCred) {
   const h = headers(cred);
   if (!h) return { skipped: true, reason: "no_credentials" };
+  console.log(`[habitica] completeTask id=${taskId} user=${cred?.userId ?? "(common)"}`);
   const res = await fetch(`${BASE}/tasks/${taskId}/score/up`, {
     method: "POST",
     headers: h,
