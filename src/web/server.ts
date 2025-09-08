@@ -19,7 +19,7 @@ import path from "path";
 // - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
-// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）
+// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日 or ?day=YYYY-MM-DD）
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -37,7 +37,7 @@ app.use(
   })
 );
 
-// === 追加: CORS（/admin 配下だけ許可、Habitica/Tampermonkey から叩けるように） ===
+// === CORS（/admin 配下だけ許可、Habitica/Tampermonkey から叩けるように） ===
 app.use((req, res, next) => {
   if (req.path.startsWith("/admin/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -255,7 +255,7 @@ app.get("/healthz", (_req, res) => {
   const habMap = buildHabiticaMap(HABITICA_USERS_JSON);
   res.json({
     ok: true,
-    version: "2025-09-08-csv2",
+    version: "2025-09-08-final",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -610,7 +610,7 @@ async function _handleCsvMultipart(req: Request, res: Response) {
         mt === "application/octet-stream" ||
         mt.endsWith("ms-excel");
       if (!ok) return reject(new Error(`file must be CSV (got ${info.mimeType})`));
-      file.setEncoding("utf8"); // UTF-8/BOM 対応（SJISは未対応だが現行エクスポートはUTF-8）
+      file.setEncoding("utf8"); // UTF-8/BOM 対応
       file.on("data", (d: string) => (csvText += d));
     });
     bb.on("error", reject);
@@ -630,42 +630,41 @@ type CsvNorm = {
   notes?: string;
 };
 
-// 仕様書CSV or 日本語アポイントCSV を正規化
+// 仕様書CSV or 日本語アポイントCSV を正規化（行番号フォールバックで安定ID）
 function normalizeCsvRows(records: any[]): CsvNorm[] {
   const out: CsvNorm[] = [];
-  for (const r of records) {
+
+  records.forEach((r, i) => {
     // --- 1) 仕様書CSV（type,email,amount,maker,id,date,notes）
-    const typeRaw = String((r.type ?? r.Type ?? "")).trim();
+    const typeRaw = String((r?.type ?? r?.Type ?? "")).trim();
     if (typeRaw) {
       const t =
         (typeRaw === "承認" ? "approval" : typeRaw === "売上" ? "sales" : typeRaw === "メーカー" ? "maker" : typeRaw) as
           | "approval"
           | "sales"
           | "maker";
-      if (!["approval", "sales", "maker"].includes(t)) continue;
+      if (!["approval", "sales", "maker"].includes(t)) return;
       const email = r.email ? String(r.email).trim().toLowerCase() : undefined;
       const amountVal = r.amount != null ? num(r.amount) : undefined;
       const maker = r.maker ? String(r.maker).trim() : undefined;
       let id = String(r.id || "").trim();
       const date = r.date ? String(r.date) : undefined;
       const notes = r.notes ? String(r.notes) : undefined;
-      if (!id) id = `${t}:${email || "-"}:${amountVal || 0}:${maker || "-"}:${date || "-"}`;
+      if (!id) id = `${t}:${email || "-"}:${amountVal || 0}:${maker || "-"}:${date || "-"}:${i}`;
       out.push({ type: t, email, amount: amountVal, maker, id, date, notes });
-      continue;
+      return;
     }
 
     // --- 2) 日本語アポイントCSV（自動判別）
-    // 代表的カラムがあれば appointments とみなす
-    const hasJP =
-      r["承認日時"] != null ||
-      r["商談ステータス"] != null ||
-      r["報酬"] != null ||
-      r["追加報酬"] != null ||
-      pickKey(r, (k) => /メール.?アドレス/.test(k)) != null;
+    const looksJP =
+      r?.["承認日時"] != null ||
+      r?.["商談ステータス"] != null ||
+      r?.["報酬"] != null ||
+      r?.["追加報酬"] != null ||
+      pickKey(r, (k) => /メール.?アドレス/i.test(k)) != null;
 
-    if (!hasJP) continue;
+    if (!looksJP) return;
 
-    // メール列（例：'担当者　メールアドレス' など全角スペース含む）
     const mailKey =
       pickKey(r, (k) => /メール.?アドレス/i.test(k)) ||
       pickKey(r, (k) => /email/i.test(k));
@@ -673,41 +672,45 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       mailKey ? String(r[mailKey]).trim().toLowerCase() :
       (r.email ? String(r.email).trim().toLowerCase() : undefined);
 
-    const id = String(r["ID"] || r["id"] || "").trim() || `appt:${Date.now()}:${Math.random().toString(36).slice(2,8)}`;
+    const idBase =
+      String(r["活動ID"] || r["レコードID"] || r["通話ID"] || r["ID"] || r["id"] || "").trim() ||
+      `${email || "-"}:${i}`;
     const status = normSpace(String(r["商談ステータス"] || ""));
-    const approvedAt = String(r["承認日時"] || r["商談終了日時"] || r["商談開始日時"] || "") || undefined;
+    const approvedAt =
+      String(r["承認日時"] || r["商談終了日時"] || r["商談開始日時"] || "") || undefined;
     const makerName = r["メーカー名"] ? String(r["メーカー名"]).trim() : undefined;
     const reward = num(r["報酬"]) || 0;
     const rewardExtra = num(r["追加報酬"]) || 0;
     const salesAmt = (reward || 0) + (rewardExtra || 0);
 
-    // approval: 承認日時が入っている or ステータスに「承認」を含む
+    // 承認
     const isApproved = !!approvedAt || /承認/i.test(status);
     if (isApproved) {
       out.push({
         type: "approval",
         email,
-        id: `${id}`,
+        id: `${idBase}:appr`,
         date: approvedAt,
         notes: makerName ? `メーカー=${makerName}` : undefined,
       });
     }
 
-    // sales: 報酬合計が正
+    // 売上
     if (salesAmt > 0) {
       out.push({
         type: "sales",
         email,
         amount: salesAmt,
-        id: `${id}:sales`,
+        id: `${idBase}:sales`,
         date: approvedAt,
         notes: makerName ? `メーカー=${makerName}` : undefined,
       });
     }
 
-    // maker: 自動付与は誤爆しやすいのでデフォルト無効（必要なら下行を有効化）
-    // if (makerName) out.push({ type: "maker", email, maker: makerName, id: `${id}:maker`, date: approvedAt });
-  }
+    // メーカー表彰（必要時だけ有効化）
+    // if (makerName) out.push({ type: "maker", email, maker: makerName, id: `${idBase}:maker`, date: approvedAt });
+  });
+
   return out;
 }
 
@@ -739,7 +742,6 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
       continue;
     }
     try {
-      // Habitica資格が無い場合は分かりやすくエラー化
       const cred = getHabiticaCredFor(r.email);
       if (!cred) {
         err++;
@@ -1175,14 +1177,15 @@ function hostAllowed(u: string): boolean {
   }
 }
 
-// ====================== ダッシュボード（今日/昨日） ==========================
-app.get("/admin/dashboard", (_req, res) => {
+// ====================== ダッシュボード（today/yesterday or ?day=） ==========
+app.get("/admin/dashboard", (req, res) => {
   function readJsonl(fp: string): any[] {
     try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); }
     catch { return []; }
   }
-  const today = isoDay();
-  const yest = (()=>{ const d=new Date(); d.setDate(d.getDate()-1); return isoDay(d); })();
+  const qDay = String((req.query?.day || "") as string).trim();
+  const today = qDay || isoDay();
+  const yest = (()=>{ const d=new Date(today); d.setDate(d.getDate()-1); return isoDay(d); })();
   const files = {
     calls: readJsonl("data/events/calls.jsonl"),
     appts: readJsonl("data/events/appointments.jsonl"),
@@ -1231,9 +1234,11 @@ app.get("/admin/dashboard", (_req, res) => {
   th,td{border:1px solid #ddd;padding:.5rem .6rem}
   th{background:#f7f7f7}
   h2{margin-top:2rem}
+  .hint{color:#666}
   </style>
   <h1>ダッシュボード</h1>
-  <h2>本日 ${today}</h2>
+  <p class="hint">?day=YYYY-MM-DD で任意日を指定できます（例: /admin/dashboard?day=2025-09-02）。</p>
+  <h2>対象日 ${today}</h2>
   <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
   <tbody>${T.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
   <h2>前日 ${yest}</h2>
