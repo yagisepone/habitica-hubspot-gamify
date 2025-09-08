@@ -1,5 +1,7 @@
 import express, { Request, Response } from "express";
 import crypto from "crypto";
+import Busboy from "busboy";
+import { parse as csvParse } from "csv-parse/sync";
 
 // === habitica-hubspot-gamify : Web server (Render 用) =======================
 //
@@ -9,6 +11,11 @@ import crypto from "crypto";
 // - GET  /oauth/callback
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
+// - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart）
+// - GET  /admin/template.csv   // CSVテンプレDL
+// - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
+// - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
+// - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -31,6 +38,12 @@ const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const DRY_RUN = String(process.env.DRY_RUN || "1") === "1";
 
+// CSVアップロードを許可する追加トークン（社長用など、カンマ区切り）
+const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const WEBHOOK_SECRET =
   process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET ||
   process.env.HUBSPOT_APP_SECRET ||
@@ -45,9 +58,10 @@ const HUBSPOT_REDIRECT_URI =
   "https://sales-gamify.onrender.com/oauth/callback";
 
 // 公開URL（例: https://sales-gamify.onrender.com）
-// v3の requestUri 計算で「絶対URL」も候補に含めるために使用
-const PUBLIC_BASE_URL =
-  (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/+$/, "");
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(
+  /\/+$/,
+  ""
+);
 
 // “新規アポ”とみなす outcome 値（内部値/表示ラベルの両方OK）
 const APPOINTMENT_VALUES = (process.env.APPOINTMENT_VALUES || "APPOINTMENT_SCHEDULED,新規アポ")
@@ -59,17 +73,36 @@ const APPOINTMENT_SET_LOWER = new Set(APPOINTMENT_VALUES.map((v) => v.toLowerCas
 // 重複抑止TTL（秒）
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24 * 60 * 60);
 
-// 担当者名解決のための任意マップ（userId→{name,email}）
+// HubSpot userId -> {name,email}
 const HUBSPOT_USER_MAP_JSON = process.env.HUBSPOT_USER_MAP_JSON || "";
 
-// （任意）担当メール→Habitica資格情報 のマップ（JSON文字列）
-// 例: HABITICA_USERS_JSON='{"alice@ex.com":{"userId":"...","apiToken":"..."}}'
+// メール -> Habitica資格（個人付与用）
 const HABITICA_USERS_JSON = process.env.HABITICA_USERS_JSON || "";
+
+// CSVカタログ（Habiticaボタンの一覧用・任意）
+const CSV_CATALOG_JSON = process.env.CSV_CATALOG_JSON || "[]";
+// 許可ホスト（空なら https のみ許可）
+const CSV_ALLOWLIST_HOSTS = String(process.env.CSV_ALLOWLIST_HOSTS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// 通話KPIの係数（必要時のみENVで上書き）
+const CALL_XP_PER_CALL = Number(process.env.CALL_XP_PER_CALL || 1);
+const CALL_XP_PER_5MIN = Number(process.env.CALL_XP_PER_5MIN || 2);
+const CALL_XP_UNIT_MS = Number(process.env.CALL_XP_UNIT_MS || 5 * 60 * 1000); // 5分
+const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
 
 // ---- External connectors ----------------------------------------------------
 // ビルド後（dist/web/server.js）から見て ../connectors/xxx.js が正解
 import { sendChatworkMessage } from "../connectors/chatwork.js";
-import { createTodo, completeTask } from "../connectors/habitica.js";
+import {
+  createTodo,
+  completeTask,
+  addApproval,
+  addSales,
+  addMakerAward,
+} from "../connectors/habitica.js";
 
 // ---- Util ------------------------------------------------------------------
 function log(...args: any[]) {
@@ -87,6 +120,18 @@ function requireBearer(req: Request, res: Response): boolean {
     return false;
   }
   return true;
+}
+function requireBearerCsv(req: Request, res: Response): boolean {
+  const auth = req.header("authorization") || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length === 0) {
+    res.status(500).json({ ok: false, error: "Server missing tokens" });
+    return false;
+  }
+  if (token === AUTH_TOKEN) return true;
+  if (CSV_UPLOAD_TOKENS.includes(token)) return true;
+  res.status(401).json({ ok: false, error: "Authentication required" });
+  return false;
 }
 function timingEqual(a: string, b: string) {
   const A = Buffer.from(a);
@@ -172,6 +217,7 @@ app.get("/healthz", (_req, res) => {
     dryRun: DRY_RUN,
     appointmentValues: APPOINTMENT_VALUES,
     habiticaUserCount: Object.keys(habMap).length,
+    callXp: { perCall: CALL_XP_PER_CALL, per5min: CALL_XP_PER_5MIN, unitMs: CALL_XP_UNIT_MS },
   });
 });
 app.get("/support", (_req, res) =>
@@ -333,12 +379,27 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
         String(e.subscriptionType || "").toLowerCase().includes("call") ||
         String(e.objectType || "").toLowerCase().includes("call") ||
         String(e.objectTypeId || "") === "0-48"; // 通話Object Id
+
+      // 成果=新規アポ
       if (isCall && e.propertyName === "hs_call_disposition") {
         await handleNormalizedEvent({
           source: "v3",
           eventId: e.eventId ?? e.attemptNumber,
           callId: e.objectId,
           outcome: e.propertyValue,
+          occurredAt: e.occurredAt,
+          raw: e,
+        });
+      }
+
+      // 通話KPI: 通話時間
+      if (isCall && e.propertyName === "hs_call_duration") {
+        const ms = inferDurationMs(e.propertyValue);
+        await handleCallDurationEvent({
+          source: "v3",
+          eventId: e.eventId ?? e.attemptNumber,
+          callId: e.objectId,
+          durationMs: ms,
           occurredAt: e.occurredAt,
           raw: e,
         });
@@ -388,8 +449,173 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
     raw: b,
   });
 
+  // 擬似: 通話KPIテスト用 (type=call.duration)
+  if (b.type === "call.duration") {
+    const ms = inferDurationMs(b.durationMs ?? b.durationSec);
+    await handleCallDurationEvent({
+      source: "workflow",
+      eventId: b.eventId || callId || `dur:${Date.now()}`,
+      callId: callId || b.callId || b.id,
+      durationMs: ms,
+      occurredAt,
+      raw: b,
+    });
+  }
+
   return res.json({ ok: true });
 });
+
+// ====================== Phase 2: /admin/csv エンドポイント ======================
+// Bearer必須。text/csv 直送 or multipart/form-data(file)
+// CSVヘッダ: type,email,amount,maker,id,date,notes
+// type: approval|承認 / sales|売上 / maker|メーカー
+
+// 重複抑止（7日TTL）
+const _csvSeen = new Map<string, number>();
+const _CSV_TTL = 7 * 24 * 60 * 60 * 1000;
+function _csvDedupeKey(r: any) {
+  const s = `${r.type}|${r.email}|${r.amount}|${r.maker}|${r.date}|${r.id}`;
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+function _csvMarkOrSkip(key: string): boolean {
+  const now = Date.now();
+  for (const [k, ts] of [..._csvSeen.entries()]) if (now - ts > _CSV_TTL) _csvSeen.delete(k);
+  if (_csvSeen.has(key)) return false;
+  _csvSeen.set(key, now);
+  return true;
+}
+
+// 1st handler: text/csv を先に受ける
+app.post("/admin/csv", express.text({ type: "text/csv", limit: "10mb" }));
+app.post("/admin/csv", async (req: Request, res: Response) => {
+  if (!requireBearerCsv(req, res)) return;
+  const ct = String(req.headers["content-type"] || "");
+  try {
+    if (/^text\/csv/i.test(ct)) {
+      return await _handleCsvText(String((req as any).body || ""), req, res);
+    }
+    if (/multipart\/form-data/i.test(ct)) {
+      return await _handleCsvMultipart(req, res);
+    }
+    return res.status(415).json({ ok: false, error: "unsupported content-type" });
+  } catch (e: any) {
+    console.error("[/admin/csv]", e?.message || e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+async function _handleCsvMultipart(req: Request, res: Response) {
+  let csvText = "";
+  await new Promise<void>((resolve, reject) => {
+    const bb = Busboy({ headers: req.headers });
+    bb.on("file", (_name, file, info) => {
+      const mt = String(info.mimeType || "").toLowerCase();
+      // “.csv”で来るブラウザは ms-excel MIME を付けることがあるため許容を広げる
+      const ok =
+        mt.includes("csv") ||
+        mt === "text/plain" ||
+        mt === "application/octet-stream" ||
+        mt.endsWith("ms-excel");
+      if (!ok) return reject(new Error(`file must be CSV (got ${info.mimeType})`));
+      file.setEncoding("utf8");
+      file.on("data", (d: string) => (csvText += d));
+    });
+    bb.on("error", reject);
+    bb.on("finish", resolve);
+    req.pipe(bb);
+  });
+  return _handleCsvText(csvText, req, res);
+}
+
+type CsvNorm = {
+  type: "approval" | "sales" | "maker";
+  email?: string;
+  amount?: number;
+  maker?: string;
+  id: string;
+  date?: string;
+  notes?: string;
+};
+
+function normalizeCsvRows(rows: any[]): CsvNorm[] {
+  const out: CsvNorm[] = [];
+  for (const r of rows) {
+    const type = String(r.type || r.Type || "").trim().toLowerCase();
+    const t =
+      (type === "承認" ? "approval" : type === "売上" ? "sales" : type === "メーカー" ? "maker" : type) as
+        | "approval"
+        | "sales"
+        | "maker";
+    if (!["approval", "sales", "maker"].includes(t)) continue;
+    const email = r.email ? String(r.email).trim().toLowerCase() : undefined;
+    const amount =
+      r.amount != null ? Number(String(r.amount).replace(/[^\d.-]/g, "")) : undefined;
+    const maker = r.maker ? String(r.maker).trim() : undefined;
+    let id = String(r.id || "").trim();
+    const date = r.date ? String(r.date) : undefined;
+    const notes = r.notes ? String(r.notes) : undefined;
+    if (!id) id = `${t}:${email || "-"}:${amount || 0}:${maker || "-"}:${date || "-"}`;
+    out.push({ type: t, email, amount, maker, id, date, notes });
+  }
+  return out;
+}
+
+async function _handleCsvText(csvText: string, _req: Request, res: Response) {
+  const records: any[] = csvParse(csvText, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+  });
+  const rows = normalizeCsvRows(records);
+
+  let received = rows.length,
+    dup = 0,
+    err = 0;
+  let nApproval = 0,
+    nSales = 0,
+    nMaker = 0,
+    sumSales = 0;
+  const errors: any[] = [];
+
+  for (const r of rows) {
+    const key = _csvDedupeKey(r);
+    if (!_csvMarkOrSkip(key)) {
+      dup++;
+      continue;
+    }
+    try {
+      const cred = getHabiticaCredFor(r.email);
+      if (r.type === "approval") {
+        nApproval++;
+        await addApproval(cred!, 1, r.notes || "CSV取り込み");
+      } else if (r.type === "sales") {
+        nSales++;
+        sumSales += Number(r.amount || 0);
+        await addSales(cred!, Number(r.amount || 0), r.notes || "CSV取り込み");
+      } else if (r.type === "maker") {
+        nMaker++;
+        await addMakerAward(cred!, 1);
+      }
+    } catch (e: any) {
+      err++;
+      errors.push({ id: r.id, error: e?.message || String(e) });
+    }
+  }
+
+  const summary = `🧾 CSV取込: 承認${nApproval} / 売上${nSales}(計${sumSales.toLocaleString()}) / メーカー${nMaker} [重複${dup}, 失敗${err}]`;
+  try {
+    await sendChatworkMessage(summary);
+  } catch {}
+  return res.json({
+    ok: true,
+    received,
+    accepted: { approval: nApproval, sales: nSales, maker: nMaker },
+    totalSales: sumSales,
+    duplicates: dup,
+    errors: err,
+    error_rows: errors,
+  });
+}
 
 // ---- 正規化イベントの共通ハンドラ -----------------------------------------
 type Normalized = {
@@ -429,7 +655,7 @@ function extractUserIdFromRaw(raw: any): string | undefined {
   // 他の形があればここに追加
   return undefined;
 }
-function resolveActor(ev: Normalized): { name: string; email?: string } {
+function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: string; email?: string } {
   const raw = ev.raw || {};
   // 1) イベントに email があれば最優先
   const email =
@@ -461,8 +687,11 @@ function buildHabiticaMap(jsonStr: string): Record<string, HabiticaCred> {
   const parsed = safeParse<Record<string, HabiticaCred>>(jsonStr) || {};
   const out: Record<string, HabiticaCred> = {};
   for (const [k, v] of Object.entries(parsed)) {
-    if (!v || !v.userId || !v.apiToken) continue;
-    out[String(k).toLowerCase()] = { userId: String(v.userId), apiToken: String(v.apiToken) };
+    if (!v || !(v as any).userId || !(v as any).apiToken) continue;
+    out[String(k).toLowerCase()] = {
+      userId: String((v as any).userId),
+      apiToken: String((v as any).apiToken),
+    };
   }
   return out;
 }
@@ -476,7 +705,7 @@ function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
 // ---- Habitica: アポ演出（To-Do→即完了・個人優先/無ければ共通） -------------
 async function awardXpForAppointment(ev: Normalized) {
   const when = fmtJST(ev.occurredAt);
-  const who = resolveActor(ev);
+  const who = resolveActor({ source: ev.source, raw: ev.raw });
   const cred = getHabiticaCredFor(who.email);
   const msg = `[XP] appointment scheduled (source=${ev.source}) callId=${ev.callId} at=${when} by=${who.name}`;
   if (DRY_RUN) {
@@ -498,11 +727,78 @@ async function awardXpForAppointment(ev: Normalized) {
   }
 }
 
+// ---- 通話KPI：duration からXPを計算して演出 -------------------------------
+type CallDurEv = {
+  source: "v3" | "workflow";
+  eventId?: any;
+  callId?: any;
+  durationMs: number;
+  occurredAt?: any;
+  raw?: any;
+};
+function inferDurationMs(v: any): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  // 1e5以上はmsとみなす（それ以外はsec→ms）
+  return n >= 100000 ? Math.floor(n) : Math.floor(n * 1000);
+}
+function computeCallXp(ms: number): number {
+  const base = ms > 0 ? CALL_XP_PER_CALL : 0;
+  const extra = ms > 0 ? Math.floor(ms / CALL_XP_UNIT_MS) * CALL_XP_PER_5MIN : 0;
+  return base + extra;
+}
+async function awardXpForCallDuration(ev: CallDurEv) {
+  const when = fmtJST(ev.occurredAt);
+  const who = resolveActor({ source: ev.source, raw: ev.raw });
+  const cred = getHabiticaCredFor(who.email);
+  const xp = computeCallXp(ev.durationMs);
+  if (xp <= 0) {
+    log(`[call] duration=0 skip callId=${ev.callId}`);
+    return;
+  }
+  const minutes = (ev.durationMs / 60000).toFixed(1);
+  const title = `📞 架電(${who.name}) +${xp}XP`;
+  const notes = `HubSpot通話\nsource=${ev.source}\ncallId=${ev.callId}\nduration=${minutes}min\ncalc=+${CALL_XP_PER_CALL} (1call) + ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
+  if (DRY_RUN) {
+    log(`[call][DRY_RUN] ${title} @${when}`);
+    return;
+  }
+  try {
+    const todo = await createTodo(title, notes, undefined, cred);
+    const id = (todo as any)?.id;
+    if (id) await completeTask(id, cred);
+    log(`[call] xp=${xp} ms=${ev.durationMs} by=${who.name} at=${when}`);
+    if (CALL_CHATWORK_NOTIFY) {
+      const msg = [
+        "[info]",
+        "[title]📞 架電XP 付与[/title]",
+        `${who.name} さんに +${xp}XP を付与しました。`,
+        `[hr]• 通話ID: ${ev.callId}\n• 通話時間: ${minutes}分`,
+        "[/info]",
+      ].join("\n");
+      try {
+        await sendChatworkMessage(msg);
+      } catch {}
+    }
+  } catch (e: any) {
+    console.error("[call] habitica failed:", e?.message || e);
+  }
+}
+async function handleCallDurationEvent(ev: CallDurEv) {
+  const idForDedupe = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
+  if (hasSeen(idForDedupe)) {
+    log(`skip duplicate call-dur id=${idForDedupe}`);
+    return;
+  }
+  markSeen(idForDedupe);
+  await awardXpForCallDuration(ev);
+}
+
 // ---- Chatwork: “誰がアポ獲得したか”を強調したモチベUP文面 -------------------
 function formatChatworkMessage(ev: Normalized) {
   const when = fmtJST(ev.occurredAt);
   const cid = ev.callId ?? "-";
-  const who = resolveActor(ev);
+  const who = resolveActor({ source: ev.source, raw: ev.raw });
 
   return [
     "[info]",
@@ -525,13 +821,160 @@ async function notifyChatworkAppointment(ev: Normalized) {
   }
   try {
     const r = await sendChatworkMessage(text);
-    if (!r.success) {
-      console.error("[chatwork] failed", r.status, r.json);
+    if (!(r as any).success) {
+      console.error("[chatwork] failed", (r as any).status, (r as any).json);
     } else {
-      log(`[chatwork] sent status=${r.status}`);
+      log(`[chatwork] sent status=${(r as any).status}`);
     }
   } catch (e: any) {
     console.error("[chatwork] error", e?.message || e);
+  }
+}
+
+// ====================== CSV 補助UI/カタログ/URL取込 ==========================
+app.get("/admin/template.csv", (_req, res) => {
+  const csv =
+    "type,email,amount,maker,id,date,notes\n" +
+    "approval,info@example.com,0,,A-001,2025-09-08,承認OK\n" +
+    "sales,info@example.com,150000,,S-001,2025-09-08,受注\n" +
+    "maker,info@example.com,,ACME,M-ACME-1,2025-09-08,最多メーカー\n";
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="template.csv"');
+  res.send(csv);
+});
+
+app.get("/admin/files", (req, res) => {
+  if (!requireBearerCsv(req, res)) return;
+  res.json({ ok: true, items: loadCsvCatalog() });
+});
+
+app.post("/admin/import-url", async (req, res) => {
+  if (!requireBearerCsv(req, res)) return;
+  try {
+    const url = String((req as any).body?.url || "");
+    if (!/^https?:\/\//i.test(url)) return res.status(400).json({ ok: false, error: "invalid_url" });
+    if (!hostAllowed(url)) return res.status(400).json({ ok: false, error: "host_not_allowed" });
+    const r = await fetch(url);
+    const text = await r.text();
+    if (!r.ok)
+      return res
+        .status(502)
+        .json({ ok: false, error: "fetch_failed", status: r.status, body: text.slice(0, 200) });
+    return _handleCsvText(text, req, res);
+  } catch (e: any) {
+    console.error("[admin/import-url]", e?.message || e);
+    return res.status(500).json({ ok: false, error: "exception" });
+  }
+});
+
+app.get("/admin/upload", (_req, res) => {
+  const html = `<!doctype html>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>CSV取込（手動）</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;max-width:860px;margin:2rem auto;padding:0 1rem;}
+ header{display:flex;gap:.75rem;align-items:center;justify-content:space-between;flex-wrap:wrap}
+ input,button,textarea{font:inherit}
+ textarea{width:100%;min-height:180px;padding:.6rem;border:1px solid #ddd;border-radius:8px}
+ .row{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin:.5rem 0}
+ .card{border:1px solid #eee;border-radius:12px;padding:1rem;margin:1rem 0;background:#fafafa}
+ .hint{color:#666;font-size:.9rem}
+ .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+ .pill{padding:.25rem .5rem;border-radius:999px;background:#eef;border:1px solid #dde}
+ .drop{border:2px dashed #9db3ff;border-radius:12px;padding:30px;text-align:center;background:#f7f9ff;color:#334;transition:.15s}
+ .drop.drag{background:#eef3ff}
+</style>
+<header>
+  <h1>CSV取込（手動アップロード）</h1>
+  <a class="pill" href="/admin/template.csv">⬇ テンプレCSVをダウンロード</a>
+</header>
+<div class="card">
+  <div class="row">
+    <label>Base URL</label>
+    <input id="base" size="40" value="${PUBLIC_BASE_URL || ""}" placeholder="https://..."/>
+  </div>
+  <div class="row">
+    <label>AUTH_TOKEN</label>
+    <input id="token" size="40" placeholder="Bearer用トークン" />
+    <button id="save">保存</button><span id="saved" class="hint"></span>
+  </div>
+  <p class="hint">※ TokenとBase URLはブラウザのlocalStorageに保存されます（サーバには送信されません）。</p>
+</div>
+<div class="card">
+  <h3>ファイルを選んでアップロード</h3>
+  <div class="row"><input type="file" id="file" accept=".csv,text/csv" /><button id="upload">アップロード</button></div>
+  <p class="hint">MIMEが text/csv でなくても “.csv” なら受理します。</p>
+</div>
+<div class="card">
+  <h3>ドラッグ&ドロップで送信</h3>
+  <div id="drop" class="drop">ここに CSV をドラッグ&ドロップ</div>
+</div>
+<div class="card">
+  <h3>CSVを直接貼り付けて送信</h3>
+  <textarea id="csv" placeholder="type,email,amount,maker,id,date,notes&#10;approval,info@example.com,0,,A-001,2025-09-08,承認OK"></textarea>
+  <div class="row"><button id="send">貼り付けCSVを送信</button></div>
+</div>
+<div id="out" class="card mono"></div>
+<script>
+const qs=(s)=>document.querySelector(s);
+const baseEl=qs('#base'), tokenEl=qs('#token'), out=qs('#out'), saved=qs('#saved');
+function load(){
+  baseEl.value = localStorage.getItem('adm_base') || baseEl.value;
+  tokenEl.value = localStorage.getItem('adm_token') || '';
+  const p = new URLSearchParams(location.search); let changed=false;
+  if(p.get('base')){ baseEl.value = p.get('base'); changed=true; }
+  if(p.get('token')){ tokenEl.value = p.get('token'); changed=true; }
+  if(changed){ save(); history.replaceState({}, '', location.pathname); }
+  if(p.get('auto')==='1'){ qs('#file').click(); }
+}
+function save(){ localStorage.setItem('adm_base', baseEl.value.trim()); localStorage.setItem('adm_token', tokenEl.value.trim()); saved.textContent='保存しました'; setTimeout(()=>saved.textContent='',1500); }
+function pr(x){ out.textContent = typeof x==='string' ? x : JSON.stringify(x,null,2); }
+async function postCsvRaw(text){
+  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
+  const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers:{'Content-Type':'text/csv','Authorization':'Bearer '+tok}, body:text });
+  const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
+}
+async function postCsvFile(file){
+  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
+  const fd=new FormData(); fd.append('file', file, file.name);
+  const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers:{'Authorization':'Bearer '+tok}, body:fd });
+  const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
+}
+qs('#save').onclick=save;
+qs('#send').onclick=()=>postCsvRaw(qs('#csv').value);
+qs('#upload').onclick=()=>{ const f=qs('#file').files[0]; if(!f) return pr('CSVファイルを選択してください'); postCsvFile(f); };
+const drop=qs('#drop');
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();drop.classList.add('drag');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();drop.classList.remove('drag');}));
+drop.addEventListener('drop',e=>{const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]; if(!f) return pr('ファイルが取得できませんでした'); postCsvFile(f);});
+qs('#csv').addEventListener('keydown',(e)=>{ if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); qs('#send').click(); }});
+load();
+</script>`;
+  res.type("html").send(html);
+});
+
+// ---- CSV Catalog helpers ---------------------------------------------------
+type CsvCatalogItem = { id: string; label: string; url: string };
+function loadCsvCatalog(): CsvCatalogItem[] {
+  const arr = safeParse<any[]>(CSV_CATALOG_JSON) || [];
+  const out: CsvCatalogItem[] = [];
+  for (const x of arr) {
+    if (!x) continue;
+    const id = String(x.id || x.label || x.url || "").trim();
+    const label = String(x.label || x.id || x.url || "").trim();
+    const url = String(x.url || "").trim();
+    if (!id || !label || !/^https?:\/\//i.test(url)) continue;
+    out.push({ id, label, url });
+  }
+  return out;
+}
+function hostAllowed(u: string): boolean {
+  try {
+    const h = new URL(u).host.toLowerCase();
+    if (CSV_ALLOWLIST_HOSTS.length === 0) return /^https:\/\//i.test(u); // httpsのみ
+    return CSV_ALLOWLIST_HOSTS.includes(h);
+  } catch {
+    return false;
   }
 }
 
