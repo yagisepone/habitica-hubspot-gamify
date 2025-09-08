@@ -749,7 +749,7 @@ function inferDurationMs(v: any): number {
   return n >= 100000 ? Math.floor(n) : Math.floor(n * 1000);
 }
 function computeCallXp(ms: number): number {
-  const base = ms > 0 ? CALL_XP_PER_CALL : 0;
+  const base = CALL_XP_PER_CALL;
   const extra = ms > 0 ? Math.floor(ms / CALL_XP_UNIT_MS) * CALL_XP_PER_5MIN : 0;
   return base + extra;
 }
