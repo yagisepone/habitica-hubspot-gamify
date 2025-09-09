@@ -556,17 +556,20 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
 
 // ============================================================================
 // Zoom/汎用 コール入口（Zoom Phone想定）
-//  - Challenge: { plainToken } が来たら encryptedToken を返す
+//  - Challenge: { event:"endpoint.url_validation", payload:{ plainToken } } が来る
 //  - Auth: Authorization: Bearer <ZOOM_WEBHOOK_SECRET>（設定推奨）
 // ============================================================================
 app.post("/webhooks/zoom", async (req: Request, res: Response) => {
   const b: any = (req as any).body || {};
 
-  // ❶ チャレンジ応答（Validate用）
-  if (b && b.plainToken) {
+  // ❶ URL検証（Validate用）
+  const plainToken: string | undefined = b?.plainToken || b?.payload?.plainToken;
+  const isValidation = String(b?.event || "").toLowerCase() === "endpoint.url_validation";
+  if (isValidation && plainToken) {
     const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN; // どちらか必須推奨
-    const enc = crypto.createHmac("sha256", key).update(String(b.plainToken)).digest("hex");
-    return res.json({ plainToken: b.plainToken, encryptedToken: enc });
+    const enc = crypto.createHmac("sha256", key).update(String(plainToken)).digest("hex");
+    log(`[zoom] url_validation OK`);
+    return res.json({ plainToken, encryptedToken: enc });
   }
 
   // ❷ 通常通知の認証（Secret Token を Bearer で検証）
