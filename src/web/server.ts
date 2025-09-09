@@ -289,7 +289,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-09-ingest-upsert",
+    version: "2025-09-09-ingest-upsert-makers",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -778,7 +778,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       baseIdRaw ||
       [actorName || email || "-", approvedAt || status || "-", salesAmt || 0, makerName || "-"].join("|");
 
-    // 2-e) 承認
+    // 2-e) 承認（メーカーも保持）
     const isApproved = /承認/.test(status) || !!approvedAt;
     if (isApproved) {
       out.push({
@@ -787,11 +787,12 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
         actorName,
         id: `${baseId}`,
         date: approvedAt,
+        maker: makerName,
         notes: makerName ? `メーカー=${makerName}` : undefined,
       });
     }
 
-    // 2-f) 売上
+    // 2-f) 売上（メーカーも保持）
     if (salesAmt > 0) {
       out.push({
         type: "sales",
@@ -800,6 +801,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
         amount: salesAmt,
         id: `${baseId}:sales`,
         date: approvedAt,
+        maker: makerName,
         notes: makerName ? `メーカー=${makerName}` : undefined,
       });
     }
@@ -863,6 +865,7 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           id: r.id,
+          maker: r.maker || undefined,
           notes: r.notes,
         };
         bufApprovals.push(obj);
@@ -879,6 +882,7 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           amount: amt,
           id: r.id,
+          maker: r.maker || undefined,
           notes: r.notes,
         };
         bufSales.push(obj);
@@ -1332,7 +1336,26 @@ app.get("/admin/dashboard", (_req, res) => {
     }
     return Object.values(by).sort((a:any,b:any)=>a.name.localeCompare(b.name));
   }
+  // メーカー別（日単位）集計（承認ベース＋売上合計）
+  function aggMakers(day: string) {
+    const by: Record<string, { maker: string; count: number; sales: number }> = {};
+    for (const a of files.apprs.filter(x=>x.day===day)) {
+      const m = (a.maker || "").trim();
+      if (!m) continue;
+      by[m] ??= { maker: m, count: 0, sales: 0 };
+      by[m].count += 1;
+    }
+    for (const s of files.sales.filter(x=>x.day===day)) {
+      const m = (s.maker || "").trim();
+      if (!m) continue;
+      by[m] ??= { maker: m, count: 0, sales: 0 };
+      by[m].sales += Number(s.amount || 0);
+    }
+    return Object.values(by).sort((a,b)=> b.count - a.count || b.sales - a.sales || a.maker.localeCompare(b.maker));
+  }
+
   const T = agg(today), Y = agg(yest);
+  const TM = aggMakers(today), YM = aggMakers(yest);
 
   const Row = (r:any)=> `<tr>
     <td>${r.name}</td><td style="text-align:right">${r.calls}</td>
@@ -1340,6 +1363,10 @@ app.get("/admin/dashboard", (_req, res) => {
     <td style="text-align:right">${r.appts}</td>
     <td style="text-align:right">${r.apprs}</td>
     <td style="text-align:right">${r.rate}%</td>
+    <td style="text-align:right">¥${(r.sales||0).toLocaleString()}</td></tr>`;
+  const RowM = (r:any)=> `<tr>
+    <td>${r.maker}</td>
+    <td style="text-align:right">${r.count}</td>
     <td style="text-align:right">¥${(r.sales||0).toLocaleString()}</td></tr>`;
 
   const html = `<!doctype html><meta charset="utf-8">
@@ -1355,9 +1382,19 @@ app.get("/admin/dashboard", (_req, res) => {
   <h2>本日 ${today}</h2>
   <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
   <tbody>${T.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
+
+  <h2>メーカー別（承認ベース） 本日 ${today}</h2>
+  <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead>
+  <tbody>${TM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
+
   <h2>前日 ${yest}</h2>
   <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
-  <tbody>${Y.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>`;
+  <tbody>${Y.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
+
+  <h2>メーカー別（承認ベース） 前日 ${yest}</h2>
+  <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead>
+  <tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
+  `;
   res.type("html").send(html);
 });
 
