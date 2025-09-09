@@ -15,8 +15,8 @@ import path from "path";
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
 // - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Bearer任意; email + duration）
-// - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart）
-// - GET  /admin/template.csv   // CSVテンプレDL
+// - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart）※メール列は無視
+// - GET  /admin/template.csv   // CSVテンプレDL（メール列なし）
 // - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
@@ -95,7 +95,7 @@ const HUBSPOT_USER_MAP_JSON = process.env.HUBSPOT_USER_MAP_JSON || "";
 // メール -> Habitica資格（個人付与用）
 const HABITICA_USERS_JSON = process.env.HABITICA_USERS_JSON || "";
 
-// 氏名 -> メール（CSVの「DX PORTの 〇〇」対策）
+// 氏名 -> メール（CSVの「DX PORTの 〇〇」対策・メール列は完全に無視）
 const NAME_EMAIL_MAP_JSON = process.env.NAME_EMAIL_MAP_JSON || "";
 
 // CSVカタログ（Habiticaボタンの一覧用・任意）
@@ -260,7 +260,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-08-final",
+    version: "2025-09-09-name-only",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -566,15 +566,23 @@ app.post("/webhooks/zoom", async (req: Request, res: Response) => {
 
 // ====================== /admin/csv エンドポイント ============================
 // Bearer必須。text/csv 直送 or multipart/form-data(file)
-// CSVヘッダ: type,email,amount,maker,id,date,notes
-// type: approval|承認 / sales|売上 / maker|メーカー
-// 追加対応: 日本語アポイントCSV（承認日時/商談ステータス/報酬/担当者 メールアドレス 等）
+// CSV（メール列は不要・無視）
+/*
+  例：日本語アポイントCSV（想定）
+   - 「承認条件 回答23」セル内に “DX PORTの 〇〇” が含まれる（〇〇＝社内の氏名）
+   - 「商談ステータス」「承認日時」「報酬」「追加報酬」「メーカー名」等
+
+  例：仕様書CSV（メール列なしでOK）
+   - ヘッダ: type,amount,maker,id,date,notes
+   - notes欄に “DX PORTの 〇〇” があれば氏名→メールに解決
+*/
 
 // 重複抑止（7日TTL）
 const _csvSeen = new Map<string, number>();
 const _CSV_TTL = 7 * 24 * 60 * 60 * 1000;
 function _csvDedupeKey(r: any) {
-  const s = `${r.type}|${r.email}|${r.amount}|${r.maker}|${r.date}|${r.id}`;
+  // メールは使わない（氏名→メール解決はENV依存のため）
+  const s = `${r.type}|${r.amount}|${r.maker}|${r.date}|${r.id}`;
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 function _csvMarkOrSkip(key: string): boolean {
@@ -628,7 +636,7 @@ async function _handleCsvMultipart(req: Request, res: Response) {
 
 type CsvNorm = {
   type: "approval" | "sales" | "maker";
-  email?: string;
+  email?: string;   // ※氏名→ENVで解決した社内メール。CSVのメール列は使わない
   amount?: number;
   maker?: string;
   id: string;
@@ -649,6 +657,11 @@ function buildNameEmailMap(jsonStr: string): Record<string, string> {
   return out;
 }
 const NAME2MAIL = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
+// 逆引き（ダッシュボード表示名用）
+const EMAIL2NAME: Record<string, string> = Object.entries(NAME2MAIL).reduce((m, [n, e]) => {
+  if (e) m[e.toLowerCase()] = n;
+  return m;
+}, {} as Record<string, string>);
 
 // ENV: メール→Habitica資格
 type HabiticaCred = { userId: string; apiToken: string };
@@ -669,6 +682,10 @@ function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
   if (!email) return undefined;
   return HAB_MAP[email.toLowerCase()];
 }
+function displayNameForEmail(email?: string): string | undefined {
+  if (!email) return undefined;
+  return EMAIL2NAME[email.toLowerCase()] || email.split("@")[0];
+}
 
 // 「DX PORTの 〇〇」から氏名を抽出
 function extractDxPortNameFromText(s?: string): string | undefined {
@@ -683,12 +700,12 @@ function extractDxPortNameFromText(s?: string): string | undefined {
   return undefined;
 }
 
-// CSV 1) 仕様書CSV or 2) 日本語アポイントCSV を正規化
+// CSV 1) 仕様書CSV or 2) 日本語アポイントCSV を正規化（メール列は無視）
 function normalizeCsvRows(records: any[]): CsvNorm[] {
   const out: CsvNorm[] = [];
 
   for (const r of records) {
-    // --- 1) 仕様書CSV（type,email,amount,maker,id,date,notes）
+    // --- 1) 仕様書CSV（type,amount,maker,id,date,notes）※メール列は不要/無視
     const typeRaw = String((r.type ?? r.Type ?? "")).trim();
     if (typeRaw) {
       const t =
@@ -698,13 +715,22 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
           | "maker";
       if (!["approval", "sales", "maker"].includes(t)) continue;
 
-      const email = r.email ? String(r.email).trim().toLowerCase() : undefined;
+      // 氏名の抽出（notesや行全体から「DX PORTの 〇〇」を探す）
+      let actorName = extractDxPortNameFromText(String(r.notes ?? ""));
+      if (!actorName) {
+        for (const v of Object.values(r)) {
+          actorName = extractDxPortNameFromText(String(v ?? ""));
+          if (actorName) break;
+        }
+      }
+      const email = actorName ? NAME2MAIL[actorName] : undefined;
+
       const amountVal = r.amount != null ? num(r.amount) : undefined;
       const maker = r.maker ? String(r.maker).trim() : undefined;
       let id = String(r.id || "").trim();
       const date = r.date ? String(r.date) : undefined;
       const notes = r.notes ? String(r.notes) : undefined;
-      if (!id) id = `${t}:${email || "-"}:${amountVal || 0}:${maker || "-"}:${date || "-"}`;
+      if (!id) id = `${t}:${actorName || "-"}:${amountVal || 0}:${maker || "-"}:${date || "-"}`;
       out.push({ type: t, email, amount: amountVal, maker, id, date, notes });
       continue;
     }
@@ -715,7 +741,6 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       r["商談ステータス"] != null ||
       r["報酬"] != null ||
       r["追加報酬"] != null ||
-      pickKey(r, (k) => /メール.?アドレス/i.test(k)) != null ||
       pickKey(r, (k) => /(承認条件|設問|質問).*(回答)?\s*23/.test(k)) != null;
 
     if (!hasJP) continue;
@@ -732,16 +757,10 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       }
     }
 
-    // 2-b) 氏名→メール
-    const emailFromName = actorName ? NAME2MAIL[actorName] : undefined;
+    // 2-b) 氏名→社内メール（ENVで解決）※CSVのメール列は完全に無視
+    const email = actorName ? NAME2MAIL[actorName] : undefined;
 
-    // 2-c) もしメール列があればそちらを優先（将来拡張）
-    const mailKey =
-      pickKey(r, (k) => /メール.?アドレス/i.test(k)) ||
-      pickKey(r, (k) => /email/i.test(k));
-    const email = (mailKey ? String(r[mailKey]).trim().toLowerCase() : "") || emailFromName;
-
-    // 2-d) ステータス・金額・メーカー
+    // 2-c) ステータス・金額・メーカー
     const status = normSpace(String(r["商談ステータス"] || ""));
     const approvedAt = String(r["承認日時"] || r["商談終了日時"] || r["商談開始日時"] || "") || undefined;
     const makerName = r["メーカー名"] ? String(r["メーカー名"]).trim() : undefined;
@@ -749,19 +768,19 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
     const rewardExtra = num(r["追加報酬"]) || 0;
     const salesAmt = (reward || 0) + (rewardExtra || 0);
 
-    // 2-e) 安定したID（CSV同一行で同じになるよう、決定的キーで生成）
+    // 2-d) 安定したID
     const baseIdRaw =
       String(r["ID"] || r["id"] || r["案件ID"] || r["レコードID"] || "").trim();
     const baseId =
       baseIdRaw ||
       [
-        actorName || email || "-",
+        actorName || "-",
         approvedAt || status || "-",
         salesAmt || 0,
         makerName || "-",
       ].join("|");
 
-    // 2-f) 承認（“承認”という語を含めば承認扱い）
+    // 2-e) 承認（“承認”という語を含めば承認扱い、または承認日時あり）
     const isApproved = /承認/.test(status) || !!approvedAt;
     if (isApproved) {
       out.push({
@@ -773,7 +792,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       });
     }
 
-    // 2-g) 売上（報酬+追加報酬）
+    // 2-f) 売上（報酬+追加報酬）
     if (salesAmt > 0) {
       out.push({
         type: "sales",
@@ -785,7 +804,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       });
     }
 
-    // 2-h) maker（自動はオフ。必要なら下記をコメント解除）
+    // 2-g) maker（自動はオフ。必要なら下記をコメント解除）
     // if (makerName) {
     //   out.push({ type: "maker", email, maker: makerName, id: `${baseId}:maker`, date: approvedAt });
     // }
@@ -830,6 +849,8 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
         continue;
       }
 
+      const actorName = displayNameForEmail(r.email);
+
       if (r.type === "approval") {
         nApproval++;
         if (!DRY_RUN) await addApproval(cred, 1, r.notes || "CSV取り込み");
@@ -837,6 +858,7 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
           at: new Date().toISOString(),
           day: isoDay(r.date),
           email: r.email,
+          actor: { name: actorName },
           id: r.id,
         });
       } else if (r.type === "sales") {
@@ -848,6 +870,7 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
           at: new Date().toISOString(),
           day: isoDay(r.date),
           email: r.email,
+          actor: { name: actorName },
           amount: amt,
           id: r.id,
         });
@@ -858,6 +881,7 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
           at: new Date().toISOString(),
           day: isoDay(r.date),
           email: r.email,
+          actor: { name: actorName },
           maker: r.maker,
           id: r.id,
         });
@@ -1091,11 +1115,12 @@ async function notifyChatworkAppointment(ev: Normalized) {
 
 // ====================== CSV 補助UI/カタログ/URL取込 ==========================
 app.get("/admin/template.csv", (_req, res) => {
+  // メール列なしテンプレ（メール列は不要/無視）
   const csv =
-    "type,email,amount,maker,id,date,notes\n" +
-    "approval,info@example.com,0,,A-001,2025-09-08,承認OK\n" +
-    "sales,info@example.com,150000,,S-001,2025-09-08,受注\n" +
-    "maker,info@example.com,,ACME,M-ACME-1,2025-09-08,最多メーカー\n";
+    "type,amount,maker,id,date,notes\n" +
+    "approval,0,,A-001,2025-09-09,DX PORTの 福田悠人 が承認\n" +
+    "sales,150000,,S-001,2025-09-09,DX PORTの 福田悠人 が受注\n" +
+    "maker,,ACME,M-ACME-1,2025-09-09,最多メーカー\n";
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", 'attachment; filename="template.csv"');
   res.send(csv);
@@ -1169,7 +1194,7 @@ app.get("/admin/upload", (_req, res) => {
 </div>
 <div class="card">
   <h3>CSVを直接貼り付けて送信</h3>
-  <textarea id="csv" placeholder="type,email,amount,maker,id,date,notes&#10;approval,info@example.com,0,,A-001,2025-09-08,承認OK"></textarea>
+  <textarea id="csv" placeholder="type,amount,maker,id,date,notes&#10;approval,0,,A-001,2025-09-09,DX PORTの 山田太郎 が承認"></textarea>
   <div class="row"><button id="send">貼り付けCSVを送信</button></div>
 </div>
 <div id="out" class="card mono"></div>
@@ -1179,21 +1204,16 @@ const baseEl=qs('#base'), tokenEl=qs('#token'), out=qs('#out'), saved=qs('#saved
 function load(){
   baseEl.value = localStorage.getItem('adm_base') || baseEl.value;
   tokenEl.value = localStorage.getItem('adm_token') || '';
-  const p = new URLSearchParams(location.search); let changed=false;
-  if(p.get('base')){ baseEl.value = p.get('base'); changed=true; }
-  if(p.get('token')){ tokenEl.value = p.get('token'); changed=true; }
-  if(changed){ save(); history.replaceState({}, '', location.pathname); }
-  if(p.get('auto')==='1'){ qs('#file').click(); }
 }
 function save(){ localStorage.setItem('adm_base', baseEl.value.trim()); localStorage.setItem('adm_token', tokenEl.value.trim()); saved.textContent='保存しました'; setTimeout(()=>saved.textContent='',1500); }
 function pr(x){ out.textContent = typeof x==='string' ? x : JSON.stringify(x,null,2); }
 async function postCsvRaw(text){
-  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
+  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力してください');
   const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers:{'Content-Type':'text/csv','Authorization':'Bearer '+tok}, body:text });
   const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
 }
 async function postCsvFile(file){
-  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
+  const base=baseEl.value.trim(); const tok=tokenEl.value.trim(); if(!base||!tok) return pr('Base/Tokenを入力してください');
   const fd=new FormData(); fd.append('file', file, file.name);
   const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{ method:'POST', headers:{'Authorization':'Bearer '+tok}, body:fd });
   const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
@@ -1205,7 +1225,6 @@ const drop=qs('#drop');
 ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();drop.classList.add('drag');}));
 ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();drop.classList.remove('drag');}));
 drop.addEventListener('drop',e=>{const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]; if(!f) return pr('ファイルが取得できませんでした'); postCsvFile(f);});
-qs('#csv').addEventListener('keydown',(e)=>{ if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); qs('#send').click(); }});
 load();
 </script>`;
   res.type("html").send(html);
