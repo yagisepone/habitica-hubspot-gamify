@@ -14,14 +14,14 @@ import path from "path";
 // - GET  /oauth/callback
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
-// - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Bearer任意; email + duration）
+// - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Challenge対応＋Bearer検証）
 // - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart, mode=insert|upsert）
 // - GET  /admin/template.csv   // CSVテンプレDL
 // - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
 // - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）
-// - POST /admin/award/maker    // ⬅ 追加: メーカー賞 実行（Bearer）
+// - POST /admin/award/maker    // メーカー賞 実行（Bearer）
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -66,6 +66,9 @@ const WEBHOOK_SECRET =
   process.env.HUBSPOT_APP_SECRET ||
   process.env.HUBSPOT_CLIENT_SECRET ||
   "";
+
+// ⬅ 追加: Zoom Webhook 用の秘密（チャレンジ応答とBearer検証に使用）
+const ZOOM_WEBHOOK_SECRET = process.env.ZOOM_WEBHOOK_SECRET || "";
 
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
@@ -297,7 +300,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-09-issue9-finish",
+    version: "2025-09-09-zoom-challenge-ready",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -552,15 +555,29 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
 });
 
 // ============================================================================
-// Zoom/汎用 コール入口（email + durationのみでもOK）
+// Zoom/汎用 コール入口（Zoom Phone想定）
+//  - Challenge: { plainToken } が来たら encryptedToken を返す
+//  - Auth: Authorization: Bearer <ZOOM_WEBHOOK_SECRET>（設定推奨）
 // ============================================================================
 app.post("/webhooks/zoom", async (req: Request, res: Response) => {
-  const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-  if (AUTH_TOKEN && tok !== AUTH_TOKEN) {
-    return res.status(401).json({ ok: false, error: "auth" });
+  const b: any = (req as any).body || {};
+
+  // ❶ チャレンジ応答（Validate用）
+  if (b && b.plainToken) {
+    const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN; // どちらか必須推奨
+    const enc = crypto.createHmac("sha256", key).update(String(b.plainToken)).digest("hex");
+    return res.json({ plainToken: b.plainToken, encryptedToken: enc });
   }
 
-  const b: any = (req as any).body || {};
+  // ❷ 通常通知の認証（Secret Token を Bearer で検証）
+  const expected = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
+  if (expected) {
+    const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
+    if (tok !== expected) {
+      return res.status(401).json({ ok: false, error: "auth" });
+    }
+  }
+
   const raw = b.payload?.object || b.object || b || {};
   const email =
     raw.user_email ||
@@ -998,7 +1015,6 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
   // 取り込み直後のメーカー賞（当日分のみ・重複防止）
   if (MAKER_AWARD_ON_IMPORT && MODE === "insert" && affectedDays.size > 0) {
     try {
-      // 取り込んだ日のみ実施（多くは同一日）
       for (const d of affectedDays) {
         await runMakerAward(d, true);
       }
