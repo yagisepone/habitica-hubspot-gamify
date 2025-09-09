@@ -21,6 +21,7 @@ import path from "path";
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
 // - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）
+// - POST /admin/award/maker    // ⬅ 追加: メーカー賞 実行（Bearer）
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -111,6 +112,13 @@ const CALL_XP_PER_CALL = Number(process.env.CALL_XP_PER_CALL || 1);
 const CALL_XP_PER_5MIN = Number(process.env.CALL_XP_PER_5MIN || 2);
 const CALL_XP_UNIT_MS = Number(process.env.CALL_XP_UNIT_MS || 5 * 60 * 1000); // 5分
 const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
+
+// === 追加: Issue#9 フラグ ============
+const CW_NOTIFY_APPROVAL_PER_ROW =
+  String(process.env.CW_NOTIFY_APPROVAL_PER_ROW || "0") === "1";
+const CW_NOTIFY_SALES_PER_ROW =
+  String(process.env.CW_NOTIFY_SALES_PER_ROW || "0") === "1";
+const MAKER_AWARD_ON_IMPORT = String(process.env.MAKER_AWARD_ON_IMPORT || "0") === "1";
 
 // ---- External connectors ----------------------------------------------------
 // ビルド後（dist/web/server.js）から見て ../connectors/xxx.js が正解
@@ -289,7 +297,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-09-ingest-upsert-makers",
+    version: "2025-09-09-issue9-finish",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -299,6 +307,11 @@ app.get("/healthz", (_req, res) => {
     habiticaUserCount: Object.keys(habMap).length,
     nameMapCount: Object.keys(nameMap).length,
     callXp: { perCall: CALL_XP_PER_CALL, per5min: CALL_XP_PER_5MIN, unitMs: CALL_XP_UNIT_MS },
+    notifyFlags: {
+      CW_NOTIFY_APPROVAL_PER_ROW,
+      CW_NOTIFY_SALES_PER_ROW,
+      MAKER_AWARD_ON_IMPORT,
+    },
   });
 });
 app.get("/support", (_req, res) =>
@@ -813,6 +826,41 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
   return out;
 }
 
+// ============ Chatwork 行単位通知用 便利関数 ==================
+function cwName(actorName?: string, email?: string) {
+  return actorName || (email ? String(email).split("@")[0] : "担当者");
+}
+function makeApprovalMessage(r: CsvNorm) {
+  const day = isoDay(r.date);
+  return [
+    "[info]",
+    "[title]🟦 承認 成立[/title]",
+    `担当 : ${cwName(r.actorName, r.email)}`,
+    r.maker ? `メーカー : ${r.maker}` : undefined,
+    `承認日 : ${day}`,
+    r.notes ? `備考 : ${r.notes}` : undefined,
+    "[/info]",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+function makeSalesMessage(r: CsvNorm, amt: number) {
+  const day = isoDay(r.date);
+  return [
+    "[info]",
+    "[title]💰 売上 登録[/title]",
+    `担当 : ${cwName(r.actorName, r.email)}`,
+    `金額 : ¥${amt.toLocaleString()}`,
+    r.maker ? `メーカー : ${r.maker}` : undefined,
+    `日付 : ${day}`,
+    r.notes ? `備考 : ${r.notes}` : undefined,
+    "[/info]",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// ============================================================
 async function _handleCsvText(csvText: string, req: Request, res: Response) {
   // 取り込みモード：既定 upsert（上書き）。insert は従来動作（重複スキップ）
   const modeRaw = String((req as any).query?.mode || "").toLowerCase();
@@ -840,10 +888,14 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
     sumSales = 0;
   const errors: any[] = [];
 
+  // 行単位通知のキュー
+  const _cwQueue: string[] = [];
+
   // ここでは JSONL へ一括反映するため、まずバッファに貯める
   const bufApprovals: any[] = [];
   const bufSales: any[] = [];
   const bufMakers: any[] = [];
+  const affectedDays = new Set<string>();
 
   for (const r of rows) {
     try {
@@ -859,9 +911,11 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
       const cred = getHabiticaCredFor(r.email);
       if (r.type === "approval") {
         nApproval++;
+        const day = isoDay(r.date);
+        affectedDays.add(day);
         const obj = {
           at: new Date().toISOString(),
-          day: isoDay(r.date),
+          day,
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           id: r.id,
@@ -871,13 +925,19 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
         bufApprovals.push(obj);
         // Habitica 付与は「新規 insert のみ」。upsert では二重付与を避けるため抑制
         if (!DRY_RUN && cred && MODE === "insert") await addApproval(cred, 1, r.notes || "CSV取り込み");
+        // 行単位Chatwork（承認）
+        if (!DRY_RUN && MODE === "insert" && CW_NOTIFY_APPROVAL_PER_ROW) {
+          _cwQueue.push(makeApprovalMessage(r));
+        }
       } else if (r.type === "sales") {
         nSales++;
         const amt = Number(r.amount || 0);
         sumSales += amt;
+        const day = isoDay(r.date);
+        affectedDays.add(day);
         const obj = {
           at: new Date().toISOString(),
-          day: isoDay(r.date),
+          day,
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           amount: amt,
@@ -887,11 +947,17 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
         };
         bufSales.push(obj);
         if (!DRY_RUN && cred && MODE === "insert") await addSales(cred, amt, r.notes || "CSV取り込み");
+        // 行単位Chatwork（売上）
+        if (!DRY_RUN && MODE === "insert" && CW_NOTIFY_SALES_PER_ROW) {
+          _cwQueue.push(makeSalesMessage(r, amt));
+        }
       } else if (r.type === "maker") {
         nMaker++;
+        const day = isoDay(r.date);
+        affectedDays.add(day);
         const obj = {
           at: new Date().toISOString(),
-          day: isoDay(r.date),
+          day,
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           maker: r.maker,
@@ -917,10 +983,30 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
     upsertJsonlByIdBulk("data/events/maker.jsonl", bufMakers);
   }
 
+  // 行単位通知をまとめて送信
+  if (!DRY_RUN && _cwQueue.length > 0) {
+    try {
+      for (const m of _cwQueue) await sendChatworkMessage(m);
+    } catch {}
+  }
+
   const summary = `🧾 CSV取込(${MODE}): 承認${nApproval} / 売上${nSales}(計${sumSales.toLocaleString()}) / メーカー${nMaker} [重複${dup}, 失敗${err}]`;
   try {
     await sendChatworkMessage(summary);
   } catch {}
+
+  // 取り込み直後のメーカー賞（当日分のみ・重複防止）
+  if (MAKER_AWARD_ON_IMPORT && MODE === "insert" && affectedDays.size > 0) {
+    try {
+      // 取り込んだ日のみ実施（多くは同一日）
+      for (const d of affectedDays) {
+        await runMakerAward(d, true);
+      }
+    } catch (e) {
+      console.error("[maker-award] on-import error", (e as any)?.message || e);
+    }
+  }
+
   return res.json({
     ok: true,
     mode: MODE,
@@ -1396,6 +1482,135 @@ app.get("/admin/dashboard", (_req, res) => {
   <tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
   `;
   res.type("html").send(html);
+});
+
+// ====================== メーカー賞 実装（Issue #9） ==========================
+type MakerAwardWinner = { maker: string; name: string; email?: string; count: number };
+
+// 既に授与済みかどうか確認するための記録ファイル
+const MAKER_AWARD_LOG = "data/events/maker_awards.jsonl";
+function hasMakerAwardRecord(day: string, maker: string, name: string): boolean {
+  const arr = readJsonlAll(MAKER_AWARD_LOG);
+  const id = `${day}|${maker}|${name}`;
+  return arr.some((x) => x && x.id === id);
+}
+function writeMakerAwardRecord(day: string, maker: string, name: string, email?: string, count?: number) {
+  appendJsonl(MAKER_AWARD_LOG, {
+    at: new Date().toISOString(),
+    day,
+    maker,
+    actor: { name, email: email || null },
+    count: count ?? 0,
+    id: `${day}|${maker}|${name}`,
+  });
+}
+
+function aggregateMakerWinners(day: string): MakerAwardWinner[] {
+  const apprs = readJsonlAll("data/events/approvals.jsonl").filter((x) => x.day === day);
+  // maker -> name -> {count,email}
+  const table: Record<string, Record<string, { count: number; email?: string }>> = {};
+  for (const a of apprs) {
+    const maker = (a.maker || "").trim();
+    if (!maker) continue;
+    const name: string =
+      (a.actor && a.actor.name) ||
+      (a.email && String(a.email).split("@")[0]) ||
+      "担当者";
+    const email: string | undefined = a.actor?.email || a.email || NAME2MAIL[name];
+    table[maker] ??= {};
+    table[maker][name] ??= { count: 0, email };
+    table[maker][name].count += 1;
+    // 最新のemailを保持
+    if (email) table[maker][name].email = email;
+  }
+
+  const winners: MakerAwardWinner[] = [];
+  for (const maker of Object.keys(table)) {
+    const rows = Object.entries(table[maker]).map(([name, v]) => ({ name, ...v }));
+    if (rows.length === 0) continue;
+    const max = Math.max(...rows.map((r) => r.count));
+    if (max <= 0) continue;
+    for (const r of rows.filter((x) => x.count === max)) {
+      winners.push({ maker, name: r.name, email: r.email, count: r.count });
+    }
+  }
+  // 安定ソート（メーカー名→担当者名）
+  winners.sort((a, b) => a.maker.localeCompare(b.maker) || a.name.localeCompare(b.name));
+  return winners;
+}
+
+function formatMakerAwardMessage(day: string, winners: MakerAwardWinner[], applied: boolean) {
+  if (winners.length === 0) {
+    return [
+      "[info]",
+      `[title]🏆 メーカー賞（${day}）[/title]`,
+      "該当なし（承認データがありません）",
+      "[/info]",
+    ].join("\n");
+  }
+  const lines: string[] = [];
+  lines.push("[info]");
+  lines.push(`[title]🏆 メーカー賞（${day}）[/title]`);
+  // maker ごとにまとめて表示
+  const byMaker: Record<string, MakerAwardWinner[]> = {};
+  for (const w of winners) {
+    byMaker[w.maker] ??= [];
+    byMaker[w.maker].push(w);
+  }
+  for (const mk of Object.keys(byMaker)) {
+    const xs = byMaker[mk].map((w) => `${w.name}（${w.count}件）`).join("、");
+    lines.push(`• ${mk} : ${xs}`);
+  }
+  lines.push("[hr]");
+  lines.push(applied ? "受賞者に称号(+1)を付与しました（Habitica）。" : "※プレビュー（付与は未実行）");
+  lines.push("[/info]");
+  return lines.join("\n");
+}
+
+async function applyMakerAwards(day: string, winners: MakerAwardWinner[]) {
+  for (const w of winners) {
+    if (hasMakerAwardRecord(day, w.maker, w.name)) {
+      log(`[maker-award] skip already awarded: ${day} ${w.maker} ${w.name}`);
+      continue;
+    }
+    const email = w.email || NAME2MAIL[w.name];
+    const cred = getHabiticaCredFor(email);
+    if (!DRY_RUN && cred) {
+      try {
+        await addMakerAward(cred, 1);
+        writeMakerAwardRecord(day, w.maker, w.name, email, w.count);
+        log(`[maker-award] +1 to ${w.name} (${w.maker})`);
+      } catch (e) {
+        console.error("[maker-award] habitica failed", (e as any)?.message || e);
+      }
+    } else {
+      log(`[maker-award] DRY_RUN or no-cred: ${w.name} (${w.maker})`);
+      writeMakerAwardRecord(day, w.maker, w.name, email, w.count);
+    }
+  }
+}
+
+async function runMakerAward(dayRaw: string, apply: boolean) {
+  const day = isoDay(dayRaw);
+  const winners = aggregateMakerWinners(day);
+  if (apply) await applyMakerAwards(day, winners);
+  const msg = formatMakerAwardMessage(day, winners, apply);
+  try { await sendChatworkMessage(msg); } catch {}
+  return { day, winners, applied: apply };
+}
+
+// API: メーカー賞 実行
+app.post("/admin/award/maker", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+  try {
+    const day = String((req as any).query?.day || isoDay());
+    const apply = String((req as any).query?.apply || "1") !== "0";
+    const result = await runMakerAward(day, apply);
+    res.json({ ok: true, ...result });
+  } catch (e: any) {
+    console.error("[/admin/award/maker]", e?.message || e);
+    res.status(500).json({ ok: false, error: "exception" });
+  }
 });
 
 // ---- Debug -----------------------------------------------------------------
