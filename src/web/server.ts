@@ -15,7 +15,7 @@ import path from "path";
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
 // - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Bearer任意; email + duration）
-// - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart）
+// - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart, mode=insert|upsert）
 // - GET  /admin/template.csv   // CSVテンプレDL
 // - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
@@ -211,6 +211,35 @@ function appendJsonl(fp: string, obj: any) {
   ensureDir(path.dirname(fp));
   fs.appendFileSync(fp, JSON.stringify(obj) + "\n", "utf8");
 }
+// 追記: JSONL 全読み/全書き + IDアップサート
+function readJsonlAll(fp: string): any[] {
+  try {
+    const t = fs.readFileSync(fp, "utf8");
+    const lines = t.split("\n").filter(Boolean);
+    return lines.map((s) => JSON.parse(s));
+  } catch {
+    return [];
+  }
+}
+function writeJsonlAll(fp: string, arr: any[]) {
+  ensureDir(path.dirname(fp));
+  const text = arr.map((o) => JSON.stringify(o)).join("\n") + (arr.length ? "\n" : "");
+  fs.writeFileSync(fp, text, "utf8");
+}
+function upsertJsonlByIdBulk(fp: string, items: any[]): { created: number; updated: number } {
+  if (items.length === 0) return { created: 0, updated: 0 };
+  const current = readJsonlAll(fp);
+  const map = new Map<string, any>();
+  for (const o of current) if (o && o.id != null) map.set(String(o.id), o);
+  let created = 0, updated = 0;
+  for (const it of items) {
+    const key = String(it.id);
+    if (map.has(key)) updated++; else created++;
+    map.set(key, it);
+  }
+  writeJsonlAll(fp, Array.from(map.values()));
+  return { created, updated };
+}
 function isoDay(d?: any) {
   const t = d ? new Date(d) : new Date();
   const tz = "Asia/Tokyo";
@@ -260,7 +289,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-09-ingest-noemail",
+    version: "2025-09-09-ingest-upsert",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -782,7 +811,13 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
   return out;
 }
 
-async function _handleCsvText(csvText: string, _req: Request, res: Response) {
+async function _handleCsvText(csvText: string, req: Request, res: Response) {
+  // 取り込みモード：既定 upsert（上書き）。insert は従来動作（重複スキップ）
+  const modeRaw = String((req as any).query?.mode || "").toLowerCase();
+  const MODE: "insert" | "upsert" =
+    modeRaw === "insert" || modeRaw === "upsert" ? (modeRaw as any) : "upsert";
+  const useDedupe = MODE === "insert";
+
   // BOM対応を有効化
   const records: any[] = csvParse(csvText, {
     columns: true,
@@ -803,50 +838,63 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
     sumSales = 0;
   const errors: any[] = [];
 
-  for (const r of rows) {
-    const key = _csvDedupeKey(r);
-    if (!_csvMarkOrSkip(key)) {
-      dup++;
-      continue;
-    }
-    try {
-      // Habitica資格は任意。無い場合は付与をスキップし、ログのみ残す（エラーにしない）
-      const cred = getHabiticaCredFor(r.email);
+  // ここでは JSONL へ一括反映するため、まずバッファに貯める
+  const bufApprovals: any[] = [];
+  const bufSales: any[] = [];
+  const bufMakers: any[] = [];
 
+  for (const r of rows) {
+    try {
+      // insert モードだけは「同一行の再送」をメモリ重複でスキップ
+      if (useDedupe) {
+        const key = _csvDedupeKey(r);
+        if (!_csvMarkOrSkip(key)) {
+          dup++;
+          continue;
+        }
+      }
+
+      const cred = getHabiticaCredFor(r.email);
       if (r.type === "approval") {
         nApproval++;
-        if (!DRY_RUN && cred) await addApproval(cred, 1, r.notes || "CSV取り込み");
-        appendJsonl("data/events/approvals.jsonl", {
+        const obj = {
           at: new Date().toISOString(),
           day: isoDay(r.date),
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           id: r.id,
-        });
+          notes: r.notes,
+        };
+        bufApprovals.push(obj);
+        // Habitica 付与は「新規 insert のみ」。upsert では二重付与を避けるため抑制
+        if (!DRY_RUN && cred && MODE === "insert") await addApproval(cred, 1, r.notes || "CSV取り込み");
       } else if (r.type === "sales") {
         nSales++;
         const amt = Number(r.amount || 0);
         sumSales += amt;
-        if (!DRY_RUN && cred) await addSales(cred, amt, r.notes || "CSV取り込み");
-        appendJsonl("data/events/sales.jsonl", {
+        const obj = {
           at: new Date().toISOString(),
           day: isoDay(r.date),
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           amount: amt,
           id: r.id,
-        });
+          notes: r.notes,
+        };
+        bufSales.push(obj);
+        if (!DRY_RUN && cred && MODE === "insert") await addSales(cred, amt, r.notes || "CSV取り込み");
       } else if (r.type === "maker") {
         nMaker++;
-        if (!DRY_RUN && cred) await addMakerAward(cred, 1);
-        appendJsonl("data/events/maker.jsonl", {
+        const obj = {
           at: new Date().toISOString(),
           day: isoDay(r.date),
           email: r.email || null,
           actor: r.actorName ? { name: r.actorName, email: r.email || null } : undefined,
           maker: r.maker,
           id: r.id,
-        });
+        };
+        bufMakers.push(obj);
+        if (!DRY_RUN && cred && MODE === "insert") await addMakerAward(cred, 1);
       }
     } catch (e: any) {
       err++;
@@ -854,12 +902,24 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
     }
   }
 
-  const summary = `🧾 CSV取込: 承認${nApproval} / 売上${nSales}(計${sumSales.toLocaleString()}) / メーカー${nMaker} [重複${dup}, 失敗${err}]`;
+  // JSONL 反映（insert は追記、upsert はIDで上書き）
+  if (MODE === "insert") {
+    for (const o of bufApprovals) appendJsonl("data/events/approvals.jsonl", o);
+    for (const o of bufSales) appendJsonl("data/events/sales.jsonl", o);
+    for (const o of bufMakers) appendJsonl("data/events/maker.jsonl", o);
+  } else {
+    upsertJsonlByIdBulk("data/events/approvals.jsonl", bufApprovals);
+    upsertJsonlByIdBulk("data/events/sales.jsonl", bufSales);
+    upsertJsonlByIdBulk("data/events/maker.jsonl", bufMakers);
+  }
+
+  const summary = `🧾 CSV取込(${MODE}): 承認${nApproval} / 売上${nSales}(計${sumSales.toLocaleString()}) / メーカー${nMaker} [重複${dup}, 失敗${err}]`;
   try {
     await sendChatworkMessage(summary);
   } catch {}
   return res.json({
     ok: true,
+    mode: MODE,
     received,
     accepted: { approval: nApproval, sales: nSales, maker: nMaker },
     totalSales: sumSales,
