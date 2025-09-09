@@ -1,3 +1,4 @@
+// server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -19,7 +20,7 @@ import path from "path";
 // - GET  /admin/upload         // 手動アップロードUI（ドラッグ&ドロップ/貼付）
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）※任意
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）※任意
-// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日 or ?day=YYYY-MM-DD）
+// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer（直近20件）
 // - GET  /debug/secret-hint    // requires Bearer
@@ -37,7 +38,7 @@ app.use(
   })
 );
 
-// === CORS（/admin 配下だけ許可、Habitica/Tampermonkey から叩けるように） ===
+// === 追加: CORS（/admin 配下だけ許可、Habitica/Tampermonkey から叩けるように） ===
 app.use((req, res, next) => {
   if (req.path.startsWith("/admin/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -93,6 +94,9 @@ const HUBSPOT_USER_MAP_JSON = process.env.HUBSPOT_USER_MAP_JSON || "";
 
 // メール -> Habitica資格（個人付与用）
 const HABITICA_USERS_JSON = process.env.HABITICA_USERS_JSON || "";
+
+// 氏名 -> メール（CSVの「DX PORTの 〇〇」対策）
+const NAME_EMAIL_MAP_JSON = process.env.NAME_EMAIL_MAP_JSON || "";
 
 // CSVカタログ（Habiticaボタンの一覧用・任意）
 const CSV_CATALOG_JSON = process.env.CSV_CATALOG_JSON || "[]";
@@ -253,6 +257,7 @@ function markSeen(id?: string | number | null) {
 // ---- Health / Support ------------------------------------------------------
 app.get("/healthz", (_req, res) => {
   const habMap = buildHabiticaMap(HABITICA_USERS_JSON);
+  const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
     version: "2025-09-08-final",
@@ -263,6 +268,7 @@ app.get("/healthz", (_req, res) => {
     dryRun: DRY_RUN,
     appointmentValues: APPOINTMENT_VALUES,
     habiticaUserCount: Object.keys(habMap).length,
+    nameMapCount: Object.keys(nameMap).length,
     callXp: { perCall: CALL_XP_PER_CALL, per5min: CALL_XP_PER_5MIN, unitMs: CALL_XP_UNIT_MS },
   });
 });
@@ -610,7 +616,7 @@ async function _handleCsvMultipart(req: Request, res: Response) {
         mt === "application/octet-stream" ||
         mt.endsWith("ms-excel");
       if (!ok) return reject(new Error(`file must be CSV (got ${info.mimeType})`));
-      file.setEncoding("utf8"); // UTF-8/BOM 対応
+      file.setEncoding("utf8"); // UTF-8/BOM 対応（SJISは未対応だが現行エクスポートはUTF-8）
       file.on("data", (d: string) => (csvText += d));
     });
     bb.on("error", reject);
@@ -630,86 +636,160 @@ type CsvNorm = {
   notes?: string;
 };
 
-// 仕様書CSV or 日本語アポイントCSV を正規化（行番号フォールバックで安定ID）
+// ENV: 氏名→メール
+function buildNameEmailMap(jsonStr: string): Record<string, string> {
+  const parsed = safeParse<Record<string, string>>(jsonStr) || {};
+  const out: Record<string, string> = {};
+  for (const [name, email] of Object.entries(parsed)) {
+    const n = normSpace(String(name || ""));
+    if (!n) continue;
+    if (!email) continue;
+    out[n] = String(email).trim().toLowerCase();
+  }
+  return out;
+}
+const NAME2MAIL = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
+
+// ENV: メール→Habitica資格
+type HabiticaCred = { userId: string; apiToken: string };
+function buildHabiticaMap(jsonStr: string): Record<string, HabiticaCred> {
+  const parsed = safeParse<Record<string, HabiticaCred>>(jsonStr) || {};
+  const out: Record<string, HabiticaCred> = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (!v || !(v as any).userId || !(v as any).apiToken) continue;
+    out[String(k).toLowerCase()] = {
+      userId: String((v as any).userId),
+      apiToken: String((v as any).apiToken),
+    };
+  }
+  return out;
+}
+const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
+function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
+  if (!email) return undefined;
+  return HAB_MAP[email.toLowerCase()];
+}
+
+// 「DX PORTの 〇〇」から氏名を抽出
+function extractDxPortNameFromText(s?: string): string | undefined {
+  if (!s) return undefined;
+  const text = String(s);
+  // 例: "DX PORTの 福田悠人 さんが..." / "DXPORTの田中太郎"
+  const m = text.match(/DX\s*PORT(?:の|:)?\s*([^\n\r、，。・;；【】\[\]\(\)]+?)(?:\s*(?:さん|様|殿|君))?(?:$|[。．、，\s])/i);
+  if (m && m[1]) {
+    const name = normSpace(m[1]).replace(/\s+/g, " ").trim();
+    if (name) return name;
+  }
+  return undefined;
+}
+
+// CSV 1) 仕様書CSV or 2) 日本語アポイントCSV を正規化
 function normalizeCsvRows(records: any[]): CsvNorm[] {
   const out: CsvNorm[] = [];
 
-  records.forEach((r, i) => {
+  for (const r of records) {
     // --- 1) 仕様書CSV（type,email,amount,maker,id,date,notes）
-    const typeRaw = String((r?.type ?? r?.Type ?? "")).trim();
+    const typeRaw = String((r.type ?? r.Type ?? "")).trim();
     if (typeRaw) {
       const t =
         (typeRaw === "承認" ? "approval" : typeRaw === "売上" ? "sales" : typeRaw === "メーカー" ? "maker" : typeRaw) as
           | "approval"
           | "sales"
           | "maker";
-      if (!["approval", "sales", "maker"].includes(t)) return;
+      if (!["approval", "sales", "maker"].includes(t)) continue;
+
       const email = r.email ? String(r.email).trim().toLowerCase() : undefined;
       const amountVal = r.amount != null ? num(r.amount) : undefined;
       const maker = r.maker ? String(r.maker).trim() : undefined;
       let id = String(r.id || "").trim();
       const date = r.date ? String(r.date) : undefined;
       const notes = r.notes ? String(r.notes) : undefined;
-      if (!id) id = `${t}:${email || "-"}:${amountVal || 0}:${maker || "-"}:${date || "-"}:${i}`;
+      if (!id) id = `${t}:${email || "-"}:${amountVal || 0}:${maker || "-"}:${date || "-"}`;
       out.push({ type: t, email, amount: amountVal, maker, id, date, notes });
-      return;
+      continue;
     }
 
     // --- 2) 日本語アポイントCSV（自動判別）
-    const looksJP =
-      r?.["承認日時"] != null ||
-      r?.["商談ステータス"] != null ||
-      r?.["報酬"] != null ||
-      r?.["追加報酬"] != null ||
-      pickKey(r, (k) => /メール.?アドレス/i.test(k)) != null;
+    const hasJP =
+      r["承認日時"] != null ||
+      r["商談ステータス"] != null ||
+      r["報酬"] != null ||
+      r["追加報酬"] != null ||
+      pickKey(r, (k) => /メール.?アドレス/i.test(k)) != null ||
+      pickKey(r, (k) => /(承認条件|設問|質問).*(回答)?\s*23/.test(k)) != null;
 
-    if (!looksJP) return;
+    if (!hasJP) continue;
 
+    // 2-a) アクター氏名の抽出（優先: 承認条件 回答23 の値内の「DX PORTの 〇〇」）
+    let actorName: string | undefined;
+    const q23Key = pickKey(r, (k) => /(承認条件|設問|質問).*(回答)?\s*23/.test(k));
+    if (q23Key) actorName = extractDxPortNameFromText(String(r[q23Key] ?? ""));
+    if (!actorName) {
+      // 値全体からスキャン（どこかのセルに「DX PORTの 〇〇」が混じっている想定）
+      for (const v of Object.values(r)) {
+        actorName = extractDxPortNameFromText(String(v ?? ""));
+        if (actorName) break;
+      }
+    }
+
+    // 2-b) 氏名→メール
+    const emailFromName = actorName ? NAME2MAIL[actorName] : undefined;
+
+    // 2-c) もしメール列があればそちらを優先（将来拡張）
     const mailKey =
       pickKey(r, (k) => /メール.?アドレス/i.test(k)) ||
       pickKey(r, (k) => /email/i.test(k));
-    const email =
-      mailKey ? String(r[mailKey]).trim().toLowerCase() :
-      (r.email ? String(r.email).trim().toLowerCase() : undefined);
+    const email = (mailKey ? String(r[mailKey]).trim().toLowerCase() : "") || emailFromName;
 
-    const idBase =
-      String(r["活動ID"] || r["レコードID"] || r["通話ID"] || r["ID"] || r["id"] || "").trim() ||
-      `${email || "-"}:${i}`;
+    // 2-d) ステータス・金額・メーカー
     const status = normSpace(String(r["商談ステータス"] || ""));
-    const approvedAt =
-      String(r["承認日時"] || r["商談終了日時"] || r["商談開始日時"] || "") || undefined;
+    const approvedAt = String(r["承認日時"] || r["商談終了日時"] || r["商談開始日時"] || "") || undefined;
     const makerName = r["メーカー名"] ? String(r["メーカー名"]).trim() : undefined;
     const reward = num(r["報酬"]) || 0;
     const rewardExtra = num(r["追加報酬"]) || 0;
     const salesAmt = (reward || 0) + (rewardExtra || 0);
 
-    // 承認
-    const isApproved = !!approvedAt || /承認/i.test(status);
+    // 2-e) 安定したID（CSV同一行で同じになるよう、決定的キーで生成）
+    const baseIdRaw =
+      String(r["ID"] || r["id"] || r["案件ID"] || r["レコードID"] || "").trim();
+    const baseId =
+      baseIdRaw ||
+      [
+        actorName || email || "-",
+        approvedAt || status || "-",
+        salesAmt || 0,
+        makerName || "-",
+      ].join("|");
+
+    // 2-f) 承認（“承認”という語を含めば承認扱い）
+    const isApproved = /承認/.test(status) || !!approvedAt;
     if (isApproved) {
       out.push({
         type: "approval",
         email,
-        id: `${idBase}:appr`,
+        id: `${baseId}`,
         date: approvedAt,
         notes: makerName ? `メーカー=${makerName}` : undefined,
       });
     }
 
-    // 売上
+    // 2-g) 売上（報酬+追加報酬）
     if (salesAmt > 0) {
       out.push({
         type: "sales",
         email,
         amount: salesAmt,
-        id: `${idBase}:sales`,
+        id: `${baseId}:sales`,
         date: approvedAt,
         notes: makerName ? `メーカー=${makerName}` : undefined,
       });
     }
 
-    // メーカー表彰（必要時だけ有効化）
-    // if (makerName) out.push({ type: "maker", email, maker: makerName, id: `${idBase}:maker`, date: approvedAt });
-  });
+    // 2-h) maker（自動はオフ。必要なら下記をコメント解除）
+    // if (makerName) {
+    //   out.push({ type: "maker", email, maker: makerName, id: `${baseId}:maker`, date: approvedAt });
+    // }
+  }
 
   return out;
 }
@@ -742,10 +822,11 @@ async function _handleCsvText(csvText: string, _req: Request, res: Response) {
       continue;
     }
     try {
+      // Habitica資格が無い場合は分かりやすくエラー化
       const cred = getHabiticaCredFor(r.email);
       if (!cred) {
         err++;
-        errors.push({ id: r.id, error: `unknown_email: ${r.email || "(empty)"}` });
+        errors.push({ id: r.id, error: `unknown_email: ${r.email || "(empty)"} (NAME_EMAIL_MAP_JSON や HABITICA_USERS_JSON を確認)` });
         continue;
       }
 
@@ -859,28 +940,6 @@ function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: str
 
   const finalEmail = email || (mapped && mapped.email) || undefined;
   return { name: display, email: finalEmail };
-}
-
-// ---- Habitica: 担当メール→資格情報マップ（起動時に正規化） -----------------
-type HabiticaCred = { userId: string; apiToken: string };
-
-function buildHabiticaMap(jsonStr: string): Record<string, HabiticaCred> {
-  const parsed = safeParse<Record<string, HabiticaCred>>(jsonStr) || {};
-  const out: Record<string, HabiticaCred> = {};
-  for (const [k, v] of Object.entries(parsed)) {
-    if (!v || !(v as any).userId || !(v as any).apiToken) continue;
-    out[String(k).toLowerCase()] = {
-      userId: String((v as any).userId),
-      apiToken: String((v as any).apiToken),
-    };
-  }
-  return out;
-}
-const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
-
-function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
-  if (!email) return undefined;
-  return HAB_MAP[email.toLowerCase()];
 }
 
 // ---- Habitica: アポ演出（To-Do→即完了・個人優先/無ければ共通） -------------
@@ -1177,15 +1236,14 @@ function hostAllowed(u: string): boolean {
   }
 }
 
-// ====================== ダッシュボード（today/yesterday or ?day=） ==========
-app.get("/admin/dashboard", (req, res) => {
+// ====================== ダッシュボード（今日/昨日） ==========================
+app.get("/admin/dashboard", (_req, res) => {
   function readJsonl(fp: string): any[] {
     try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); }
     catch { return []; }
   }
-  const qDay = String((req.query?.day || "") as string).trim();
-  const today = qDay || isoDay();
-  const yest = (()=>{ const d=new Date(today); d.setDate(d.getDate()-1); return isoDay(d); })();
+  const today = isoDay();
+  const yest = (()=>{ const d=new Date(); d.setDate(d.getDate()-1); return isoDay(d); })();
   const files = {
     calls: readJsonl("data/events/calls.jsonl"),
     appts: readJsonl("data/events/appointments.jsonl"),
@@ -1234,11 +1292,9 @@ app.get("/admin/dashboard", (req, res) => {
   th,td{border:1px solid #ddd;padding:.5rem .6rem}
   th{background:#f7f7f7}
   h2{margin-top:2rem}
-  .hint{color:#666}
   </style>
   <h1>ダッシュボード</h1>
-  <p class="hint">?day=YYYY-MM-DD で任意日を指定できます（例: /admin/dashboard?day=2025-09-02）。</p>
-  <h2>対象日 ${today}</h2>
+  <h2>本日 ${today}</h2>
   <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
   <tbody>${T.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
   <h2>前日 ${yest}</h2>
@@ -1280,6 +1336,7 @@ app.listen(PORT, () => {
     )})`
   );
   log(`[habitica] user map loaded: ${Object.keys(HAB_MAP).length} users`);
+  log(`[name->email] map loaded: ${Object.keys(NAME2MAIL).length} entries`);
 });
 
 export {};
