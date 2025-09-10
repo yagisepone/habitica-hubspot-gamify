@@ -93,17 +93,38 @@ const APPOINTMENT_SET_LOWER = new Set(APPOINTMENT_VALUES.map((v) => v.toLowerCas
 // 重複抑止TTL（秒）
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24 * 60 * 60);
 
+// === 追加: 大きいJSONを _FILE/_B64/平文 の順で読むヘルパ =====================
+function readJsonTextFromEnv(name: string): string {
+  const file = process.env[`${name}_FILE`];
+  if (file) {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch (e: any) {
+      console.error(`[env] read ${name}_FILE failed:`, e?.message || e);
+    }
+  }
+  const b64 = process.env[`${name}_B64`];
+  if (b64) {
+    try {
+      return Buffer.from(b64, "base64").toString("utf8");
+    } catch (e: any) {
+      console.error(`[env] decode ${name}_B64 failed:`, e?.message || e);
+    }
+  }
+  return process.env[name] || "";
+}
+
 // HubSpot userId -> {name,email}
-const HUBSPOT_USER_MAP_JSON = process.env.HUBSPOT_USER_MAP_JSON || "";
+const HUBSPOT_USER_MAP_JSON = readJsonTextFromEnv("HUBSPOT_USER_MAP_JSON");
 
 // メール -> Habitica資格（個人付与用）
-const HABITICA_USERS_JSON = process.env.HABITICA_USERS_JSON || "";
+const HABITICA_USERS_JSON = readJsonTextFromEnv("HABITICA_USERS_JSON");
 
 // 氏名 -> メール（CSVの「DX PORTの 〇〇」対策）
-const NAME_EMAIL_MAP_JSON = process.env.NAME_EMAIL_MAP_JSON || "";
+const NAME_EMAIL_MAP_JSON = readJsonTextFromEnv("NAME_EMAIL_MAP_JSON");
 
 // CSVカタログ（Habiticaボタンの一覧用・任意）
-const CSV_CATALOG_JSON = process.env.CSV_CATALOG_JSON || "[]";
+const CSV_CATALOG_JSON = readJsonTextFromEnv("CSV_CATALOG_JSON") || "[]";
 // 許可ホスト（空なら https のみ許可）
 const CSV_ALLOWLIST_HOSTS = String(process.env.CSV_ALLOWLIST_HOSTS || "")
   .split(",")
@@ -195,7 +216,9 @@ function fmtJST(ms?: number | string) {
 }
 function safeParse<T = any>(s?: string): T | undefined {
   try {
-    return s ? (JSON.parse(s) as T) : undefined;
+    if (!s) return undefined;
+    const cleaned = String(s).replace(/^\uFEFF/, ""); // ← BOM除去
+    return JSON.parse(cleaned) as T;
   } catch {
     return undefined;
   }
@@ -874,7 +897,7 @@ function makeSalesMessage(r: CsvNorm, amt: number) {
     "[info]",
     "[title]💰 売上 登録[/title]",
     `担当 : ${cwName(r.actorName, r.email)}`,
-    `金額 : ¥${amt.toLocaleString()}`,
+    `金額 : ¥${(amt || 0).toLocaleString()}`,
     r.maker ? `メーカー : ${r.maker}` : undefined,
     `日付 : ${day}`,
     r.notes ? `備考 : ${r.notes}` : undefined,
