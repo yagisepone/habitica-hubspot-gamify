@@ -67,7 +67,7 @@ const WEBHOOK_SECRET =
   process.env.HUBSPOT_CLIENT_SECRET ||
   "";
 
-// ⬅ 追加: Zoom Webhook 用の秘密（チャレンジ応答とBearer検証に使用）
+// Zoom Webhook 用の秘密（チャレンジ応答とBearer検証に使用）
 const ZOOM_WEBHOOK_SECRET = process.env.ZOOM_WEBHOOK_SECRET || "";
 
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
@@ -116,7 +116,7 @@ const CALL_XP_PER_5MIN = Number(process.env.CALL_XP_PER_5MIN || 2);
 const CALL_XP_UNIT_MS = Number(process.env.CALL_XP_UNIT_MS || 5 * 60 * 1000); // 5分
 const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
 
-// === 追加: Issue#9 フラグ ============
+// Issue#9 フラグ
 const CW_NOTIFY_APPROVAL_PER_ROW =
   String(process.env.CW_NOTIFY_APPROVAL_PER_ROW || "0") === "1";
 const CW_NOTIFY_SALES_PER_ROW =
@@ -556,32 +556,36 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
 
 // ============================================================================
 // Zoom/汎用 コール入口（Zoom Phone想定）
-//  - Challenge: { event:"endpoint.url_validation", payload:{ plainToken } } が来る
-//  - Auth: Authorization: Bearer <ZOOM_WEBHOOK_SECRET>（設定推奨）
+//  - Challenge: { plainToken } が来たら encryptedToken を返す（認証不要）
+//  - Auth: 通常通知は Authorization: Bearer <ZOOM_WEBHOOK_SECRET> を検証
+//  - JSONが空/不正でも rawBody から再パースを試みる
 // ============================================================================
-app.post("/webhooks/zoom", async (req: Request, res: Response) => {
-  const b: any = (req as any).body || {};
-
-  // ❶ URL検証（Validate用）
-  const plainToken: string | undefined = b?.plainToken || b?.payload?.plainToken;
-  const isValidation = String(b?.event || "").toLowerCase() === "endpoint.url_validation";
-  if (isValidation && plainToken) {
-    const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN; // どちらか必須推奨
-    const enc = crypto.createHmac("sha256", key).update(String(plainToken)).digest("hex");
-    log(`[zoom] url_validation OK`);
-    return res.json({ plainToken, encryptedToken: enc });
+app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Response) => {
+  // ❶ ボディを頑健に取得
+  const rawText = req.rawBody ? req.rawBody.toString("utf8") : undefined;
+  let b: any = (req as any).body || {};
+  if (!b || (Object.keys(b).length === 0 && rawText)) {
+    try { b = JSON.parse(rawText!); } catch {}
   }
 
-  // ❷ 通常通知の認証（Secret Token を Bearer で検証）
+  // ❷ URL検証（plainToken）は **無条件で先に処理**（Authorization 不要）
+  const plain =
+    b?.plainToken || b?.payload?.plainToken || b?.event?.plainToken || undefined;
+  if (plain) {
+    const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "dummy";
+    const enc = crypto.createHmac("sha256", key).update(String(plain)).digest("hex");
+    return res.json({ plainToken: String(plain), encryptedToken: enc });
+  }
+
+  // ❸ 通常イベントのみ認証チェック
   const expected = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
   if (expected) {
     const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-    if (tok !== expected) {
-      return res.status(401).json({ ok: false, error: "auth" });
-    }
+    if (tok !== expected) return res.status(401).json({ ok: false, error: "auth" });
   }
 
-  const raw = b.payload?.object || b.object || b || {};
+  // ❹ 通常イベントの処理（通話時間など）
+  const raw = b?.payload?.object || b?.object || b || {};
   const email =
     raw.user_email ||
     raw.owner_email ||
@@ -689,8 +693,8 @@ async function _handleCsvMultipart(req: Request, res: Response) {
 
 type CsvNorm = {
   type: "approval" | "sales" | "maker";
-  email?: string;       // ← Habitica連携用（任意）
-  actorName?: string;   // ← ダッシュボード表示用（必須推奨）
+  email?: string;
+  actorName?: string;
   amount?: number;
   maker?: string;
   id: string;
@@ -749,7 +753,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
   const out: CsvNorm[] = [];
 
   for (const r of records) {
-    // --- 1) 仕様書CSV（type,email,amount,maker,id,date,notes）※emailは任意扱い
+    // --- 1) 仕様書CSV
     const typeRaw = String((r.type ?? r.Type ?? "")).trim();
     if (typeRaw) {
       const t =
@@ -781,7 +785,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
 
     if (!hasJP) continue;
 
-    // 2-a) アクター氏名の抽出（優先: 承認条件 回答23 の値内の「DX PORTの 〇〇」）
+    // 2-a) アクター氏名
     let actorName: string | undefined;
     const q23Key = pickKey(r, (k) => /(承認条件|設問|質問).*(回答)?\s*23/.test(k));
     if (q23Key) actorName = extractDxPortNameFromText(String(r[q23Key] ?? ""));
@@ -792,9 +796,9 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       }
     }
 
-    // 2-b) メールは「氏名→メール」マップのみ使用（取引先のメール列は完全に無視）
+    // 2-b) メールは「氏名→メール」マップのみ使用（取引先のメール列は無視）
     const emailFromName = actorName ? NAME2MAIL[actorName] : undefined;
-    const email = emailFromName; // ← ここがポイント
+    const email = emailFromName;
 
     // 2-c) ステータス・金額・メーカー
     const status = normSpace(String(r["商談ステータス"] || ""));
@@ -804,14 +808,14 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
     const rewardExtra = num(r["追加報酬"]) || 0;
     const salesAmt = (reward || 0) + (rewardExtra || 0);
 
-    // 2-d) 安定したID（役者や金額等を混ぜて決定的に）
+    // 2-d) 安定したID
     const baseIdRaw =
       String(r["ID"] || r["id"] || r["案件ID"] || r["レコードID"] || "").trim();
     const baseId =
       baseIdRaw ||
       [actorName || email || "-", approvedAt || status || "-", salesAmt || 0, makerName || "-"].join("|");
 
-    // 2-e) 承認（メーカーも保持）
+    // 2-e) 承認
     const isApproved = /承認/.test(status) || !!approvedAt;
     if (isApproved) {
       out.push({
@@ -825,7 +829,7 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
       });
     }
 
-    // 2-f) 売上（メーカーも保持）
+    // 2-f) 売上
     if (salesAmt > 0) {
       out.push({
         type: "sales",
@@ -911,7 +915,7 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
   // 行単位通知のキュー
   const _cwQueue: string[] = [];
 
-  // ここでは JSONL へ一括反映するため、まずバッファに貯める
+  // JSONL 一括反映用バッファ
   const bufApprovals: any[] = [];
   const bufSales: any[] = [];
   const bufMakers: any[] = [];
@@ -919,7 +923,6 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
 
   for (const r of rows) {
     try {
-      // insert モードだけは「同一行の再送」をメモリ重複でスキップ
       if (useDedupe) {
         const key = _csvDedupeKey(r);
         if (!_csvMarkOrSkip(key)) {
@@ -943,9 +946,7 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
           notes: r.notes,
         };
         bufApprovals.push(obj);
-        // Habitica 付与は「新規 insert のみ」。upsert では二重付与を避けるため抑制
         if (!DRY_RUN && cred && MODE === "insert") await addApproval(cred, 1, r.notes || "CSV取り込み");
-        // 行単位Chatwork（承認）
         if (!DRY_RUN && MODE === "insert" && CW_NOTIFY_APPROVAL_PER_ROW) {
           _cwQueue.push(makeApprovalMessage(r));
         }
@@ -967,7 +968,6 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
         };
         bufSales.push(obj);
         if (!DRY_RUN && cred && MODE === "insert") await addSales(cred, amt, r.notes || "CSV取り込み");
-        // 行単位Chatwork（売上）
         if (!DRY_RUN && MODE === "insert" && CW_NOTIFY_SALES_PER_ROW) {
           _cwQueue.push(makeSalesMessage(r, amt));
         }
@@ -992,7 +992,7 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
     }
   }
 
-  // JSONL 反映（insert は追記、upsert はIDで上書き）
+  // JSONL 反映
   if (MODE === "insert") {
     for (const o of bufApprovals) appendJsonl("data/events/approvals.jsonl", o);
     for (const o of bufSales) appendJsonl("data/events/sales.jsonl", o);
@@ -1003,7 +1003,7 @@ async function _handleCsvText(csvText: string, req: Request, res: Response) {
     upsertJsonlByIdBulk("data/events/maker.jsonl", bufMakers);
   }
 
-  // 行単位通知をまとめて送信
+  // 行単位通知まとめ送信
   if (!DRY_RUN && _cwQueue.length > 0) {
     try {
       for (const m of _cwQueue) await sendChatworkMessage(m);
@@ -1097,7 +1097,7 @@ function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: str
   return { name: display, email: finalEmail };
 }
 
-// ---- Habitica: アポ演出（To-Do→即完了・個人優先/無ければ共通） -------------
+// ---- Habitica: アポ演出 ----------------------------------------------------
 async function awardXpForAppointment(ev: Normalized) {
   const when = fmtJST(ev.occurredAt);
   const who = resolveActor({ source: ev.source, raw: ev.raw });
@@ -1105,7 +1105,6 @@ async function awardXpForAppointment(ev: Normalized) {
   const msg = `[XP] appointment scheduled (source=${ev.source}) callId=${ev.callId} at=${when} by=${who.name}`;
   if (DRY_RUN || !cred) {
     log(`${msg} (DRY_RUN or no-cred)`);
-    // ログのみ（ダッシュボードは calls/appts のみで集計）
     appendJsonl("data/events/appointments.jsonl", {
       at: new Date().toISOString(),
       day: isoDay(ev.occurredAt),
@@ -1474,6 +1473,9 @@ app.get("/admin/dashboard", (_req, res) => {
     <td style="text-align:right">${r.count}</td>
     <td style="text-align:right">¥${(r.sales||0).toLocaleString()}</td></tr>`;
 
+  const todayLabel = today;
+  const yestLabel = yest;
+
   const html = `<!doctype html><meta charset="utf-8">
   <title>ダッシュボード</title>
   <style>
@@ -1484,19 +1486,19 @@ app.get("/admin/dashboard", (_req, res) => {
   h2{margin-top:2rem}
   </style>
   <h1>ダッシュボード</h1>
-  <h2>本日 ${today}</h2>
+  <h2>本日 ${todayLabel}</h2>
   <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
   <tbody>${T.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
 
-  <h2>メーカー別（承認ベース） 本日 ${today}</h2>
+  <h2>メーカー別（承認ベース） 本日 ${todayLabel}</h2>
   <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead>
   <tbody>${TM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
 
-  <h2>前日 ${yest}</h2>
+  <h2>前日 ${yestLabel}</h2>
   <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
   <tbody>${Y.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
 
-  <h2>メーカー別（承認ベース） 前日 ${yest}</h2>
+  <h2>メーカー別（承認ベース） 前日 ${yestLabel}</h2>
   <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead>
   <tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
   `;
