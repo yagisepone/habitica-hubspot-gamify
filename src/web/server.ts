@@ -93,38 +93,57 @@ const APPOINTMENT_SET_LOWER = new Set(APPOINTMENT_VALUES.map((v) => v.toLowerCas
 // 重複抑止TTL（秒）
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24 * 60 * 60);
 
-// === 追加: 大きいJSONを _FILE/_B64/平文 の順で読むヘルパ =====================
-function readJsonTextFromEnv(name: string): string {
-  const file = process.env[`${name}_FILE`];
-  if (file) {
+/**
+ * JSON相当の「文字列」をいろんな経路から安全に読むためのヘルパ。
+ * 優先順:
+ *   1) 直接 ENV（NAME）
+ *   2) パス ENV（NAME_FILE）
+ *   3) base64 ENV（NAME_B64）
+ *   4) 既定の探索パス（Render Secret Files ＝ /etc/secrets/*.json）
+ */
+function readJsonish(name: string, fallbacks: string[] = []): string {
+  const direct = process.env[name];
+  if (direct && direct.trim()) return direct;
+
+  const fileEnv = process.env[`${name}_FILE`];
+  if (fileEnv) {
     try {
-      return fs.readFileSync(file, "utf8");
-    } catch (e: any) {
-      console.error(`[env] read ${name}_FILE failed:`, e?.message || e);
-    }
+      if (fs.existsSync(fileEnv)) return fs.readFileSync(fileEnv, "utf8");
+    } catch {}
   }
+
   const b64 = process.env[`${name}_B64`];
-  if (b64) {
+  if (b64 && b64.trim()) {
     try {
       return Buffer.from(b64, "base64").toString("utf8");
-    } catch (e: any) {
-      console.error(`[env] decode ${name}_B64 failed:`, e?.message || e);
-    }
+    } catch {}
   }
-  return process.env[name] || "";
+
+  for (const p of fallbacks) {
+    try {
+      if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
+    } catch {}
+  }
+  return "";
 }
 
 // HubSpot userId -> {name,email}
-const HUBSPOT_USER_MAP_JSON = readJsonTextFromEnv("HUBSPOT_USER_MAP_JSON");
+const HUBSPOT_USER_MAP_JSON = readJsonish("HUBSPOT_USER_MAP_JSON", [
+  "/etc/secrets/hubspot_user_map.json",
+]);
 
 // メール -> Habitica資格（個人付与用）
-const HABITICA_USERS_JSON = readJsonTextFromEnv("HABITICA_USERS_JSON");
+const HABITICA_USERS_JSON = readJsonish("HABITICA_USERS_JSON", [
+  "/etc/secrets/habitica_users.json",
+]);
 
 // 氏名 -> メール（CSVの「DX PORTの 〇〇」対策）
-const NAME_EMAIL_MAP_JSON = readJsonTextFromEnv("NAME_EMAIL_MAP_JSON");
+const NAME_EMAIL_MAP_JSON = readJsonish("NAME_EMAIL_MAP_JSON", [
+  "/etc/secrets/name_email_map.json",
+]);
 
 // CSVカタログ（Habiticaボタンの一覧用・任意）
-const CSV_CATALOG_JSON = readJsonTextFromEnv("CSV_CATALOG_JSON") || "[]";
+const CSV_CATALOG_JSON = process.env.CSV_CATALOG_JSON || "[]";
 // 許可ホスト（空なら https のみ許可）
 const CSV_ALLOWLIST_HOSTS = String(process.env.CSV_ALLOWLIST_HOSTS || "")
   .split(",")
@@ -216,9 +235,7 @@ function fmtJST(ms?: number | string) {
 }
 function safeParse<T = any>(s?: string): T | undefined {
   try {
-    if (!s) return undefined;
-    const cleaned = String(s).replace(/^\uFEFF/, ""); // ← BOM除去
-    return JSON.parse(cleaned) as T;
+    return s ? (JSON.parse(s) as T) : undefined;
   } catch {
     return undefined;
   }
@@ -897,7 +914,7 @@ function makeSalesMessage(r: CsvNorm, amt: number) {
     "[info]",
     "[title]💰 売上 登録[/title]",
     `担当 : ${cwName(r.actorName, r.email)}`,
-    `金額 : ¥${(amt || 0).toLocaleString()}`,
+    `金額 : ¥${amt.toLocaleString()}`,
     r.maker ? `メーカー : ${r.maker}` : undefined,
     `日付 : ${day}`,
     r.notes ? `備考 : ${r.notes}` : undefined,
