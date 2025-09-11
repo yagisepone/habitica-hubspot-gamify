@@ -20,7 +20,7 @@ import path from "path";
 // - GET  /admin/upload         // 手動アップロードUI
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）
-// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）
+// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/前日）
 // - POST /admin/award/maker    // メーカー賞 実行（Bearer）
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer
@@ -94,8 +94,12 @@ const ZOOM_WEBHOOK_SECRET =
   (process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || process.env.SECRET || "").trim();
 // 任意：Bearer フォールバック用（Zoom 側で Authorization を付けられない場合は未使用でOK）
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
-// 許容スキュー（秒）
-const ZOOM_SIG_SKEW = Number(process.env.ZOOM_SIG_SKEW || 300);
+// 許容スキュー（秒）— ZOOM_SIG_SKEW / ZOOM_SKEW_SEC どちらでもOK
+const ZOOM_SIG_SKEW = Number(
+  (process.env as any).ZOOM_SIG_SKEW ??
+  (process.env as any).ZOOM_SKEW_SEC ??
+  300
+);
 
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
@@ -485,7 +489,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   let skew: number | undefined;
   let sigDebug: any = undefined;
 
-  // まず 署名（推奨 / A/B両方式）
+  // まず 署名（推奨 / A,B両方式）
   if (req.get("x-zm-signature") && ZOOM_WEBHOOK_SECRET) {
     const chk = verifyZoomSignatureDetailed(req, ZOOM_WEBHOOK_SECRET);
     authOK = chk.ok; why = chk.why; skew = chk.skew;
