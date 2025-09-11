@@ -95,6 +95,9 @@ const WEBHOOK_SECRET =
 // ★ 空白や改行混入を避けるため trim() する（Renderのコピペ事故対策）
 const ZOOM_WEBHOOK_SECRET =
   (process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || process.env.SECRET || "").trim();
+// 追加：Verification Token（Zoomが一部イベントでHEXのみ署名に用いる鍵）
+const ZOOM_VERIFICATION_TOKEN =
+  (process.env.ZOOM_VERIFICATION_TOKEN || process.env.ZOOM_VTOKEN || "").trim();
 // 任意：Bearer フォールバック用（Zoom 側で Authorization を付けられない場合は未使用でOK）
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
 // 許容スキュー（秒）※互換: ZOOM_SKEW_SEC も読む
@@ -333,7 +336,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-11-zoom-signature-triple+debug-reason",
+    version: "2025-09-11-zoom-hex-vtoken+secret-ready",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -404,8 +407,7 @@ app.post(
     ).toLowerCase();
 
     const raw: Buffer =
-      (req as any).rawBody ??
-      Buffer.from(JSON.stringify((req as any).body ?? ""), "utf8");
+      (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body ?? ""), "utf8");
 
     const proto =
       String(req.headers["x-forwarded-proto"] || "")
@@ -593,7 +595,8 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
 // ---- Zoom 署名検証（A/B: ts+base64 & C: HEX no-ts） ------------------------
 function verifyZoomSignatureDetailed(
   req: Request & { rawBody?: Buffer },
-  secret: string
+  secret: string,
+  verificationToken?: string
 ): {
   ok: boolean;
   why?: string;
@@ -605,8 +608,9 @@ function verifyZoomSignatureDetailed(
   hex1_12?: string;
   hex2_12?: string;
   hex3_12?: string;
+  vtoken_hex12?: string;
 } {
-  if (!secret) return { ok: false, why: "no_secret" };
+  if (!secret && !verificationToken) return { ok: false, why: "no_secret" };
 
   const header = req.get("x-zm-signature") || "";
   if (!header) return { ok: false, why: "no_header" };
@@ -615,32 +619,41 @@ function verifyZoomSignatureDetailed(
 
   // Variant-C: v0=<HEXのみ>（Zoom Phone が稀に送る / timestamp なし）
   {
-    const mHex = header.match(/^v0=([a-f0-9]{32,64})$/i);
+    const mHex = header.match(/^v0=([a-f0-9]{64})$/i);
     if (mHex) {
       const sigHex = mHex[1].toLowerCase();
-      const h1 = crypto.createHmac("sha256", secret).update(body).digest("hex"); // HMAC(secret, body)
-      const h2 = crypto
-        .createHmac("sha256", secret)
-        .update("v0" + body)
-        .digest("hex"); // HMAC(secret, "v0"+body)
-      const h3 = crypto
-        .createHmac("sha256", secret)
-        .update("v0:" + body)
-        .digest("hex"); // HMAC(secret, "v0:"+body)
       const sigBuf = Buffer.from(sigHex, "hex");
-      const eq = (hex: string) => {
+      const safeEqHex = (hex: string) => {
         try {
-          return crypto.timingSafeEqual(Buffer.from(hex, "hex"), sigBuf);
+          return crypto.timingSafeEqual(sigBuf, Buffer.from(hex, "hex"));
         } catch {
           return false;
         }
       };
-      const ok = eq(h1) || eq(h2) || eq(h3);
+
+      // まず Verification Token 鍵で HMAC(body)
+      if (verificationToken) {
+        const vtMac = crypto.createHmac("sha256", verificationToken).update(body).digest("hex");
+        if (safeEqHex(vtMac)) {
+          return {
+            ok: true,
+            variant: "hex_no_ts_vtoken",
+            hdr12: sigHex.slice(0, 12),
+            vtoken_hex12: vtMac.slice(0, 12),
+          };
+        }
+      }
+
+      // Secret Token 鍵の既存互換（本実装では body / "v0"+body / "v0:"+body を試す）
+      const h1 = crypto.createHmac("sha256", secret).update(body).digest("hex");
+      const h2 = crypto.createHmac("sha256", secret).update("v0" + body).digest("hex");
+      const h3 = crypto.createHmac("sha256", secret).update("v0:" + body).digest("hex");
+      const ok = safeEqHex(h1) || safeEqHex(h2) || safeEqHex(h3);
       return {
         ok,
         why: ok ? undefined : "signature_mismatch_hex",
         hdr12: sigHex.slice(0, 12),
-        variant: "hex_no_ts",
+        variant: ok ? (safeEqHex(h1) ? "hex_no_ts_secret" : "hex_no_ts_secret") : "hex_no_ts",
         hex1_12: h1.slice(0, 12),
         hex2_12: h2.slice(0, 12),
         hex3_12: h3.slice(0, 12),
@@ -648,7 +661,7 @@ function verifyZoomSignatureDetailed(
     }
   }
 
-  // Variant-A/B: v0=<ts>:<base64> or v0:<ts>:<base64>
+  // Variant-A/B: v0=<ts>:<base64> or v0:<ts>:<base64>（Secret Token 鍵）
   const m = header.match(/^v0[:=](\d+):([A-Za-z0-9+/=]+)$/);
   if (!m) return { ok: false, why: "bad_format" };
 
@@ -689,6 +702,7 @@ function verifyZoomSignatureDetailed(
     hdr12: sigB64.slice(0, 12),
     macA12: macA.slice(0, 12),
     macB12: macB.slice(0, 12),
+    variant: "v0_ts_b64",
   };
 }
 
@@ -723,8 +737,8 @@ app.post(
     let sigDebug: any = undefined;
 
     // まず 署名（推奨 / A/B/C すべて対応）
-    if (req.get("x-zm-signature") && ZOOM_WEBHOOK_SECRET) {
-      const chk = verifyZoomSignatureDetailed(req, ZOOM_WEBHOOK_SECRET);
+    if (req.get("x-zm-signature") && (ZOOM_WEBHOOK_SECRET || ZOOM_VERIFICATION_TOKEN)) {
+      const chk = verifyZoomSignatureDetailed(req, ZOOM_WEBHOOK_SECRET, ZOOM_VERIFICATION_TOKEN);
       authOK = chk.ok;
       why = chk.why;
       skew = chk.skew;
@@ -736,9 +750,10 @@ app.post(
         hex1_12: chk.hex1_12,
         hex2_12: chk.hex2_12,
         hex3_12: chk.hex3_12,
+        vtoken_hex12: chk.vtoken_hex12,
       };
       if (authOK) via = "signature";
-    } else if (req.get("x-zm-signature") && !ZOOM_WEBHOOK_SECRET) {
+    } else if (req.get("x-zm-signature") && !ZOOM_WEBHOOK_SECRET && !ZOOM_VERIFICATION_TOKEN) {
       why = "server_missing_secret";
     }
 
@@ -844,8 +859,7 @@ function _csvDedupeKey(r: any) {
 }
 function _csvMarkOrSkip(key: string) {
   const now = Date.now();
-  for (const [k, ts] of [..._csvSeen.entries()])
-    if (now - ts > _CSV_TTL) _csvSeen.delete(k);
+  for (const [k, ts] of [..._csvSeen.entries()]) if (now - ts > _CSV_TTL) _csvSeen.delete(k);
   if (_csvSeen.has(key)) return false;
   _csvSeen.set(key, now);
   return true;
