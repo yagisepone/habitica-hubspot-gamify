@@ -88,12 +88,14 @@ const WEBHOOK_SECRET =
   process.env.HUBSPOT_CLIENT_SECRET || "";
 
 // Zoom Webhook 用（署名＆チャレンジ用 Secret）
-// ※ ZOOM_WEBHOOK_SECRET が無ければ ZOOM_SECRET をフォールバックで拾う
+// ※ ZOOM_WEBHOOK_SECRET が無ければ ZOOM_SECRET → SECRET をフォールバックで拾う
 // ★ 空白や改行混入を避けるため trim() する（Renderのコピペ事故対策）
 const ZOOM_WEBHOOK_SECRET =
-  (process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || "").trim();
+  (process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || process.env.SECRET || "").trim();
 // 任意：Bearer フォールバック用（Zoom 側で Authorization を付けられない場合は未使用でOK）
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
+// 許容スキュー（秒）
+const ZOOM_SIG_SKEW = Number(process.env.ZOOM_SIG_SKEW || 300);
 
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
@@ -199,6 +201,7 @@ function isoDay(d?:any){ const t=d?new Date(d):new Date(); const tz="Asia/Tokyo"
 interface LastEvent {
   at?: string; path?: string; verified?: boolean; note?: string;
   headers?: Record<string, string | undefined>; body?: any; sig_debug?: any;
+  why?: string; skew_sec?: number;
 }
 const lastEvent: LastEvent = {};
 const recent: LastEvent[] = [];
@@ -217,7 +220,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-11-zoom-signature-dual",
+    version: "2025-09-11-zoom-signature-dual+debug-reason",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -409,43 +412,54 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
   return res.json({ ok: true });
 });
 
-// ---- Zoom 署名検証ヘルパー（A/B両方式対応） -------------------------------
-function verifyZoomSignature(req: Request & { rawBody?: Buffer }, secret: string): boolean {
-  const header = req.get("x-zm-signature");
-  if (!header || !secret) return false;
+// ---- Zoom 署名検証（A/B両方式 + 詳細理由を返す） ---------------------------
+function parseZmHeader(h?: string): { ts?: number; sig?: string } {
+  if (!h) return {};
+  // 許容: "v0=<ts>:<sig>" または "v0:<ts>:<sig>"
+  const m = h.match(/^v0[:=](\d+):([A-Za-z0-9+/=]+)$/);
+  if (!m) return {};
+  const ts = Number(m[1]);
+  const sig = m[2];
+  if (!Number.isFinite(ts) || !sig) return {};
+  return { ts, sig };
+}
 
-  const [schema, rest] = header.split("=");
-  if (schema !== "v0" || !rest) return false;
+function verifyZoomSignatureDetailed(req: Request & { rawBody?: Buffer }, secret: string): {
+  ok: boolean; why?: string; skew?: number; hdr12?: string; macA12?: string; macB12?: string;
+} {
+  if (!secret) return { ok:false, why:"no_secret" };
 
-  const [tsStr, sigB64] = rest.split(":");
-  if (!tsStr || !sigB64) return false;
+  const header = req.get("x-zm-signature") || "";
+  if (!header) return { ok:false, why:"no_header" };
 
-  // リプレイ対策（±5分）
+  const { ts, sig } = parseZmHeader(header);
+  if (!ts || !sig) return { ok:false, why:"bad_format" };
+
   const now = Math.floor(Date.now() / 1000);
-  const ts = parseInt(tsStr, 10);
-  if (!Number.isFinite(ts) || Math.abs(now - ts) > 300) return false;
+  const skew = Math.abs(now - ts);
+  if (skew > ZOOM_SIG_SKEW) return { ok:false, why:"timestamp_skew_exceeded", skew };
 
   const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
 
   // 方式A: HMAC(secret, ts + body)
-  const macA = crypto.createHmac("sha256", secret).update(tsStr + body).digest("base64");
-  // 方式B: HMAC(secret, `v0:${ts}:${body}`) ← Zoom本番で多い
-  const macB = crypto.createHmac("sha256", secret).update(`v0:${tsStr}:${body}`).digest("base64");
+  const macA = crypto.createHmac("sha256", secret).update(String(ts) + body).digest("base64");
+  // 方式B: HMAC(secret, `v0:${ts}:${body}`)
+  const macB = crypto.createHmac("sha256", secret).update(`v0:${ts}:${body}`).digest("base64");
 
-  // /debug/last で比較を見れるように保存
-  (req as any)._zoom_sig_debug = {
-    first12_hdr: sigB64.slice(0, 12),
-    first12_A: macA.slice(0, 12),
-    first12_B: macB.slice(0, 12),
-  };
-
-  const sigBuf = Buffer.from(sigB64);
+  const sigBuf = Buffer.from(sig);
   const eq = (mac: string) => {
-    try { return crypto.timingSafeEqual(Buffer.from(mac), sigBuf); }
-    catch { return false; }
+    try { return crypto.timingSafeEqual(Buffer.from(mac), sigBuf); } catch { return false; }
   };
 
-  return eq(macA) || eq(macB);
+  const ok = eq(macA) || eq(macB);
+  return {
+    ok,
+    why: ok ? undefined : "signature_mismatch",
+    skew,
+    hdr12: sig.slice(0,12),
+    macA12: macA.slice(0,12),
+    macB12: macB.slice(0,12),
+  };
 }
 
 // ============================================================================
@@ -467,11 +481,18 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   // ② 認証
   let via: "signature" | "bearer" | "none" = "none";
   let authOK = false;
+  let why: string | undefined;
+  let skew: number | undefined;
+  let sigDebug: any = undefined;
 
   // まず 署名（推奨 / A/B両方式）
   if (req.get("x-zm-signature") && ZOOM_WEBHOOK_SECRET) {
-    authOK = verifyZoomSignature(req, ZOOM_WEBHOOK_SECRET);
+    const chk = verifyZoomSignatureDetailed(req, ZOOM_WEBHOOK_SECRET);
+    authOK = chk.ok; why = chk.why; skew = chk.skew;
+    sigDebug = { first12_hdr: chk.hdr12, first12_A: chk.macA12, first12_B: chk.macB12 };
     if (authOK) via = "signature";
+  } else if (req.get("x-zm-signature") && !ZOOM_WEBHOOK_SECRET) {
+    why = "server_missing_secret";
   }
 
   // フォールバック：Bearer（任意）
@@ -479,12 +500,30 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     const expected = ZOOM_BEARER_TOKEN || ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
     if (expected) {
       const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-      authOK = tok === expected;
-      if (authOK) via = "bearer";
+      if (tok === expected) { authOK = true; via = "bearer"; why = undefined; }
+      else if (!why) { why = "bad_bearer"; }
     }
   }
 
-  if (!authOK) return res.status(401).json({ ok: false, error: "auth" });
+  // デバッグ格納（成功・失敗どちらでも）
+  const evBase: LastEvent = {
+    at: new Date().toISOString(),
+    path: "/webhooks/zoom",
+    verified: authOK,
+    note: "zoom-event",
+    headers: {
+      "x-zm-signature": req.get("x-zm-signature") || undefined,
+      "authorization": req.get("authorization") || undefined,
+      via,
+    },
+    body: b,
+    sig_debug: sigDebug,
+    why,
+    skew_sec: skew,
+  };
+  Object.assign(lastEvent, evBase); pushRecent(evBase);
+
+  if (!authOK) return res.status(401).json({ ok: false, error: "auth", why, skew_sec: skew });
 
   // ③ 通常イベント処理（通話時間など）
   const raw = b?.payload?.object || b?.object || b || {};
@@ -501,21 +540,6 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   const callId = raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
   const whoRaw = { userEmail: email };
 
-  // デバッグ格納
-  const ev: LastEvent = {
-    at: new Date().toISOString(),
-    path: "/webhooks/zoom",
-    verified: true,
-    note: "zoom-event",
-    headers: {
-      "x-zm-signature": req.get("x-zm-signature") || undefined,
-      "authorization": req.get("authorization") || undefined,
-      via,
-    },
-    body: b,
-    sig_debug: (req as any)._zoom_sig_debug, // ← 署名比較の先頭12文字を保存
-  };
-  Object.assign(lastEvent, ev); pushRecent(ev);
   log(`[zoom] event=${b?.event || b?.event_type || "(unknown)"} accepted via=${via} callId=${callId} ms=${ms}`);
 
   await handleCallDurationEvent({
