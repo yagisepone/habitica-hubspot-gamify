@@ -90,9 +90,10 @@ const WEBHOOK_SECRET =
 // Zoom Webhook 用（署名＆チャレンジ用 Secret）
 // ※ ZOOM_WEBHOOK_SECRET が無ければ ZOOM_SECRET をフォールバックで拾う
 const ZOOM_WEBHOOK_SECRET = process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || "";
-// 任意：Bearer フォールバック用（Zoom 側で Authorization を付けられない場合は未使用でOK）
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
+const ZOOM_SKEW_SEC = Number(process.env.ZOOM_SKEW_SEC || 300); // ★ 変更: 許容時計ずれ(秒)
 
+// HubSpot OAuth
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
   process.env.HUBSPOT_APP_SECRET || process.env.HUBSPOT_CLIENT_SECRET || "";
@@ -215,7 +216,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-11-zoom-signature-ready",
+    version: "2025-09-11-zoom-b64", // ★ 変更: バージョン更新
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -418,13 +419,14 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }, secret: string
   const [tsStr, sigB64] = rest.split(":");
   if (!tsStr || !sigB64) return false;
 
-  // リプレイ対策（±5分）
+  // リプレイ対策（±ZOOM_SKEW_SEC）
   const now = Math.floor(Date.now() / 1000);
   const ts = parseInt(tsStr, 10);
-  if (!Number.isFinite(ts) || Math.abs(now - ts) > 300) return false;
+  if (!Number.isFinite(ts) || Math.abs(now - ts) > ZOOM_SKEW_SEC) return false;
 
-  const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
-  const mac = crypto.createHmac("sha256", secret).update(tsStr + body).digest("base64");
+  // ★ 変更: rawBody を Buffer のまま連結して HMAC、base64 で比較
+  const bodyBuf: Buffer = (req.rawBody ?? Buffer.alloc(0));
+  const mac = crypto.createHmac("sha256", secret).update(tsStr, "utf8").update(bodyBuf).digest("base64");
 
   try { return crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(sigB64)); }
   catch { return false; }
@@ -442,7 +444,8 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   const plain = b?.plainToken || b?.payload?.plainToken || b?.event?.plainToken || undefined;
   if (plain) {
     const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "dummy";
-    const enc = crypto.createHmac("sha256", key).update(String(plain)).digest("hex");
+    // ★ 変更: hex → base64（Zoom仕様）
+    const enc = crypto.createHmac("sha256", key).update(String(plain)).digest("base64");
     return res.json({ plainToken: String(plain), encryptedToken: enc });
   }
 
@@ -483,7 +486,18 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   const callId = raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
   const whoRaw = { userEmail: email };
 
-  // デバッグ格納
+  // デバッグ格納（署名の比較先頭12文字も保持）
+  let sigDbg: any = undefined; // ★ 追加: デバッグ
+  const hdr = req.get("x-zm-signature") || "";
+  if (hdr && ZOOM_WEBHOOK_SECRET) {
+    const [_, r] = hdr.split("=");
+    const [tsStr, got] = (r||"").split(":");
+    if (tsStr) {
+      const mac = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(tsStr, "utf8").update(req.rawBody ?? Buffer.alloc(0)).digest("base64");
+      sigDbg = { ts: tsStr, got_first12: (got||"").slice(0,12), calc_first12: mac.slice(0,12) };
+    }
+  }
+
   const ev: LastEvent = {
     at: new Date().toISOString(),
     path: "/webhooks/zoom",
@@ -491,6 +505,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     note: "zoom-event",
     headers: { "x-zm-signature": req.get("x-zm-signature") || undefined, "authorization": req.get("authorization") || undefined, via },
     body: b,
+    sig_debug: sigDbg,
   };
   Object.assign(lastEvent, ev); pushRecent(ev);
   log(`[zoom] event=${b?.event || b?.event_type || "(unknown)"} accepted via=${via} callId=${callId} ms=${ms}`);
