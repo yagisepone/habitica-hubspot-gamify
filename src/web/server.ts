@@ -43,7 +43,7 @@ app.use(
 app.use((req, res, next) => {
   if (req.path.startsWith("/admin/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Authorization");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     if (req.method === "OPTIONS") return res.status(204).end();
   }
@@ -245,6 +245,19 @@ function normSpace(s?: string) {
   return (s || "").replace(/\u3000/g, " ").trim();
 }
 
+// 追加：Bearer を複数ヘッダから取り出す
+function readBearerFromHeaders(req: Request): string {
+  const keys = ["authorization", "x-authorization", "x-auth", "x-zoom-authorization", "zoom-authorization"];
+  for (const k of keys) {
+    const v = req.get(k);
+    if (!v) continue;
+    const t = v.trim();
+    const m = t.match(/^Bearer\s+(.+)$/i);
+    return (m ? m[1] : t).trim();
+  }
+  return "";
+}
+
 // ---- JSONL logger ----------------------------------------------------------
 function ensureDir(p: string) {
   fs.mkdirSync(p, { recursive: true });
@@ -336,7 +349,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-11-zoom-hex-vtoken+secret-ready",
+    version: "2025-09-11-zoom-hex-vtoken+xauth-ready",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -761,7 +774,7 @@ app.post(
     if (!authOK) {
       const expected = ZOOM_BEARER_TOKEN || ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
       if (expected) {
-        const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
+        const tok = readBearerFromHeaders(req); // ← Authorization / x-authorization 両対応
         if (tok === expected) {
           authOK = true;
           via = "bearer";
@@ -781,6 +794,7 @@ app.post(
       headers: {
         "x-zm-signature": req.get("x-zm-signature") || undefined,
         authorization: req.get("authorization") || undefined,
+        "x-authorization": req.get("x-authorization") || undefined, // 追加
         via,
       },
       body: b,
