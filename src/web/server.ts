@@ -14,7 +14,7 @@ import path from "path";
 // - GET  /oauth/callback
 // - POST /webhooks/hubspot     // HubSpot Webhook v3（署名検証あり）
 // - POST /webhooks/workflow    // HubSpot ワークフローWebhooks（Bearer検証）
-// - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Challenge対応＋Bearer検証）
+// - POST /webhooks/zoom        // Zoom/汎用 コール受け口（Challenge対応＋署名検証＋Bearer）
 // - POST /admin/csv            // CSV取り込み（Bearer必須; text/csv or multipart, mode=insert|upsert）
 // - GET  /admin/template.csv   // CSVテンプレDL
 // - GET  /admin/upload         // 手動アップロードUI
@@ -30,7 +30,7 @@ const app = express();
 app.set("x-powered-by", false);
 app.set("trust proxy", true);
 
-// raw body を保存（v3署名で必須）
+// raw body を保存（v3署名やZoom署名で必須）
 app.use(
   express.json({
     verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
@@ -87,8 +87,10 @@ const WEBHOOK_SECRET =
   process.env.HUBSPOT_APP_SECRET ||
   process.env.HUBSPOT_CLIENT_SECRET || "";
 
-// Zoom Webhook 用（challenge と Bearer 検証）
-const ZOOM_WEBHOOK_SECRET = process.env.ZOOM_WEBHOOK_SECRET || "";
+// Zoom Webhook 用
+const ZOOM_WEBHOOK_SECRET = process.env.ZOOM_WEBHOOK_SECRET || ""; // Webhook v2 Secret Token
+// オプション: Zoomの「Include authorization header」を使う場合のBearer
+const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
 
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID || "";
 const HUBSPOT_APP_SECRET =
@@ -404,6 +406,29 @@ app.post("/webhooks/workflow", async (req: Request, res: Response) => {
   return res.json({ ok: true });
 });
 
+// ---- Zoom 署名検証ヘルパー -------------------------------------------------
+function verifyZoomSignature(req: Request & { rawBody?: Buffer }, secret: string): boolean {
+  const header = req.get("x-zm-signature");
+  if (!header || !secret) return false;
+
+  const [schema, rest] = header.split("=");
+  if (schema !== "v0" || !rest) return false;
+
+  const [tsStr, sigB64] = rest.split(":");
+  if (!tsStr || !sigB64) return false;
+
+  // リプレイ対策（±5分）
+  const now = Math.floor(Date.now() / 1000);
+  const ts = parseInt(tsStr, 10);
+  if (!Number.isFinite(ts) || Math.abs(now - ts) > 300) return false;
+
+  const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
+  const mac = crypto.createHmac("sha256", secret).update(tsStr + body).digest("base64");
+
+  try { return crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(sigB64)); }
+  catch { return false; }
+}
+
 // ============================================================================
 // Zoom/汎用 コール入口（Zoom Phone想定）
 // ============================================================================
@@ -412,7 +437,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   let b: any = (req as any).body || {};
   if (!b || (Object.keys(b).length === 0 && rawText)) { try { b = JSON.parse(rawText!); } catch {} }
 
-  // ❷ URL検証（plainToken）は無条件で先に処理
+  // ① URL検証（plainToken）は最優先で応答
   const plain = b?.plainToken || b?.payload?.plainToken || b?.event?.plainToken || undefined;
   if (plain) {
     const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "dummy";
@@ -420,14 +445,27 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     return res.json({ plainToken: String(plain), encryptedToken: enc });
   }
 
-  // ❸ 通常イベントは Bearer 検証
-  const expected = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
-  if (expected) {
-    const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-    if (tok !== expected) return res.status(401).json({ ok:false, error:"auth" });
+  // ② 認証：まず Zoom 署名（推奨）
+  let authOK = false;
+  if (req.get("x-zm-signature") && ZOOM_WEBHOOK_SECRET) {
+    authOK = verifyZoomSignature(req, ZOOM_WEBHOOK_SECRET);
   }
 
-  // ❹ 通常イベント処理（通話時間など）
+  // ③ フォールバック：Authorization: Bearer（任意）
+  if (!authOK) {
+    const expected = ZOOM_BEARER_TOKEN || ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
+    if (expected) {
+      const tok = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
+      authOK = tok === expected;
+    } else {
+      // 明示トークンが無い環境では許可（必要に応じてfalseに）
+      authOK = true;
+    }
+  }
+
+  if (!authOK) return res.status(401).json({ ok: false, error: "auth" });
+
+  // ④ 本処理（通話時間など）
   const raw = b?.payload?.object || b?.object || b || {};
   const email = raw.user_email || raw.owner_email || raw.caller_email || raw.callee_email || b.email || undefined;
 
@@ -442,8 +480,20 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   const callId = raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
   const whoRaw = { userEmail: email };
 
+  // デバッグ格納
+  const ev: LastEvent = {
+    at: new Date().toISOString(),
+    path: "/webhooks/zoom",
+    verified: true,
+    note: "zoom-event",
+    headers: { "x-zm-signature": req.get("x-zm-signature") || undefined, "authorization": req.get("authorization") || undefined },
+    body: b,
+  };
+  Object.assign(lastEvent, ev); pushRecent(ev);
+  log(`[zoom] event=${b?.event || b?.event_type || "(unknown)"} accepted callId=${callId} ms=${ms}`);
+
   await handleCallDurationEvent({
-    source: "workflow",
+    source: "workflow", // 既存の集計系に合わせて workflow を再利用
     eventId: b.event_id || b.eventId || callId,
     callId,
     durationMs: inferDurationMs(ms),
@@ -950,7 +1000,8 @@ app.post("/admin/award/maker", async (req,res)=>{
 // ---- Debug -----------------------------------------------------------------
 app.get("/debug/last",(req,res)=>{ if(!requireBearer(req,res)) return; if(!lastEvent.at) return res.status(404).json({ ok:false, error:"not_found" }); res.json({ ok:true, last_event:lastEvent }); });
 app.get("/debug/recent",(req,res)=>{ if(!requireBearer(req,res)) return; res.json({ ok:true, recent }); });
-app.get("/debug/secret-hint",(req,res)=>{ if(!requireBearer(req,res)) return;
+app.get("/debug/secret-hint",(req,res)=>{
+  if(!requireBearer(req,res)) return;
   const secret=WEBHOOK_SECRET||""; const hash=crypto.createHash("sha256").update(secret).digest("hex");
   res.json({ ok:true, present:!!secret, length: secret.length, sha256_12: hash.slice(0,12) });
 });
