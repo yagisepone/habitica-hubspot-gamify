@@ -20,7 +20,7 @@ import path from "path";
 // - GET  /admin/upload         // 手動アップロードUI
 // - GET  /admin/files          // CSVカタログ一覧（Bearer）
 // - POST /admin/import-url     // URLのCSVを取り込み（Bearer）
-// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日+当月メーカー）
+// - GET  /admin/dashboard      // KPI簡易ダッシュボード（今日/昨日）
 // - POST /admin/award/maker    // メーカー賞 実行（Bearer）
 // - GET  /debug/last           // requires Bearer
 // - GET  /debug/recent         // requires Bearer
@@ -90,7 +90,7 @@ const WEBHOOK_SECRET =
   process.env.HUBSPOT_CLIENT_SECRET ||
   "";
 
-// Zoom Webhook 用（署名＆チャレンジ用 Secret）
+// Zoom Webhook 用
 const ZOOM_WEBHOOK_SECRET =
   (process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || process.env.SECRET || "").trim();
 const ZOOM_VERIFICATION_TOKEN =
@@ -104,6 +104,7 @@ const HUBSPOT_APP_SECRET =
 const HUBSPOT_REDIRECT_URI =
   process.env.HUBSPOT_REDIRECT_URI || "https://sales-gamify.onrender.com/oauth/callback";
 
+// 公開URL
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/+$/, "");
 
 // “新規アポ”とみなす outcome 値
@@ -143,10 +144,13 @@ const CSV_ALLOWLIST_HOSTS = String(process.env.CSV_ALLOWLIST_HOSTS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// 通話KPI 係数（+1XP/1call は本コード内で固定実装、ここは通知ON/OFFのみで利用）
+// 通話KPI 係数（← ここが 1コール=+1XP / 5分毎=+2XP）
+const CALL_XP_PER_CALL = Number(process.env.CALL_XP_PER_CALL || 1);
+const CALL_XP_PER_5MIN = Number(process.env.CALL_XP_PER_5MIN || 2);
+const CALL_XP_UNIT_MS = Number(process.env.CALL_XP_UNIT_MS || 5 * 60 * 1000);
 const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
 
-// Issue#9 フラグ
+// 追加フラグ
 const CW_NOTIFY_APPROVAL_PER_ROW = String(process.env.CW_NOTIFY_APPROVAL_PER_ROW || "0") === "1";
 const CW_NOTIFY_SALES_PER_ROW = String(process.env.CW_NOTIFY_SALES_PER_ROW || "0") === "1";
 const MAKER_AWARD_ON_IMPORT = String(process.env.MAKER_AWARD_ON_IMPORT || "0") === "1";
@@ -235,8 +239,7 @@ function pickKey(obj: any, matcher: (k: string) => boolean) {
 function normSpace(s?: string) {
   return (s || "").replace(/\u3000/g, " ").trim();
 }
-
-// 追加：Bearer を複数ヘッダから取り出す
+// Bearer 取り出し
 function readBearerFromHeaders(req: Request): string {
   const keys = ["authorization", "x-authorization", "x-auth", "x-zoom-authorization", "zoom-authorization"];
   for (const k of keys) {
@@ -299,36 +302,6 @@ function isoDay(d?: any) {
   return `${y}-${m}-${da}`;
 }
 
-// ===== 通話累積XP（当日5分ごと+2XP）: 進捗管理 (email×dayごと) =====
-const XP_PROGRESS_FP = "data/events/xp_progress.jsonl";
-type XpProg = { key: string; email: string; day: string; units: number; at: string };
-function loadXpProgress(): Record<string, XpProg> {
-  const rows = readJsonlAll(XP_PROGRESS_FP);
-  const map: Record<string, XpProg> = {};
-  for (const r of rows) if (r && r.key) map[r.key] = r as XpProg;
-  return map;
-}
-function saveXpProgress(map: Record<string, XpProg>) {
-  writeJsonlAll(XP_PROGRESS_FP, Object.values(map));
-}
-function progressKey(email: string, day: string) {
-  return `${day}|${email.toLowerCase()}`;
-}
-function calcTotalSecsForDay(email?: string, day?: string) {
-  if (!email || !day) return 0;
-  let totalMs = 0;
-  try {
-    const rows = readJsonlAll("data/events/calls.jsonl").filter(
-      (x) =>
-        x.day === day &&
-        (x.actor?.email?.toLowerCase?.() === email.toLowerCase() ||
-          x.email?.toLowerCase?.() === email.toLowerCase())
-    );
-    for (const r of rows) totalMs += Number(r.ms || 0);
-  } catch {}
-  return Math.max(0, Math.floor(totalMs / 1000));
-}
-
 // ---- Debug store -----------------------------------------------------------
 interface LastEvent {
   at?: string;
@@ -370,7 +343,7 @@ app.get("/healthz", (_req, res) => {
   const nameMap = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
   res.json({
     ok: true,
-    version: "2025-09-17-final-xp1-per-call+xp2-per-5min",
+    version: "2025-09-17-chatwork-tuned",
     tz: process.env.TZ || "Asia/Tokyo",
     now: new Date().toISOString(),
     hasSecret: !!WEBHOOK_SECRET,
@@ -665,7 +638,7 @@ function verifyZoomSignatureDetailed(
         }
       };
 
-      // まず Verification Token 鍵で HMAC(body)
+      // Verification Token 鍵で HMAC(body)
       if (verificationToken) {
         const vtMac = crypto.createHmac("sha256", verificationToken).update(body).digest("hex");
         if (safeEqHex(vtMac)) {
@@ -678,7 +651,7 @@ function verifyZoomSignatureDetailed(
         }
       }
 
-      // Secret Token 鍵の既存互換（body / "v0"+body / "v0:"+body を試す）
+      // Secret Token 鍵の互換
       const h1 = crypto.createHmac("sha256", secret).update(body).digest("hex");
       const h2 = crypto.createHmac("sha256", secret).update("v0" + body).digest("hex");
       const h3 = crypto.createHmac("sha256", secret).update("v0:" + body).digest("hex");
@@ -695,7 +668,7 @@ function verifyZoomSignatureDetailed(
     }
   }
 
-  // Variant-A/B: v0=<ts>:<base64> or v0:<ts>:<base64>（Secret Token 鍵）
+  // Variant-A/B: v0=<ts>:<base64> or v0:<ts>:<base64>
   const m = header.match(/^v0[:=](\d+):([A-Za-z0-9+/=]+)$/);
   if (!m) return { ok: false, why: "bad_format" };
 
@@ -770,7 +743,6 @@ app.post(
     let skew: number | undefined;
     let sigDebug: any = undefined;
 
-    // 署名（推奨 / A/B/C すべて対応）
     if (req.get("x-zm-signature") && (ZOOM_WEBHOOK_SECRET || ZOOM_VERIFICATION_TOKEN)) {
       const chk = verifyZoomSignatureDetailed(req, ZOOM_WEBHOOK_SECRET, ZOOM_VERIFICATION_TOKEN);
       authOK = chk.ok;
@@ -791,7 +763,7 @@ app.post(
       why = "server_missing_secret";
     }
 
-    // フォールバック：Bearer（任意）
+    // フォールバック：Bearer
     if (!authOK) {
       const expected = ZOOM_BEARER_TOKEN || ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
       if (expected) {
@@ -871,7 +843,7 @@ app.post(
     );
 
     await handleCallDurationEvent({
-      source: "workflow", // 集計系に合わせて workflow を再利用
+      source: "workflow",
       eventId: b.event_id || b.eventId || callId,
       callId,
       durationMs: inferDurationMs(ms),
@@ -980,25 +952,6 @@ const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
 function getHabiticaCredFor(email?: string): HabiticaCred | undefined {
   if (!email) return undefined;
   return HAB_MAP[email.toLowerCase()];
-}
-
-// Habitica 直接XP付与用（管理者の認証）
-const HABITICA_USER = process.env.HABITICA_USER || "";
-const HABITICA_TOKEN = process.env.HABITICA_TOKEN || "";
-async function giveXPToEmail(email: string, xp: number, note: string) {
-  const cred = getHabiticaCredFor(email);
-  if (!cred || !HABITICA_USER || !HABITICA_TOKEN || DRY_RUN || xp <= 0) return;
-  try {
-    await fetch(`https://habitica.com/api/v3/members/${cred.userId}/score/exp/${xp}`, {
-      method: "POST",
-      headers: {
-        "x-api-user": HABITICA_USER,
-        "x-api-key": HABITICA_TOKEN,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ comment: note }),
-    } as any);
-  } catch {}
 }
 
 // 「DX PORTの 〇〇」から氏名を抽出
@@ -1113,19 +1066,45 @@ function normalizeCsvRows(records: any[]): CsvNorm[] {
   return out;
 }
 
-// ============ Chatwork 行単位通知用（短文テンプレ） ==================
+// ============ Chatwork 行単位通知用 ==================
 function cwName(actorName?: string, email?: string) {
   return actorName || (email ? String(email).split("@")[0] : "担当者");
 }
+
+// ★ 承認：ご要望のメッセージに変更
 function makeApprovalMessage(r: CsvNorm) {
   const day = isoDay(r.date);
-  const who = cwName(r.actorName, r.email);
-  return `🆗 承認: ${who}${r.maker ? " " + r.maker : ""} 1件（${day}）`;
+  return [
+    "[info]",
+    "[title]🟦 承認 成立[/title]",
+    `${cwName(r.actorName, r.email)} さん、**おめでとうございます！** 🎉`,
+    "この勢いで**さらに高みを目指しましょう！** 🚀",
+    r.maker ? `🏭 メーカー : ${r.maker}` : undefined,
+    `📅 日付 : ${day}`,
+    r.notes ? `📝 備考 : ${r.notes}` : undefined,
+    "[/info]",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
+
+// 売上（従来の見やすい体裁）
 function makeSalesMessage(r: CsvNorm, amt: number) {
   const day = isoDay(r.date);
   const who = cwName(r.actorName, r.email);
-  return `💰 売上: ${who} ¥${amt.toLocaleString()}（${day}）`;
+  return [
+    "[info]",
+    "[title]💰 売上 登録[/title]",
+    `${who} さん、素晴らしいです！👏`,
+    `売上 : ¥${amt.toLocaleString()}`,
+    r.maker ? `🏭 メーカー : ${r.maker}` : undefined,
+    `📅 日付 : ${day}`,
+    r.notes ? `📝 備考 : ${r.notes}` : undefined,
+    "この調子で更なる記録更新を狙いましょう！📈🔥",
+    "[/info]",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function _handleCsvText(csvText: string, req: Request, res: Response) {
@@ -1383,55 +1362,68 @@ function inferDurationMs(v: any) {
   if (!Number.isFinite(n) || n <= 0) return 0;
   return n >= 100000 ? Math.floor(n) : Math.floor(n * 1000);
 }
-
-// 1) 1コールごとに +1XP、2) 当日累積5分ごとに +2XP（差分のみ）を両立
+function computeCallXp(ms: number) {
+  const base = CALL_XP_PER_CALL;
+  const extra = ms > 0 ? Math.floor(ms / CALL_XP_UNIT_MS) * CALL_XP_PER_5MIN : 0;
+  return base + extra;
+}
 async function awardXpForCallDuration(ev: CallDurEv) {
   const when = fmtJST(ev.occurredAt);
   const who = resolveActor({ source: ev.source, raw: ev.raw });
-  const email = (who.email || "").toLowerCase();
-  const day = isoDay(ev.occurredAt);
-  const addedMs = Math.max(0, Number(ev.durationMs || 0));
-
-  // calls.jsonl へ記録（ダッシュボード集計用）
-  appendJsonl("data/events/calls.jsonl", {
-    at: new Date().toISOString(),
-    day,
-    callId: ev.callId,
-    ms: addedMs,
-    actor: who,
-    email: email || null,
-  });
-
-  // ---- (A) 1コールごとに +1XP
-  await giveXPToEmail(email, 1, `1 call (callId=${ev.callId})`);
-
-  // ---- (B) 当日累積5分ごとに +2XP（差分）
-  const totalSec = calcTotalSecsForDay(email, day);          // calls.jsonl から当日合計秒
-  const totalUnits = Math.floor(totalSec / 300);             // 5分単位
-  const progMap = loadXpProgress();
-  const key = progressKey(email, day);
-  const already = progMap[key]?.units || 0;
-  const deltaUnits = Math.max(0, totalUnits - already);
-  const deltaXp = deltaUnits * 2;
-
-  if (deltaXp > 0) {
-    await giveXPToEmail(email, deltaXp, `Δ ${deltaUnits} × 5min (totalUnits=${totalUnits})`);
-    progMap[key] = { key, email, day, units: totalUnits, at: new Date().toISOString() };
-    saveXpProgress(progMap);
+  const cred = getHabiticaCredFor(who.email);
+  const xp = computeCallXp(ev.durationMs);
+  if (xp <= 0) {
+    log(`[call] duration=0 skip callId=${ev.callId}`);
+    return;
   }
-
-  // 任意通知
-  if (CALL_CHATWORK_NOTIFY) {
-    try {
-      await sendChatworkMessage(
-        `📞 通話: ${who.name} +1XP${deltaXp > 0 ? ` / 累積 +${deltaXp}XP` : ""}（本日${Math.floor(totalSec / 60)}分）`
-      );
-    } catch {}
+  const minutes = (ev.durationMs / 60000).toFixed(1);
+  const title = `📞 架電(${who.name}) +${xp}XP`;
+  const notes = `HubSpot通話
+source=${ev.source}
+callId=${ev.callId}
+duration=${minutes}min
+calc=+${CALL_XP_PER_CALL} (1call) + ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
+  if (DRY_RUN || !cred) {
+    log(`[call] (DRY_RUN or no-cred) ${title} @${when}`);
+    appendJsonl("data/events/calls.jsonl", {
+      at: new Date().toISOString(),
+      day: isoDay(ev.occurredAt),
+      callId: ev.callId,
+      ms: ev.durationMs,
+      xp: computeCallXp(ev.durationMs),
+      actor: who,
+    });
+    return;
   }
-
-  log(`[call] by=${who.name} at=${when} ms=${addedMs} (+1XP${deltaXp > 0 ? `, +${deltaXp}XP(累積)` : ""})`);
+  try {
+    const todo = await createTodo(title, notes, undefined, cred);
+    const id = (todo as any)?.id;
+    if (id) await completeTask(id, cred);
+    log(`[call] xp=${xp} ms=${ev.durationMs} by=${who.name} at=${when}`);
+    appendJsonl("data/events/calls.jsonl", {
+      at: new Date().toISOString(),
+      day: isoDay(ev.occurredAt),
+      callId: ev.callId,
+      ms: ev.durationMs,
+      xp: computeCallXp(ev.durationMs),
+      actor: who,
+    });
+    if (CALL_CHATWORK_NOTIFY) {
+      const msg = [
+        "[info]",
+        "[title]📞 架電XP 付与[/title]",
+        `${who.name} さんに +${xp}XP を付与しました。`,
+        `[hr]• 通話ID: ${ev.callId}\n• 通話時間: ${minutes}分`,
+        "[/info]",
+      ].join("\n");
+      try {
+        await sendChatworkMessage(msg);
+      } catch {}
+    }
+  } catch (e: any) {
+    console.error("[call] habitica failed:", e?.message || e);
+  }
 }
-
 async function handleCallDurationEvent(ev: CallDurEv) {
   const idForDedupe = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
   if (hasSeen(idForDedupe)) {
@@ -1442,11 +1434,16 @@ async function handleCallDurationEvent(ev: CallDurEv) {
   await awardXpForCallDuration(ev);
 }
 
-// ---- Chatwork: “アポ獲得”通知（短文） -----------------------------------
+// ---- Chatwork: “誰がアポ獲得したか”演出（ご要望のトーンに変更） -----------
 function formatChatworkMessage(ev: Normalized) {
-  const day = isoDay(ev.occurredAt);
   const who = resolveActor({ source: ev.source, raw: ev.raw });
-  return `✅ アポ獲得: ${who.name} (${day})`;
+  return [
+    "[info]",
+    "[title]皆さんお疲れ様です！[/title]",
+    `🎉 ${who.name} さんが【新規アポ】を獲得しました！💪🔥`,
+    "ナイスコール！🙌 この調子でもう1件お願いします！💯",
+    "[/info]",
+  ].join("\n");
 }
 async function notifyChatworkAppointment(ev: Normalized) {
   const text = formatChatworkMessage(ev);
@@ -1560,7 +1557,7 @@ app.get("/admin/upload", (_req, res) => {
 <div id="out" class="card mono"></div>
 <script>
 const qs=(s)=>document.querySelector(s);
-const baseEl=qs('#base'), tokenEl=qs('#token'), out=qs('#out'), saved=qs('#saved']);
+const baseEl=qs('#base'), tokenEl=qs('#token'), out=qs('#out'), saved=qs('#saved');
 function load(){
   baseEl.value = localStorage.getItem('adm_base') || baseEl.value;
   tokenEl.value = localStorage.getItem('adm_token') || '';
@@ -1699,22 +1696,6 @@ app.get("/admin/dashboard", (_req, res) => {
       (a, b) => b.count - a.count || b.sales - a.sales || a.maker.localeCompare(b.maker)
     );
   }
-  function aggMakersMonth(yearMonth: string) {
-    const by: Record<string, { maker: string; count: number; sales: number }> = {};
-    const apprs = files.apprs.filter((x)=> (x.day||"").startsWith(yearMonth));
-    const sales = files.sales.filter((x)=> (x.day||"").startsWith(yearMonth));
-    for (const a of apprs) {
-      const m = (a.maker || "").trim(); if (!m) continue;
-      by[m] ??= { maker: m, count: 0, sales: 0 };
-      by[m].count += 1;
-    }
-    for (const s of sales) {
-      const m = (s.maker || "").trim(); if (!m) continue;
-      by[m] ??= { maker: m, count: 0, sales: 0 };
-      by[m].sales += Number(s.amount || 0);
-    }
-    return Object.values(by).sort((a,b)=> b.count - a.count || b.sales - a.sales || a.maker.localeCompare(b.maker));
-  }
 
   const T = agg(today),
     Y = agg(yest);
@@ -1729,13 +1710,6 @@ app.get("/admin/dashboard", (_req, res) => {
       r.sales || 0
     ).toLocaleString()}</td></tr>`;
 
-  const ym = today.slice(0,7);
-  const MM = aggMakersMonth(ym);
-  const RowMM = (r: any) =>
-    `<tr><td>${r.maker}</td><td style="text-align:right">${r.count}</td><td style="text-align:right">¥${(
-      r.sales || 0
-    ).toLocaleString()}</td></tr>`;
-
   const html = `<!doctype html><meta charset="utf-8"><title>ダッシュボード</title>
   <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:2rem}table{border-collapse:collapse;min-width:720px}th,td{border:1px solid #ddd;padding:.5rem .6rem}th{background:#f7f7f7}h2{margin-top:2rem}</style>
   <h1>ダッシュボード</h1>
@@ -1746,9 +1720,7 @@ app.get("/admin/dashboard", (_req, res) => {
   <h2>前日 ${yest}</h2><table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead>
   <tbody>${Y.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
   <h2>メーカー別（承認ベース） 前日 ${yest}</h2><table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead>
-  <tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
-  <h2>メーカー別（承認ベース） 今月 ${ym}</h2><table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead>
-  <tbody>${MM.map(RowMM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>`;
+  <tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>`;
   res.type("html").send(html);
 });
 
@@ -1815,19 +1787,30 @@ function aggregateMakerWinners(day: string): MakerAwardWinner[] {
 function formatMakerAwardMessage(
   day: string,
   winners: MakerAwardWinner[],
-  _applied: boolean
+  applied: boolean
 ) {
-  if (winners.length === 0) return `⚙メーカー賞: ${day} 該当なし`;
-  const by: Record<string, string[]> = {};
+  if (winners.length === 0)
+    return ["[info]", `[title]🏆 メーカー賞（${day}）[/title]`, "該当なし（承認データがありません）", "[/info]"].join(
+      "\n"
+    );
+  const lines: string[] = [];
+  lines.push("[info]");
+  lines.push(`[title]🏆 メーカー賞（${day}）[/title]`);
+  const byMaker: Record<string, MakerAwardWinner[]> = {};
   for (const w of winners) {
-    by[w.maker] ??= [];
-    by[w.maker].push(`${w.name}${w.count ? `:${w.count}` : ""}`);
+    byMaker[w.maker] ??= [];
+    byMaker[w.maker].push(w);
   }
-  const body = Object.keys(by)
-    .sort()
-    .map((mk) => `${mk}(${by[mk].join("・")})`)
-    .join(" / ");
-  return `⚙メーカー賞: ${day} ${body}`;
+  for (const mk of Object.keys(byMaker)) {
+    const xs = byMaker[mk].map((w) => `${w.name}（${w.count}件）`).join("、");
+    lines.push(`• ${mk} : ${xs}`);
+  }
+  lines.push("[hr]");
+  lines.push(
+    applied ? "受賞者に称号(+1)を付与しました（Habitica）。" : "※プレビュー（付与は未実行）"
+  );
+  lines.push("[/info]");
+  return lines.join("\n");
 }
 async function applyMakerAwards(day: string, winners: MakerAwardWinner[]) {
   for (const w of winners) {
