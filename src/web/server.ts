@@ -87,15 +87,12 @@ const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL
 const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
 // 通話XP（累計5分ごと）
-// ★仕様：発信1本につき +1XP（必須） + 「当日累計5分ごとに +2XP」
+// ★ ここ：+1XPは環境変数不要でデフォルト有効（未設定でも 1）
 const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1";
-const CALL_XP_PER_CALL    = Number(process.env.CALL_XP_PER_CALL || 1);   // ← デフォルトを1に
-const CALL_XP_PER_5MIN    = Number(process.env.CALL_XP_PER_5MIN || 2);
-const CALL_XP_UNIT_MS     = Number(process.env.CALL_XP_UNIT_MS || 300000);
+const CALL_XP_PER_CALL   = Number(process.env.CALL_XP_PER_CALL ?? 1); // ← 既定1
+const CALL_XP_PER_5MIN   = Number(process.env.CALL_XP_PER_5MIN || 2);
+const CALL_XP_UNIT_MS    = Number(process.env.CALL_XP_UNIT_MS || 300000);
 const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
-
-// バッジ（簡易ON/OFF）
-const BADGE_ENABLE = String(process.env.BADGE_ENABLE || "1") === "1";
 
 // CSV UI 設定（簡略）
 const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s=>s.trim()).filter(Boolean);
@@ -122,7 +119,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-17-totalize5m+percall", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-17-totalize5m", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length
   });
@@ -300,29 +297,18 @@ async function handleNormalizedEvent(ev: Normalized){
   else { log(`non-appointment outcome=${ev.outcome||"(empty)"}`); }
 }
 
-// =============== Habiticaユーティリティ ===============
-async function giveXp(cred: HabiticaCred|undefined, title: string, notes?: string){
-  if (!cred || DRY_RUN) { log("[habitica:dry] "+title); return; }
-  try {
-    const todo = await createTodo(title, notes||"", undefined, cred);
-    const id = (todo as any)?.id; if (id) await completeTask(id, cred);
-  } catch(e:any){ console.error("[habitica] giveXp failed:", e?.message||e); }
-}
-
 // =============== Habitica付与（アポ） & Chatwork通知（読みやすく） ===============
 async function awardXpForAppointment(ev: Normalized){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   const cred = getHabitica(who.email);
   const when = fmtJST(ev.occurredAt);
-
-  // XP（アポ）
-  await giveXp(cred, `🟩 新規アポ（${who.name}）`, `source=${ev.source}\ncallId=${ev.callId}\nwhen=${when}`);
-
-  // 簡易バッジ（ONのときだけ）
-  if (BADGE_ENABLE) {
-    await giveXp(cred, `🏅 バッジ：新規アポ獲得（${isoDay(ev.occurredAt)}）`, `actor=${who.email||who.name}`);
+  if (!cred || DRY_RUN) {
+    log(`[XP] appointment scheduled (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name} @${when}`);
+    appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
+    return;
   }
-
+  const todo = await createTodo(`🟩 新規アポ（${who.name}）`, `source=${ev.source}\ncallId=${ev.callId}\nwhen=${when}`, undefined, cred);
+  const id = (todo as any)?.id; if (id) await completeTask(id, cred);
   appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
 }
 
@@ -356,7 +342,7 @@ async function notifyChatworkAppointment(ev: Normalized){
   try { await sendChatworkMessage(cwApptMessage(ev)); } catch {}
 }
 
-// =============== 通話（累計5分ごとXP + 1本ごと+1XP） ===============
+// =============== 通話（累計5分ごとXP） ===============
 type CallDurEv = { source:"v3"|"workflow"; eventId?:any; callId?:any; durationMs:number; occurredAt?:any; raw?:any; };
 function inferDurationMs(v:any){ const n=Number(v); if(!Number.isFinite(n)||n<=0) return 0; return n>=100000?Math.floor(n):Math.floor(n*1000); }
 
@@ -366,6 +352,7 @@ type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:
 function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
 function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
 
+// 旧一括計算用のヘルパは残しつつ…
 function computePerCallXp(ms:number){ const base=CALL_XP_PER_CALL; const extra = ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; return base+extra; }
 function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
@@ -374,14 +361,25 @@ async function awardXpForCallDuration(ev: CallDurEv){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:ev.durationMs, actor:who});
 
-  const cred = getHabitica(who.email);
-
-  // 1) まず「1コールにつき +1XP」を必ず付与（仕様の必須項目）
+  // ★ 追加：毎コール +1XP（環境変数いらず／既定1）
   if (CALL_XP_PER_CALL > 0) {
-    await giveXp(cred, `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`, `callId=${ev.callId}\nwhen=${when}\nper_call=1`);
+    const cred = getHabitica(who.email);
+    if (!cred || DRY_RUN) {
+      log(`[call] (DRY_RUN or no-cred) per-call base +${CALL_XP_PER_CALL}XP by=${who.name} @${when}`);
+    } else {
+      const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
+      const notes = `per-call base XP`;
+      try {
+        const todo = await createTodo(title, notes, undefined, cred);
+        const id = (todo as any)?.id;
+        if (id) await completeTask(id, cred);
+      } catch(e:any){
+        console.error("[call] per-call habitica failed:", e?.message||e);
+      }
+    }
   }
 
-  // 2) 累計方式（当日トータル5分ごと +2XP）
+  // 累計方式で付与（当日 5分ごと +2XP）
   if (CALL_TOTALIZE_5MIN) {
     const day = isoDay(ev.occurredAt);
     const email = (who.email||"").toLowerCase();
@@ -397,18 +395,26 @@ async function awardXpForCallDuration(ev: CallDurEv){
     const xp = add * CALL_XP_PER_5MIN;
     st[day][email].steps_awarded = nowSteps; saveCallState(st);
 
-    if (xp>0) {
-      await giveXp(cred, `📞 累計架電（${who.name}） +${xp}XP`, `day=${day}\nemail=${email}\n+steps=${add}\nunit_ms=${CALL_XP_UNIT_MS}\ntotal_ms=${st[day][email].total_ms}\nsteps_awarded=${st[day][email].steps_awarded}`);
-      if (CALL_CHATWORK_NOTIFY) { try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{} }
+    const cred = getHabitica(who.email);
+    if (!cred || DRY_RUN) {
+      log(`[call] (DRY_RUN or no-cred) totalize +${xp}XP (${add} steps) by=${who.name} @${when}`);
+      return;
     }
+    const title = `📞 累計架電（${who.name}） +${xp}XP`;
+    const notes = `day=${day}\nemail=${email}\ntotal_ms=${st[day][email].total_ms}\nsteps_awarded=${st[day][email].steps_awarded}`;
+    try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call-totalize] habitica failed:", e?.message||e); }
+    if (CALL_CHATWORK_NOTIFY) { try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{} }
     return;
   }
 
-  // 3) 旧：累計を使わない場合は、1コール内の長さで +floor(ms/5分)*2 を追加付与
-  const extraXp = Math.max(0, Math.floor(ev.durationMs/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN);
-  if (extraXp>0) {
-    await giveXp(cred, `📞 架電（${who.name}） +${extraXp}XP`, `per-call extra by duration\nms=${ev.durationMs}`);
-  }
+  // （参考）旧：1コール内での合算付与モード
+  const xp = computePerCallXp(ev.durationMs);
+  if (xp<=0) return;
+  const cred = getHabitica(who.email);
+  if (!cred || DRY_RUN) { log(`[call] (DRY_RUN or no-cred) per-call xp=${xp} by=${who.name} @${when}`); return; }
+  const title = `📞 架電（${who.name}） +${xp}XP`;
+  const notes = `per-call: +${CALL_XP_PER_CALL} + ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
+  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call] habitica failed:", e?.message||e); }
 }
 
 async function handleCallDurationEvent(ev: CallDurEv){
@@ -439,28 +445,9 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     const maker = r.maker? String(r.maker).trim(): undefined;
     const id = String(r.id || `${type}:${email||"-"}:${maker||"-"}`).trim();
     const date = r.date? String(r.date): undefined;
-
-    if (type==="approval") {
-      nA++;
-      appendJsonl("data/events/approvals.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker});
-      const cred=getHabitica(email);
-      if(!DRY_RUN&&cred) {
-        await addApproval(cred,1, "CSV");
-        if (BADGE_ENABLE) { await giveXp(cred, `🏅 バッジ：承認獲得（${isoDay(date)}）`, `from=CSV`); }
-      }
-    }
-    if (type==="sales") {
-      nS++; sum+=(amount||0);
-      appendJsonl("data/events/sales.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker,amount});
-      const cred=getHabitica(email);
-      if(!DRY_RUN&&cred&&amount) await addSales(cred, amount, "CSV");
-    }
-    if (type==="maker") {
-      nM++;
-      appendJsonl("data/events/maker.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker});
-      const cred=getHabitica(email);
-      if(!DRY_RUN&&cred) await addMakerAward(cred,1);
-    }
+    if (type==="approval") { nA++; appendJsonl("data/events/approvals.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addApproval(cred,1, "CSV"); }
+    if (type==="sales")    { nS++; sum+=(amount||0); appendJsonl("data/events/sales.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker,amount}); const cred=getHabitica(email); if(!DRY_RUN&&cred&&amount) await addSales(cred, amount, "CSV"); }
+    if (type==="maker")    { nM++; appendJsonl("data/events/maker.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addMakerAward(cred,1); }
   }
   try{ await sendChatworkMessage(`[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`);}catch{}
   res.json({ ok:true, mode:"upsert", received:recs.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales:sum, duplicates:0, errors:0 });
