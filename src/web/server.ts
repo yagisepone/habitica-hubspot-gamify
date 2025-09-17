@@ -1,7 +1,7 @@
 // server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
-import Busboy from "busboy";
+import Busboy from "busboy"; // （今は未使用でもOK。将来のファイル受信で使えます）
 import { parse as csvParse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
@@ -87,9 +87,10 @@ const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL
 const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
 // 通話XP（累計5分ごと）
-// ★ ここ：+1XPは環境変数不要でデフォルト有効（未設定でも 1）
+// ★ +1XPは環境変数いらずで常時有効（デフォルト1）
 const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1";
-const CALL_XP_PER_CALL   = Number(process.env.CALL_XP_PER_CALL ?? 1); // ← 既定1
+const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
+  ? 1 : Number(process.env.CALL_XP_PER_CALL);
 const CALL_XP_PER_5MIN   = Number(process.env.CALL_XP_PER_5MIN || 2);
 const CALL_XP_UNIT_MS    = Number(process.env.CALL_XP_UNIT_MS || 300000);
 const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
@@ -352,8 +353,8 @@ type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:
 function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
 function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
 
-// 旧一括計算用のヘルパは残しつつ…
-function computePerCallXp(ms:number){ const base=CALL_XP_PER_CALL; const extra = ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; return base+extra; }
+// 旧モード用の“5分ごと加点（ベース抜き）”
+function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
 function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
 async function awardXpForCallDuration(ev: CallDurEv){
@@ -361,14 +362,14 @@ async function awardXpForCallDuration(ev: CallDurEv){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:ev.durationMs, actor:who});
 
-  // ★ 追加：毎コール +1XP（環境変数いらず／既定1）
+  // 仕様準拠：毎コール +1XP（環境変数いらず／既定1）。累計ON/OFFに関わらず付与。
   if (CALL_XP_PER_CALL > 0) {
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
-      log(`[call] (DRY_RUN or no-cred) per-call base +${CALL_XP_PER_CALL}XP by=${who.name} @${when}`);
+      log(`[call] per-call base +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
     } else {
       const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
-      const notes = `per-call base XP`;
+      const notes = `rule=per-call+${CALL_XP_PER_CALL}`;
       try {
         const todo = await createTodo(title, notes, undefined, cred);
         const id = (todo as any)?.id;
@@ -397,7 +398,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
 
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
-      log(`[call] (DRY_RUN or no-cred) totalize +${xp}XP (${add} steps) by=${who.name} @${when}`);
+      log(`[call] totalize +${xp}XP (${add} steps) (DRY_RUN or no-cred) by=${who.name} @${when}`);
       return;
     }
     const title = `📞 累計架電（${who.name}） +${xp}XP`;
@@ -407,14 +408,14 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
 
-  // （参考）旧：1コール内での合算付与モード
-  const xp = computePerCallXp(ev.durationMs);
-  if (xp<=0) return;
+  // 旧：1コール内で“5分ごと”の加点のみ（ベース+1は上で既に付与済）
+  const xpExtra = computePerCallExtra(ev.durationMs);
+  if (xpExtra<=0) return;
   const cred = getHabitica(who.email);
-  if (!cred || DRY_RUN) { log(`[call] (DRY_RUN or no-cred) per-call xp=${xp} by=${who.name} @${when}`); return; }
-  const title = `📞 架電（${who.name}） +${xp}XP`;
-  const notes = `per-call: +${CALL_XP_PER_CALL} + ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
-  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call] habitica failed:", e?.message||e); }
+  if (!cred || DRY_RUN) { log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`); return; }
+  const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
+  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
+  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
 }
 
 async function handleCallDurationEvent(ev: CallDurEv){
@@ -477,12 +478,10 @@ app.get("/admin/upload", (_req,res)=>{
     }
     async function postCsvFile(file){
       const base=qs('#base').value.trim(); const tok=qs('#tok').value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
-      const fd=new FormData(); fd.append('file', file, file.name);
-      const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{method:'POST',headers:{'Authorization':'Bearer '+tok},body:fd});
-      const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
+      const fr=new FileReader(); fr.onload=()=>postCsvRaw(String(fr.result||'')); fr.readAsText(file);
     }
     qs('#send').onclick=()=>postCsvRaw(qs('#csv').value);
-    qs('#upload').onclick=()=>{ const f=qs('#file').files[0]; if(!f) return pr('CSVファイルを選択'); const fr=new FileReader(); fr.onload=()=>postCsvRaw(String(fr.result||'')); fr.readAsText(f); };
+    qs('#upload').onclick=()=>{ const f=qs('#file').files[0]; if(!f) return pr('CSVファイルを選択'); postCsvFile(f); };
   </script>`;
   res.type("html").send(html);
 });
