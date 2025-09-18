@@ -1,7 +1,7 @@
 // server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
-import Busboy from "busboy"; // （今は未使用でもOK。将来のファイル受信で使えます）
+import Busboy from "busboy"; // 将来のファイル受信用（未使用でもOK）
 import { parse as csvParse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
@@ -35,7 +35,9 @@ function appendJsonl(fp: string, obj: any) {
   ensureDir(path.dirname(fp)); fs.appendFileSync(fp, JSON.stringify(obj) + "\n");
 }
 function readJsonlAll(fp: string): any[] {
-  try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); } catch { return []; }
+  try {
+    return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s));
+  } catch { return []; }
 }
 function writeJson(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); }
 function readJson<T=any>(fp: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(fp,"utf8")); } catch { return fallback; } }
@@ -64,6 +66,7 @@ function requireBearer(req: Request, res: Response): boolean {
   if (token !== AUTH_TOKEN) { res.status(401).json({ok:false,error:"auth"}); return false; }
   return true;
 }
+const toNum = (v:any)=>{ const n = Number(String(v??"").trim()); return Number.isFinite(n)? n: 0; };
 
 // =============== ENV ===============
 const PORT = Number(process.env.PORT || 10000);
@@ -86,8 +89,7 @@ const HABITICA_USERS_JSON = readEnvJsonOrFile("HABITICA_USERS_JSON","HABITICA_US
 const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL_MAP_FILE");
 const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
-// 通話XP（累計5分ごと）
-// ★ +1XPは環境変数いらずで常時有効（デフォルト1）
+// 通話XP（累計5分ごと）— +1XP は環境変数不要（既定1で常時ON）
 const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1";
 const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
   ? 1 : Number(process.env.CALL_XP_PER_CALL);
@@ -120,7 +122,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-17-totalize5m", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-18-zoom-phone-fixes", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length
   });
@@ -222,6 +224,19 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   return { ok: eqB64(macA)||eqB64(macB), variant:"v0_ts_b64" };
 }
 
+// Zoom Phone payload 正規化（call_logs の最後をマージ）
+function flattenZoomPhoneObject(obj:any){
+  let o = obj || {};
+  if (o.call_logs && Array.isArray(o.call_logs) && o.call_logs.length>0) {
+    const last = o.call_logs[o.call_logs.length-1] || {};
+    o = { ...o, ...last };
+  }
+  if (o.call_log && typeof o.call_log === "object") {
+    o = { ...o, ...o.call_log };
+  }
+  return o;
+}
+
 app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Response)=>{
   const rawText = req.rawBody? req.rawBody.toString("utf8"): undefined;
   let b:any = (req as any).body || {};
@@ -244,25 +259,53 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   }
   if(!ok) return res.status(401).json({ok:false,error:"auth"});
 
-  const raw = b?.payload?.object || b?.object || b || {};
+  const core = b?.payload?.object || b?.object || b || {};
+  const raw = flattenZoomPhoneObject(core); // ← phone.caller_call_history_completed にも対応
+
+  // だれ
   const email =
     raw.user_email || raw.owner_email || raw.caller_email || raw.callee_email || b.email;
   const zid = raw.zoom_user_id || raw.user_id || raw.owner_id;
   const whoRaw = { userEmail: email || (zid && ZOOM_UID2MAIL[String(zid)]) || undefined };
 
-  // duration 推定
-  const cand = [raw.duration_ms, raw.call_duration_ms, raw.durationMs, raw.duration, raw.call_duration, b.duration];
-  let ms = cand.map(Number).find(x=>Number.isFinite(x)) || 0;
-  if(ms>0 && ms<100000) ms*=1000;
-  if(ms<=0 && raw.start_time && raw.end_time){
-    const st = new Date(raw.start_time).getTime();
-    const et = new Date(raw.end_time).getTime();
-    if(Number.isFinite(st)&&Number.isFinite(et)) ms=Math.max(0, et-st);
+  // duration 推定（ms）
+  // 1) 既存候補
+  let ms = [
+    raw.duration_ms, raw.call_duration_ms, raw.durationMs, raw.duration, raw.call_duration
+  ].map(toNum).find(n=>n>0) || 0;
+  // 2) Zoom Phone の talk/hold/wait（秒）
+  if (ms<=0) {
+    const talk = toNum(raw.talk_time || raw.talkTime || raw.talk_duration);
+    const hold = toNum(raw.hold_time);
+    const wait = toNum(raw.wait_time || raw.ring_time);
+    const totalSec = talk + hold + wait;
+    if (totalSec>0) ms = totalSec * 1000;
   }
-  const callId = raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
+  // 3) start_time / end_time（ISO）
+  if (ms<=0 && raw.start_time && raw.end_time) {
+    const st = new Date(String(raw.start_time)).getTime();
+    const et = new Date(String(raw.end_time)).getTime();
+    if (Number.isFinite(st) && Number.isFinite(et) && et>st) ms = et-st;
+  }
+  // 4) modified_time しか無いサマリー変更などは 0ms のまま（+1XP は別で必ず付与）
 
-  log(`[zoom] accepted callId=${callId} ms=${ms}`);
-  await handleCallDurationEvent({ source:"workflow", eventId:b.event_id||callId, callId, durationMs:inferDurationMs(ms), occurredAt:b.timestamp||raw.end_time||Date.now(), raw: whoRaw });
+  // 代表ID
+  const callId =
+    raw.call_id || raw.callID || raw.session_id || raw.sessionID || raw.call_log_id ||
+    b.id || `zoom:${Date.now()}`;
+
+  const occurredAt =
+    raw.end_time || raw.modified_time || raw.updated_time || b.timestamp || Date.now();
+
+  log(`[zoom] accepted event=${b?.event||b?.event_type||"-"} callId=${callId} ms=${ms}`);
+  await handleCallDurationEvent({
+    source: "workflow",
+    eventId: b.event_id || callId,
+    callId,
+    durationMs: inferDurationMs(ms),
+    occurredAt,
+    raw: whoRaw
+  });
   res.json({ok:true, accepted:true, ms});
 });
 
@@ -353,7 +396,7 @@ type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:
 function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
 function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
 
-// 旧モード用の“5分ごと加点（ベース抜き）”
+// 旧モード用（1コール内の“5分ごと”加点のみ）
 function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
 function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
@@ -362,7 +405,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:ev.durationMs, actor:who});
 
-  // 仕様準拠：毎コール +1XP（環境変数いらず／既定1）。累計ON/OFFに関わらず付与。
+  // 仕様：毎コール +1XP（時間0でも必ず付与）
   if (CALL_XP_PER_CALL > 0) {
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
@@ -408,7 +451,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
 
-  // 旧：1コール内で“5分ごと”の加点のみ（ベース+1は上で既に付与済）
+  // 旧：1コール内の“5分ごと”加点だけ（ベース+1は上で付与済み）
   const xpExtra = computePerCallExtra(ev.durationMs);
   if (xpExtra<=0) return;
   const cred = getHabitica(who.email);
@@ -421,7 +464,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
 async function handleCallDurationEvent(ev: CallDurEv){
   const id = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
   if (hasSeen(id)) return; markSeen(id);
-  if (ev.durationMs<=0) return;
+  // 必ず実行（duration=0 でも +1XP を付与するため）
   await awardXpForCallDuration(ev);
 }
 
@@ -490,7 +533,7 @@ app.get("/admin/upload", (_req,res)=>{
 app.get("/admin/dashboard", (_req,res)=>{
   const today = isoDay(), yest = isoDay(new Date(Date.now()-86400000));
   const rd = (fp:string)=> readJsonlAll(fp);
-  const calls = rd("data/events/calls.jsonl");        // Zoom/HubSpotからの通話（累計対象）
+  const calls = rd("data/events/calls.jsonl");
   const appts = rd("data/events/appointments.jsonl");
   const apprs = rd("data/events/approvals.jsonl");
   const sales = rd("data/events/sales.jsonl");
