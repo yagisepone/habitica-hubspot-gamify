@@ -69,7 +69,7 @@ const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
 // --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
 // - 会話時間は talk_time（秒）最優先
 // - 予備として start_time/end_time 差分を許容
-// - 1コールは最大3時間に丸める
+// - 1コールは最大3時間に丸める（無効値は0）
 // - endedAt は epoch(ms)
 function pickZoomInfo(obj: any) {
   const o = obj || {};
@@ -97,23 +97,28 @@ function pickZoomInfo(obj: any) {
   // 方向
   const dir = (String(chosen?.direction || o.direction || "").toLowerCase() || "unknown");
 
-  // 会話時間：talk_time（秒）最優先
+  // ====== 会話時間：talk_time（秒）最優先 ======
   const talkSecCand =
     chosen?.talk_time ?? o.talk_time ?? chosen?.talkTime ?? o.talkTime;
 
   let ms = 0;
   if (typeof talkSecCand === "number" && isFinite(talkSecCand)) {
+    // 秒→ms
     ms = Math.max(0, Math.floor(talkSecCand * 1000));
   } else {
-    // 予備：start_time / end_time 差分
+    // 予備：start_time / end_time 差分（ISO文字列）
     const stIso = chosen?.start_time || o.start_time;
     const etIso = chosen?.end_time   || o.end_time   || chosen?.ended_at || o.ended_at;
     const st = stIso ? Date.parse(stIso) : NaN;
     const et = etIso ? Date.parse(etIso) : NaN;
     if (Number.isFinite(st) && Number.isFinite(et)) {
       ms = Math.max(0, et - st);
+    } else {
+      ms = 0; // 無効は0に落とす（ここが重要）
     }
   }
+  // 最終クランプ
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
   if (ms > MAX_CALL_MS) ms = MAX_CALL_MS;
 
   // callId
@@ -195,7 +200,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-18-final4", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-18-final5", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES
@@ -342,7 +347,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   // 発信のみXP（0秒でも +1XP は必ず付与）
   log(`[zoom] accepted event=${b?.event || "unknown"} callId=${info.callId} ms=${info.ms||0} dir=${info.dir||"unknown"}`);
   await handleCallDurationEvent({
-    source: "zoom", // ★ Zoomのみ付与
+    source: "zoom",
     eventId: b.event_id || info.callId,
     callId: info.callId,
     durationMs: inferDurationMs(info.ms),
@@ -404,7 +409,7 @@ async function awardXpForAppointment(ev: Normalized){
   }
 
   try {
-    // 1) コネクタ側の専用APIがあれば優先
+    // 1) コネクタ側に専用APIがあれば優先
     if (typeof habiticaAny.addAppointment === "function") {
       await habiticaAny.addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
     } else {
@@ -459,7 +464,7 @@ function inferDurationMs(v:any){
   const n=Number(v);
   if(!Number.isFinite(n)||n<=0) return 0;
   const ms = n>=100000? Math.floor(n): Math.floor(n*1000);
-  return Math.min(ms, MAX_CALL_MS);
+  return Math.min(Math.max(0, ms), MAX_CALL_MS);
 }
 
 // 累計ステート（日×メール）
@@ -479,8 +484,10 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
 
-  // ★ ここで最終クランプ（どこから来ても3時間超は切り捨て）
-  const durMs = Math.min(MAX_CALL_MS, Math.max(0, Math.floor(ev.durationMs || 0)));
+  // 最終クランプ（どこから来ても3時間超は切り捨て、無効は0）
+  let durMs = Math.floor(Number(ev.durationMs||0));
+  if (!Number.isFinite(durMs) || durMs < 0) durMs = 0;
+  if (durMs > MAX_CALL_MS) durMs = MAX_CALL_MS;
 
   const when = fmtJST(ev.occurredAt);
   const who = resolveActor({source:ev.source as any, raw:ev.raw});
