@@ -146,10 +146,9 @@ const HABITICA_USERS_JSON = readEnvJsonOrFile("HABITICA_USERS_JSON","HABITICA_US
 const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL_MAP_FILE");
 const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
-// XPルール
-// 既定：通話ごとリセット方式（仕様書通り）
-// 日累計方式は CALL_TOTALIZE_5MIN=1 を入れた時だけ“追加で”有効化。
-const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "0") === "1";
+// 架電XP
+// ★ +1XPは環境変数いらずで常時有効（デフォルト1）
+const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1"; // 0にすると「コール内5分ごと」モード
 const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
   ? 1 : Number(process.env.CALL_XP_PER_CALL);
 const CALL_XP_PER_5MIN   = Number(process.env.CALL_XP_PER_5MIN || 2);
@@ -158,6 +157,12 @@ const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") ===
 
 // CSV UI 設定
 const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s=>s.trim()).filter(Boolean);
+
+// 日報ボーナス: ENV
+const DAILY_BONUS_XP = Number(process.env.DAILY_BONUS_XP || 10);
+const DAILY_TASK_MATCH = String(process.env.DAILY_TASK_MATCH || "日報")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const HABITICA_WEBHOOK_SECRET = process.env.HABITICA_WEBHOOK_SECRET || AUTH_TOKEN || "";
 
 // =============== 外部コネクタ ===============
 import { sendChatworkMessage } from "../connectors/chatwork.js";
@@ -181,7 +186,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-18-per-call-5min", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-18-final", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length
   });
@@ -198,6 +203,7 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const sigHeader = req.header("x-hubspot-signature-v3") || "";
   const raw: Buffer = (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body||""),"utf8");
 
+  // 署名候補（RenderのX-ForwardedやPUBLIC_BASE_URL差を吸収）
   const proto = String(req.headers["x-forwarded-proto"]||"").split(",")[0].trim() || (req as any).protocol || "https";
   const hostHdr = String(req.headers["x-forwarded-host"]||req.headers["host"]||"").split(",")[0].trim();
   const candidates = new Set<string>();
@@ -251,7 +257,7 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   if(!header) return { ok:false, why:"no_header" };
   const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
 
-  // HEX variant
+  // HEXのみ variant (Zoom Phone 稀に)
   const mHex = header.match(/^v0=([a-f0-9]{64})$/i);
   if (mHex) {
     const sigHex = mHex[1].toLowerCase();
@@ -304,12 +310,12 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   }
   if(!ok) return res.status(401).json({ok:false,error:"auth"});
 
-  // ==== Zoomの実データ処理 ====
+  // ==== ここから：Zoomの実データ処理 ====
   const obj = b?.payload?.object || b?.object || {};
   const info = pickZoomInfo(obj);
   const resolvedEmail = info.email || (info.zid && ZOOM_UID2MAIL[String(info.zid)]) || undefined;
 
-  // 着信はXP対象外（ログのみ）
+  // 着信はスキップ（記録のみ）
   if (String(info.dir) === "inbound") {
     log(`[call] inbound (no XP) by=担当者 ${fmtJST(b.timestamp || info.endedAt || Date.now())}`);
     appendJsonl("data/events/calls.jsonl", {
@@ -323,7 +329,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     return res.json({ ok: true, accepted: true, inbound: true });
   }
 
-  // 発信のみXP
+  // 発信のみXP（0秒でも +1XP は必ず付与）
   log(`[zoom] accepted event=${b?.event || "unknown"} callId=${info.callId} ms=${info.ms||0} dir=${info.dir||"unknown"}`);
   await handleCallDurationEvent({
     source: "workflow",
@@ -338,10 +344,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
 
 // =============== 正規化処理 & だれ特定 ===============
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
-function extractDxPortNameFromText(s?: string): string|undefined {
-  if(!s) return; const m=String(s).match(/DX\s*PORT(?:の|:)?\s*([^\n\r、，。・;；【】\[\]\(\)]+?)(?:\s*(?:さん|様|殿|君))?(?:$|[。．、，\s])/i);
-  return m?.[1] ? normSpace(m[1]).replace(/\s+/g," ").trim(): undefined;
-}
+function extractDxPortNameFromText(_s?: string): string|undefined { return undefined; } // 仕様外なら未使用
 function resolveActor(ev:{source:"v3"|"workflow"; raw?:any}):{name:string; email?:string}{
   const raw = ev.raw||{};
   let email: string|undefined =
@@ -383,7 +386,6 @@ async function awardXpForAppointment(ev: Normalized){
   appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
 }
 
-// Chatwork
 function cwApptMessage(ev: Normalized){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   const when = fmtJST(ev.occurredAt);
@@ -413,17 +415,17 @@ async function notifyChatworkAppointment(ev: Normalized){
   try { await sendChatworkMessage(cwApptMessage(ev)); } catch {}
 }
 
-// =============== 通話（通話ごとリセット + 任意で日累計） ===============
+// =============== 通話（+1XP ＆ 5分ごとXP） ===============
 type CallDurEv = { source:"v3"|"workflow"; eventId?:any; callId?:any; durationMs:number; occurredAt?:any; raw?:any; };
 function inferDurationMs(v:any){ const n=Number(v); if(!Number.isFinite(n)||n<=0) return 0; return n>=100000?Math.floor(n):Math.floor(n*1000); }
 
-// 累計ステート（日×メール） ※日累計モードを使う場合だけ参照
+// 累計ステート（日×メール）
 const CALL_STATE_FP = "data/state/call_totals.json";
 type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:number }>>;
 function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
 function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
 
-// 5分ごとXP（通話ごと）
+// “5分ごと加点（ベース抜き）”
 function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
 function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
@@ -432,7 +434,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:ev.durationMs, actor:who});
 
-  // ベース：毎コール +1XP（0秒でも付与）
+  // 仕様：毎コール +1XP（0秒でも付与）
   if (CALL_XP_PER_CALL > 0) {
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
@@ -450,26 +452,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     }
   }
 
-  // 通話ごとの 5分ブロック +2XP
-  const xpExtra = computePerCallExtra(ev.durationMs);
-  if (xpExtra > 0) {
-    const cred = getHabitica(who.email);
-    if (!cred || DRY_RUN) {
-      log(`[call] per-call extra (5min) xp=${xpExtra} by=${who.name} @${when}`);
-    } else {
-      const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
-      const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
-      try {
-        const todo = await createTodo(title, notes, undefined, cred);
-        const id = (todo as any)?.id;
-        if (id) await completeTask(id, cred);
-      } catch(e:any){
-        console.error("[call] habitica extra failed:", e?.message||e);
-      }
-    }
-  }
-
-  // （任意）日累計も同時に走らせたい場合のみ ON
+  // A) 累計方式（当日 5分ごと +2XP）
   if (CALL_TOTALIZE_5MIN) {
     const day = isoDay(ev.occurredAt);
     const email = (who.email||"").toLowerCase();
@@ -494,17 +477,27 @@ async function awardXpForCallDuration(ev: CallDurEv){
     const notes = `day=${day}\nemail=${email}\ntotal_ms=${st[day][email].total_ms}\nsteps_awarded=${st[day][email].steps_awarded}`;
     try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call-totalize] habitica failed:", e?.message||e); }
     if (CALL_CHATWORK_NOTIFY) { try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{} }
+    return;
   }
+
+  // B) コール内で5分ごと +2XP（コール終了でリセット）
+  const xpExtra = computePerCallExtra(ev.durationMs);
+  if (xpExtra<=0) return;
+  const cred = getHabitica(who.email);
+  if (!cred || DRY_RUN) { log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`); return; }
+  const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
+  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
+  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
 }
 
 async function handleCallDurationEvent(ev: CallDurEv){
   const id = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
   if (hasSeen(id)) return; markSeen(id);
-  // 0秒でも +1XP を付与するため、durationMs が 0 でも実行する
+  // ★ 0秒でも +1XP を付与するため、durationMs が 0 でも実行する
   await awardXpForCallDuration(ev);
 }
 
-// =============== CSV（簡略・既存互換） ===============
+// =============== CSV（承認・売上・メーカー賞 取り込み） ===============
 function requireBearerCsv(req: Request, res: Response): boolean {
   const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
   if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length===0) { res.status(500).json({ok:false,error:"missing tokens"}); return false; }
@@ -609,7 +602,7 @@ app.get("/admin/dashboard", (_req,res)=>{
   res.type("html").send(html);
 });
 
-// =============== 診断API ===============
+// =============== 診断API（誰が誰に紐づいてるか） ===============
 app.get("/admin/mapping", (req,res)=>{
   if(!requireBearer(req,res)) return;
   res.json({ ok:true, habiticaEmails:Object.keys(HAB_MAP).sort(), nameEmailEntries:Object.keys(NAME2MAIL).length, zoomUserIdMapCount:Object.keys(ZOOM_UID2MAIL).length });
@@ -617,6 +610,117 @@ app.get("/admin/mapping", (req,res)=>{
 app.get("/admin/state/calls", (req,res)=>{
   if(!requireBearer(req,res)) return;
   res.json({ ok:true, state: loadCallState() });
+});
+
+// =============== 日報 Webhook（Habitica完了→+10XP） ===============
+function isDailyTaskTitle(title?: string) {
+  const t = String(title || "").trim();
+  if (!t) return false;
+  return DAILY_TASK_MATCH.some(k => t.includes(k));
+}
+function hasDailyBonusGiven(email: string, day: string) {
+  const key = `daily:${day}:${email}`;
+  return hasSeen(key);
+}
+function markDailyBonusGiven(email: string, day: string) {
+  const key = `daily:${day}:${email}`;
+  markSeen(key);
+}
+
+app.post("/webhooks/habitica", async (req: Request, res: Response) => {
+  const token = String((req.query.t || req.query.token || "")).trim();
+  if (!token || token !== HABITICA_WEBHOOK_SECRET) {
+    return res.status(401).json({ ok: false, error: "auth" });
+  }
+  const email = String(req.query.email || "").toLowerCase();
+  if (!email) return res.status(400).json({ ok: false, error: "missing email" });
+
+  const body: any = (req as any).body || {};
+  const task = body.task || body.data?.task || body.data || {};
+  const text = String(task.text || task.title || "");
+  const completed = task.completed === true || String(body.direction || "").toLowerCase() === "up";
+
+  if (!isDailyTaskTitle(text) || !completed) {
+    return res.json({ ok: true, skipped: true });
+  }
+
+  const day = isoDay();
+  if (hasDailyBonusGiven(email, day)) {
+    return res.json({ ok: true, duplicate: true });
+  }
+
+  const cred = getHabitica(email);
+  if (!cred || DRY_RUN) {
+    log(`[daily] +${DAILY_BONUS_XP}XP (DRY_RUN or no-cred) email=${email} task="${text}"`);
+    appendJsonl("data/events/daily_bonus.jsonl", { at: new Date().toISOString(), day, email, task: text, dry_run: true });
+    markDailyBonusGiven(email, day);
+    return res.json({ ok: true, dryRun: true });
+  }
+
+  try {
+    const title = `🗓日報ボーナス（${email.split("@")[0]}） +${DAILY_BONUS_XP}XP`;
+    const notes = `rule=daily+${DAILY_BONUS_XP}\nsource=habitica_webhook\ntask="${text}"`;
+    const todo = await createTodo(title, notes, undefined, cred);
+    const id = (todo as any)?.id;
+    if (id) await completeTask(id, cred);
+
+    appendJsonl("data/events/daily_bonus.jsonl", { at: new Date().toISOString(), day, email, task: text });
+    log(`[daily] +${DAILY_BONUS_XP}XP by=${email} task="${text}"`);
+    markDailyBonusGiven(email, day);
+    res.json({ ok: true, awarded: DAILY_BONUS_XP });
+  } catch (e: any) {
+    console.error("[daily] habitica award failed:", e?.message || e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// === Habitica Webhook を全員分に自動登録（管理API） ===
+async function ensureHabiticaWebhook(email: string, cred: { userId: string; apiToken: string }) {
+  if (!PUBLIC_BASE_URL) return { ok: false, why: "no PUBLIC_BASE_URL" };
+  const base = "https://habitica.com/api/v3";
+  const headers: any = {
+    "x-api-user": cred.userId,
+    "x-api-key": cred.apiToken,
+    "content-type": "application/json",
+  };
+  const url = `${PUBLIC_BASE_URL.replace(/\/+$/,"")}/webhooks/habitica?t=${encodeURIComponent(HABITICA_WEBHOOK_SECRET)}&email=${encodeURIComponent(email)}`;
+
+  // 既存一覧
+  let list: any[] = [];
+  try {
+    const r = await fetch(`${base}/user/webhook`, { headers } as any);
+    const js: any = await r.json().catch(() => ({}));
+    list = Array.isArray(js?.data) ? js.data : [];
+  } catch {}
+
+  const exists = list.find((w: any) => w?.url === url && w?.label === "daily-bonus");
+  if (exists) return { ok: true, existed: true };
+
+  // 作成（type: "taskActivity"）
+  const body = { url, label: "daily-bonus", type: "taskActivity" };
+  const cr = await fetch(`${base}/user/webhook`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  } as any);
+  const cj: any = await cr.json().catch(() => ({}));
+  return { ok: !!cj?.success, created: true };
+}
+
+app.post("/admin/habitica/setup-webhooks", async (req: Request, res: Response) => {
+  if (!requireBearer(req, res)) return;
+  if (!HABITICA_WEBHOOK_SECRET) return res.status(400).json({ ok: false, error: "missing HABITICA_WEBHOOK_SECRET" });
+
+  const results: any[] = [];
+  for (const [email, cred] of Object.entries(HAB_MAP)) {
+    try {
+      const r = await ensureHabiticaWebhook(email, cred as any);
+      results.push({ email, ...r });
+    } catch (e: any) {
+      results.push({ email, ok: false, error: e?.message || String(e) });
+    }
+  }
+  res.json({ ok: true, results });
 });
 
 // =============== Start ===============
