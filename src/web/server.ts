@@ -1,13 +1,11 @@
-// server.ts  — 完全版
+// server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import { parse as csvParse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
 
-/* =========================================================
- * 基本設定
- * =======================================================*/
+// =============== 基本 ===============
 const app = express();
 app.set("x-powered-by", false);
 app.set("trust proxy", true);
@@ -18,8 +16,7 @@ app.use(
     },
   })
 );
-
-// CORS（/admin 配下のみ許可）
+// CORS（/admin配下のみ）
 app.use((req, res, next) => {
   if (req.path.startsWith("/admin/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -30,9 +27,7 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =========================================================
- * ユーティリティ
- * =======================================================*/
+// =============== Utils ===============
 function log(...a: any[]) { console.log("[web]", ...a); }
 function ensureDir(p: string) { fs.mkdirSync(p, { recursive: true }); }
 function appendJsonl(fp: string, obj: any) {
@@ -69,85 +64,69 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 
-/* =========================================================
- * ENV
- * =======================================================*/
+// =============== ENV ===============
 const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const DRY_RUN = String(process.env.DRY_RUN || "0") === "1";
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/+$/,"");
 
-// HubSpot v3 署名
+// HubSpot v3
 const WEBHOOK_SECRET = process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET || process.env.HUBSPOT_APP_SECRET || "";
 
-// Zoom Webhook 署名/トークン
-const ZOOM_WEBHOOK_SECRET   = String(process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || "").trim();
+// Zoom 署名
+const ZOOM_WEBHOOK_SECRET = String(process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || "").trim();
 const ZOOM_VERIFICATION_TOKEN = String(process.env.ZOOM_VERIFICATION_TOKEN || process.env.ZOOM_VTOKEN || "").trim();
-const ZOOM_BEARER_TOKEN     = process.env.ZOOM_BEARER_TOKEN || "";
-const ZOOM_SIG_SKEW         = Number(process.env.ZOOM_SIG_SKEW || 300);
+const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
+const ZOOM_SIG_SKEW = Number(process.env.ZOOM_SIG_SKEW || 300);
 
 // だれ判定マップ
 const HUBSPOT_USER_MAP_JSON = readEnvJsonOrFile("HUBSPOT_USER_MAP_JSON","HUBSPOT_USER_MAP_FILE");
-const HABITICA_USERS_JSON   = readEnvJsonOrFile("HABITICA_USERS_JSON","HABITICA_USERS_FILE");
-const NAME_EMAIL_MAP_JSON   = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL_MAP_FILE");
-const ZOOM_EMAIL_MAP_JSON   = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
+const HABITICA_USERS_JSON = readEnvJsonOrFile("HABITICA_USERS_JSON","HABITICA_USERS_FILE");
+const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL_MAP_FILE");
+const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
-// 通話XP 仕様
-// ★ 「1本あたり +1XP」は環境変数不要で常時有効（未設定でも 1）
-const CALL_TOTALIZE_5MIN    = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1";
-const CALL_XP_PER_CALL      = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "") ? 1 : Number(process.env.CALL_XP_PER_CALL);
-const CALL_XP_PER_5MIN      = Number(process.env.CALL_XP_PER_5MIN || 2);
-const CALL_XP_UNIT_MS       = Number(process.env.CALL_XP_UNIT_MS || 300000); // 5分 = 300,000ms
-const CALL_CHATWORK_NOTIFY  = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
+// 通話XP（累計5分ごと）
+// ★ +1XPは環境変数いらずで常時有効（未設定・空文字なら 1）
+const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1";
+const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
+  ? 1 : Number(process.env.CALL_XP_PER_CALL);
+const CALL_XP_PER_5MIN   = Number(process.env.CALL_XP_PER_5MIN || 2);
+const CALL_XP_UNIT_MS    = Number(process.env.CALL_XP_UNIT_MS || 300000);
+const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
 
-// CSV UI 追加トークン
+// CSV UI 設定（簡略）
 const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s=>s.trim()).filter(Boolean);
 
-/* =========================================================
- * 外部コネクタ
- * =======================================================*/
+// =============== 外部コネクタ ===============
 import { sendChatworkMessage } from "../connectors/chatwork.js";
 import { createTodo, completeTask, addApproval, addSales, addMakerAward } from "../connectors/habitica.js";
 
-/* =========================================================
- * マップ構築
- * =======================================================*/
+// =============== マップ構築 ===============
 type HabiticaCred = { userId: string; apiToken: string };
 function buildHabiticaMap(s: string){ const p = safeParse<Record<string,HabiticaCred>>(s)||{}; const out:Record<string,HabiticaCred>={}; for(const [k,v] of Object.entries(p)){ if(v?.userId && v?.apiToken) out[k.toLowerCase()]={userId:String(v.userId),apiToken:String(v.apiToken)}; } return out; }
 function buildNameEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [n,e] of Object.entries(p)){ if(!n||!e) continue; out[normSpace(n)] = e.toLowerCase(); } return out; }
 function buildZoomEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [z,e] of Object.entries(p)){ if(!z||!e) continue; out[z]=e.toLowerCase(); } return out; }
-const HAB_MAP       = buildHabiticaMap(HABITICA_USERS_JSON);
-const NAME2MAIL     = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
+const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
+const NAME2MAIL = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
 const ZOOM_UID2MAIL = buildZoomEmailMap(ZOOM_EMAIL_MAP_JSON);
-const getHabitica   = (email?: string)=> email? HAB_MAP[email.toLowerCase()]: undefined;
+const getHabitica = (email?: string)=> email? HAB_MAP[email.toLowerCase()]: undefined;
 
-/* =========================================================
- * 重複抑止
- * =======================================================*/
+// =============== 重複抑止 ===============
 const seen = new Map<string, number>();
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24*60*60);
 function hasSeen(id?: any){ if(id==null) return false; const key=String(id); const now=Date.now(); for(const [k,ts] of seen){ if(now-ts>DEDUPE_TTL_SEC*1000) seen.delete(k); } return seen.has(key); }
 function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now()); }
 
-/* =========================================================
- * Health / Support
- * =======================================================*/
+// =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({
-    ok:true, version:"2025-09-18-final",
-    tz:process.env.TZ||"Asia/Tokyo",
-    now:new Date().toISOString(),
-    baseUrl:PUBLIC_BASE_URL||null,
-    dryRun:DRY_RUN,
-    habiticaUserCount:Object.keys(HAB_MAP).length,
-    nameMapCount:Object.keys(NAME2MAIL).length
+  res.json({ ok:true, version:"2025-09-18-zoom-calllogs", tz:process.env.TZ||"Asia/Tokyo",
+    now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
+    habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length
   });
 });
 app.get("/support", (_req,res)=>res.type("text/plain").send("Support page"));
 
-/* =========================================================
- * HubSpot v3 Webhook（署名検証）
- * =======================================================*/
+// =============== HubSpot v3 Webhook（署名検証） ===============
 app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: Response)=>{
   const method = (req.method||"POST").toUpperCase();
   const withQuery = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
@@ -157,7 +136,7 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const sigHeader = req.header("x-hubspot-signature-v3") || "";
   const raw: Buffer = (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body||""),"utf8");
 
-  // Render の X-Forwarded や PUBLIC_BASE_URL の差を吸収
+  // 署名候補（RenderのX-ForwardedやPUBLIC_BASE_URL差を吸収）
   const proto = String(req.headers["x-forwarded-proto"]||"").split(",")[0].trim() || (req as any).protocol || "https";
   const hostHdr = String(req.headers["x-forwarded-host"]||req.headers["host"]||"").split(",")[0].trim();
   const candidates = new Set<string>();
@@ -189,14 +168,12 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   }
 });
 
-/* =========================================================
- * HubSpot Workflow（Bearer 認証）
- * =======================================================*/
+// =============== HubSpot Workflow（Bearerのみ） ===============
 app.post("/webhooks/workflow", async (req: Request, res: Response)=>{
   if(!requireBearer(req,res)) return;
   const b:any = (req as any).body || {};
-  const outcome    = b.outcome || b.hs_call_disposition || b.properties?.hs_call_disposition;
-  const callId     = b.callId || b.engagementId || b.id;
+  const outcome = b.outcome || b.hs_call_disposition || b.properties?.hs_call_disposition;
+  const callId = b.callId || b.engagementId || b.id;
   const occurredAt = b.endedAt || b.occurredAt || b.timestamp || b.properties?.hs_timestamp;
   await handleNormalizedEvent({ source:"workflow", eventId:b.eventId||callId, callId, outcome, occurredAt, raw:b });
   if (b.type==="call.duration") {
@@ -206,14 +183,11 @@ app.post("/webhooks/workflow", async (req: Request, res: Response)=>{
   res.json({ok:true});
 });
 
-/* =========================================================
- * Zoom Webhook
- *   - 署名（x-zm-signature） or Bearer を許可
- *   - duration は「talk_time（秒）」優先、無ければ秒/ミリ秒を自動判定
- * =======================================================*/
+// =============== Zoom Webhook（ts+base64 / HEX に対応） ===============
 function readBearerFromHeaders(req: Request){
   for(const k of ["authorization","x-authorization","x-auth","x-zoom-authorization","zoom-authorization"]) {
-    const v=req.get(k); if(!v) continue; const m=v.trim().match(/^Bearer\s+(.+)$/i); return (m?m[1]:v).trim();
+    const v=req.get(k); if(!v) continue; const m=v.trim().match(/^Bearer\s+(.+)$/i);
+    return (m?m[1]:v).trim();
   }
   return "";
 }
@@ -222,7 +196,7 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   if(!header) return { ok:false, why:"no_header" };
   const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
 
-  // HEX 形式（たまに来る）
+  // HEX のみ variant
   const mHex = header.match(/^v0=([a-f0-9]{64})$/i);
   if (mHex) {
     const sigHex = mHex[1].toLowerCase();
@@ -253,36 +227,50 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   return { ok: eqB64(macA)||eqB64(macB), variant:"v0_ts_b64" };
 }
 
-// Zoom の “通話時間(ms)” を安全に推定
+// 重要：Zoom の duration を安全に取り出す（call_logs[] 優先）
 function extractZoomDurationMs(payload: any): number {
   const obj = payload?.payload?.object || payload?.object || payload || {};
   const n = (v:any)=> Number(v);
 
-  // 1) Zoom Phone の「talk_time」（秒）が最優先（話していた正味時間）
+  // call_logs[] を合計
+  if (Array.isArray(obj.call_logs) && obj.call_logs.length > 0) {
+    let sumMs = 0;
+    for (const cl of obj.call_logs) {
+      let ms = 0;
+      if (cl.talk_time != null) {
+        const s = n(cl.talk_time);
+        if (Number.isFinite(s) && s >= 0) ms = Math.floor(s * 1000);
+      } else if (cl.duration_ms != null) {
+        const x = n(cl.duration_ms); if (Number.isFinite(x) && x >= 0) ms = Math.floor(x);
+      } else if (cl.duration != null) {
+        const s = n(cl.duration); if (Number.isFinite(s) && s >= 0) ms = Math.floor(s * 1000);
+      } else if (cl.start_time && cl.end_time) {
+        const st = new Date(cl.start_time).getTime();
+        const et = new Date(cl.end_time).getTime();
+        if (Number.isFinite(st) && Number.isFinite(et)) ms = Math.max(0, et - st);
+      }
+      if (Number.isFinite(ms) && ms > 0) sumMs += ms;
+    }
+    if (sumMs > 0) return sumMs;
+  }
+
+  // ルート直下（保険）
   if (obj.talk_time != null) {
     const s = n(obj.talk_time);
     if (Number.isFinite(s) && s >= 0) return Math.floor(s * 1000);
   }
-
-  // 2) 代表的候補を順にチェック
   const candNames = ["duration_ms", "call_duration_ms", "call_duration", "duration", "call_time"];
   for (const k of candNames) {
     const v = obj[k]; if (v == null) continue;
     const x = n(v);
     if (!Number.isFinite(x) || x < 0) continue;
-    // *_ms はミリ秒、それ以外は「秒」の可能性が高い
-    if (/_ms$/i.test(k)) return Math.floor(x);
-    // 値からも推定：1e6 を超えるなら既に ms、さもなくば秒
-    return Math.floor(x < 1e6 ? x*1000 : x);
+    return /_ms$/i.test(k) ? Math.floor(x) : Math.floor(x * 1000);
   }
-
-  // 3) start_time / end_time があれば差分（ミリ秒）
   if (obj.start_time && obj.end_time) {
     const st = new Date(obj.start_time).getTime();
     const et = new Date(obj.end_time).getTime();
     if (Number.isFinite(st) && Number.isFinite(et)) return Math.max(0, et - st);
   }
-
   return 0;
 }
 
@@ -291,7 +279,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   let b:any = (req as any).body || {};
   if(!b || (Object.keys(b).length===0 && rawText)) { try{ b=JSON.parse(rawText!);}catch{} }
 
-  // URL 検証
+  // URL検証
   const plain = b?.plainToken || b?.payload?.plainToken || b?.event?.plainToken;
   if(plain){
     const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "dummy";
@@ -308,32 +296,33 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   }
   if(!ok) return res.status(401).json({ok:false,error:"auth"});
 
-  // 実体
-  const obj = b?.payload?.object || b?.object || b || {};
-  const email = obj.user_email || obj.owner_email || obj.caller_email || obj.callee_email || b.email;
-  const zid   = obj.zoom_user_id || obj.user_id || obj.owner_id;
+  const obj  = b?.payload?.object || b?.object || b || {};
+  const email= obj.user_email || obj.owner_email || obj.caller_email || obj.callee_email || b.email;
+  const zid  = obj.zoom_user_id || obj.user_id || obj.owner_id;
   const whoRaw = { userEmail: email || (zid && ZOOM_UID2MAIL[String(zid)]) || undefined };
 
-  // どのイベントでも「完了系」だけで十分。summary_changed は ms=0 のことが多いので 0 は無視される。
-  const callId = obj.call_id || obj.session_id || obj.callID || obj.sessionID || b.id || `zoom:${Date.now()}`;
-  const ms = extractZoomDurationMs(b); // 安全に推定（talk_time 優先）
+  // callId をできるだけ安定して拾う（call_logs[] 内も見る）
+  const firstLog = Array.isArray(obj.call_logs) && obj.call_logs.length ? obj.call_logs[0] : undefined;
+  const callId =
+    obj.call_id || obj.session_id || obj.callID || obj.sessionID ||
+    firstLog?.call_id || firstLog?.session_id ||
+    b.id || `zoom:${Date.now()}`;
 
-  log(`[zoom] accepted event=${b.event||"-"} callId=${callId} ms=${ms}`);
+  const ms = extractZoomDurationMs(b);
+
+  log(`[zoom] accepted event=${b?.event || "(unknown)"} callId=${callId} ms=${ms}`);
   await handleCallDurationEvent({
-    source:"workflow",
+    source: "workflow",
     eventId: b.event_id || callId,
     callId,
     durationMs: inferDurationMs(ms),
     occurredAt: b.timestamp || obj.end_time || Date.now(),
     raw: whoRaw
   });
-
   res.json({ok:true, accepted:true, ms});
 });
 
-/* =========================================================
- * 正規化 & だれ特定
- * =======================================================*/
+// =============== 正規化処理 & だれ特定 ===============
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
 function resolveActor(ev:{source:"v3"|"workflow"; raw?:any}):{name:string; email?:string}{
   const raw = ev.raw||{};
@@ -356,15 +345,12 @@ async function handleNormalizedEvent(ev: Normalized){
   const id = ev.eventId ?? ev.callId;
   if (hasSeen(id)) return; markSeen(id);
 
-  const v = String(ev.outcome||"").toLowerCase();
-  const isAppt = v === "appointment_scheduled" || v === "新規アポ" || v === "appointment scheduled";
+  const isAppt = String(ev.outcome||"").trim() && ["appointment_scheduled","新規アポ"].includes(String(ev.outcome).toLowerCase());
   if (isAppt) { await awardXpForAppointment(ev); await notifyChatworkAppointment(ev); }
   else { log(`non-appointment outcome=${ev.outcome||"(empty)"}`); }
 }
 
-/* =========================================================
- * Habitica（アポ） & Chatwork 通知
- * =======================================================*/
+// =============== Habitica付与（アポ） & Chatwork通知 ===============
 async function awardXpForAppointment(ev: Normalized){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   const cred = getHabitica(who.email);
@@ -379,7 +365,6 @@ async function awardXpForAppointment(ev: Normalized){
   appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
 }
 
-// Chatwork
 function cwApptMessage(ev: Normalized){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   const when = fmtJST(ev.occurredAt);
@@ -409,9 +394,7 @@ async function notifyChatworkAppointment(ev: Normalized){
   try { await sendChatworkMessage(cwApptMessage(ev)); } catch {}
 }
 
-/* =========================================================
- * 通話：+1XP（毎コール）＆ 5分ごと +2XP（当日累計）
- * =======================================================*/
+// =============== 通話（毎コール +1XP ＆ 当日累計5分ごと +2XP） ===============
 type CallDurEv = { source:"v3"|"workflow"; eventId?:any; callId?:any; durationMs:number; occurredAt?:any; raw?:any; };
 function inferDurationMs(v:any){ const n=Number(v); if(!Number.isFinite(n)||n<=0) return 0; return n>=100000?Math.floor(n):Math.floor(n*1000); }
 
@@ -421,7 +404,6 @@ type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:
 function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
 function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
 
-// 旧：1コール内の5分加点のみ（ベースは別で +1）
 function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
 function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
@@ -430,16 +412,15 @@ async function awardXpForCallDuration(ev: CallDurEv){
   const who = resolveActor({source:ev.source, raw:ev.raw});
   appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:ev.durationMs, actor:who});
 
-  // 1) 仕様：毎コール +1XP（環境変数いらず／既定1）。通話秒数が 0 でも付与。
+  // 1) 仕様：毎コール +1XP（0秒でも付与）
   if (CALL_XP_PER_CALL > 0) {
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
       log(`[call] per-call base +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
     } else {
       const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
-      const notes = `rule=per-call+${CALL_XP_PER_CALL}`;
       try {
-        const todo = await createTodo(title, notes, undefined, cred);
+        const todo = await createTodo(title, "rule=per-call", undefined, cred);
         const id = (todo as any)?.id;
         if (id) await completeTask(id, cred);
       } catch(e:any){
@@ -448,7 +429,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     }
   }
 
-  // 2) 当日 累計 5分ごと +2XP
+  // 2) 当日累計 5分ごと +2XP
   if (CALL_TOTALIZE_5MIN) {
     const day = isoDay(ev.occurredAt);
     const email = (who.email||"").toLowerCase();
@@ -471,20 +452,12 @@ async function awardXpForCallDuration(ev: CallDurEv){
     }
     const title = `📞 累計架電（${who.name}） +${xp}XP`;
     const notes = `day=${day}\nemail=${email}\ntotal_ms=${st[day][email].total_ms}\nsteps_awarded=${st[day][email].steps_awarded}`;
-    try {
-      const todo = await createTodo(title, notes, undefined, cred);
-      const id   = (todo as any)?.id;
-      if (id) await completeTask(id, cred);
-    } catch(e:any){
-      console.error("[call-totalize] habitica failed:", e?.message||e);
-    }
-    if (CALL_CHATWORK_NOTIFY) {
-      try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{}
-    }
+    try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call-totalize] habitica failed:", e?.message||e); }
+    if (CALL_CHATWORK_NOTIFY) { try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{} }
     return;
   }
 
-  // 3) 旧：1コール内の5分加点のみ
+  // 3) 旧：1コール内“5分ごと”の加点のみ（ベース+1は上で付与済）
   const xpExtra = computePerCallExtra(ev.durationMs);
   if (xpExtra<=0) return;
   const cred = getHabitica(who.email);
@@ -495,20 +468,13 @@ async function awardXpForCallDuration(ev: CallDurEv){
 }
 
 async function handleCallDurationEvent(ev: CallDurEv){
-  // 同一 callId / eventId の重複防止
   const id = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
   if (hasSeen(id)) return; markSeen(id);
-  if (ev.durationMs<=0) {
-    // +1XP は handleCallDurationEvent の外で付けないと秒0で漏れるので、
-    // この関数で +1 も付与しているため、秒0でも上の per-call ブロックは実行済み。
-    return;
-  }
+  if (ev.durationMs<=0 && CALL_XP_PER_CALL<=0) return; // 0秒でも +1 は付与済なので、この条件
   await awardXpForCallDuration(ev);
 }
 
-/* =========================================================
- * CSV（簡略・既存互換）
- * =======================================================*/
+// =============== CSV（簡略・既存互換） ===============
 function requireBearerCsv(req: Request, res: Response): boolean {
   const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
   if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length===0) { res.status(500).json({ok:false,error:"missing tokens"}); return false; }
@@ -529,37 +495,18 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     const maker = r.maker? String(r.maker).trim(): undefined;
     const id = String(r.id || `${type}:${email||"-"}:${maker||"-"}`).trim();
     const date = r.date? String(r.date): undefined;
-
-    if (type==="approval") {
-      nA++;
-      appendJsonl("data/events/approvals.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker});
-      const cred=getHabitica(email); if(!DRY_RUN&&cred) await addApproval(cred,1, "CSV");
-    }
-    if (type==="sales") {
-      nS++; sum+=(amount||0);
-      appendJsonl("data/events/sales.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker,amount});
-      const cred=getHabitica(email); if(!DRY_RUN&&cred&&amount) await addSales(cred, amount, "CSV");
-    }
-    if (type==="maker") {
-      nM++;
-      appendJsonl("data/events/maker.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker});
-      const cred=getHabitica(email); if(!DRY_RUN&&cred) await addMakerAward(cred,1);
-    }
+    if (type==="approval") { nA++; appendJsonl("data/events/approvals.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addApproval(cred,1, "CSV"); }
+    if (type==="sales")    { nS++; sum+=(amount||0); appendJsonl("data/events/sales.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker,amount}); const cred=getHabitica(email); if(!DRY_RUN&&cred&&amount) await addSales(cred, amount, "CSV"); }
+    if (type==="maker")    { nM++; appendJsonl("data/events/maker.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addMakerAward(cred,1); }
   }
-  try{
-    await sendChatworkMessage(`[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`);
-  }catch{}
+  try{ await sendChatworkMessage(`[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`);}catch{}
   res.json({ ok:true, mode:"upsert", received:recs.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales:sum, duplicates:0, errors:0 });
 });
-
-// CSV テンプレ
 app.get("/admin/template.csv", (_req,res)=>{
   res.setHeader("Content-Type","text/csv; charset=utf-8");
   res.setHeader("Content-Disposition",'attachment; filename="template.csv"');
   res.send("type,email,amount,maker,id,date,notes\napproval,info@example.com,0,,A-001,2025-09-08,承認OK\nsales,info@example.com,150000,,S-001,2025-09-08,受注\nmaker,info@example.com,,ACME,M-ACME-1,2025-09-08,最多メーカー\n");
 });
-
-// 手動アップロードUI（貼り付け送信）
 app.get("/admin/upload", (_req,res)=>{
   const html = `<!doctype html><meta charset="utf-8"/><title>CSV取込（手動）</title>
   <style>body{font-family:system-ui;max-width:860px;margin:2rem auto;padding:0 1rem}textarea{width:100%;min-height:160px}</style>
@@ -578,20 +525,17 @@ app.get("/admin/upload", (_req,res)=>{
       const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{method:'POST',headers:{'Content-Type':'text/csv','Authorization':'Bearer '+tok},body:text});
       const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
     }
-    function readAsText(f){ return new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(String(fr.result||'')); fr.readAsText(f); }); }
-    qs('#upload').onclick=async()=>{ const f=qs('#file').files[0]; if(!f) return pr('CSVファイルを選択'); const text=await readAsText(f); postCsvRaw(text); };
     qs('#send').onclick=()=>postCsvRaw(qs('#csv').value);
+    qs('#upload').onclick=()=>{ const f=qs('#file').files[0]; if(!f) return pr('CSVファイルを選択'); const fr=new FileReader(); fr.onload=()=>postCsvRaw(String(fr.result||'')); fr.readAsText(f); };
   </script>`;
   res.type("html").send(html);
 });
 
-/* =========================================================
- * ダッシュボード
- * =======================================================*/
+// =============== ダッシュボード ===============
 app.get("/admin/dashboard", (_req,res)=>{
   const today = isoDay(), yest = isoDay(new Date(Date.now()-86400000));
   const rd = (fp:string)=> readJsonlAll(fp);
-  const calls = rd("data/events/calls.jsonl");        // Zoom/HubSpotからの通話（累計対象）
+  const calls = rd("data/events/calls.jsonl");
   const appts = rd("data/events/appointments.jsonl");
   const apprs = rd("data/events/approvals.jsonl");
   const sales = rd("data/events/sales.jsonl");
@@ -631,9 +575,7 @@ app.get("/admin/dashboard", (_req,res)=>{
   res.type("html").send(html);
 });
 
-/* =========================================================
- * 診断API
- * =======================================================*/
+// =============== 診断API ===============
 app.get("/admin/mapping", (req,res)=>{
   if(!requireBearer(req,res)) return;
   res.json({ ok:true, habiticaEmails:Object.keys(HAB_MAP).sort(), nameEmailEntries:Object.keys(NAME2MAIL).length, zoomUserIdMapCount:Object.keys(ZOOM_UID2MAIL).length });
@@ -643,12 +585,9 @@ app.get("/admin/state/calls", (req,res)=>{
   res.json({ ok:true, state: loadCallState() });
 });
 
-/* =========================================================
- * Start
- * =======================================================*/
+// =============== Start ===============
 app.listen(PORT, ()=>{
   log(`listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL}`);
   log(`[habitica] users=${Object.keys(HAB_MAP).length}, [name->email] entries=${Object.keys(NAME2MAIL).length}`);
 });
-
 export {};
