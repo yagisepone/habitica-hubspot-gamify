@@ -566,7 +566,119 @@ async function handleCallDurationEvent(ev: CallDurEv){
   await awardXpForCallDuration(ev); // ★ durationMs=0 でも per-call +1XP のため実行
 }
 
-// =============== CSV（承認・売上・メーカー賞 取り込み） ===============
+// =============== CSV（承認・売上・メーカー賞 取り込み：自動マッピング対応） ===============
+function truthyJP(v: any) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return ["1","true","yes","y","on","済","◯","〇","ok","承認","approved","done"].some(t => s.includes(t));
+}
+function numOrUndefined(v:any){
+  if (v==null) return undefined;
+  const n = Number(String(v).replace(/[^\d.-]/g,""));
+  return Number.isFinite(n) ? n : undefined;
+}
+function firstMatchKey(row: any, candidates: string[]): string|undefined {
+  const keys = Object.keys(row||{});
+  const lc = (x:string)=>x.toLowerCase().replace(/\s+/g,"");
+  const set = new Map(keys.map(k=>[lc(k),k]));
+  for (const c of candidates) {
+    const m = set.get(lc(c));
+    if (m) return m;
+  }
+  // 前方一致も許容
+  for (const key of keys) {
+    const k = lc(key);
+    if (candidates.some(c => k.includes(lc(c)))) return key;
+  }
+  return undefined;
+}
+
+/**
+ * 任意スキーマCSV -> 標準レコード配列に正規化
+ * 標準レコード: { type:'approval'|'sales'|'maker', email?, amount?, maker?, id?, date? }
+ * 1行から複数typeを生成可（例: メーカー成果→ maker + approval）
+ */
+function normalizeCsv(text: string){
+  const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
+
+  // よくある見出しの候補
+  const C_EMAIL  = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
+  const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker"];
+  const C_AMOUNT = ["金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額"];
+  const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号"];
+  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at"];
+  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果"];
+  const C_TYPE   = ["type","種別","イベント種別"];
+
+  const out: Array<{type:"approval"|"sales"|"maker"; email?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string}> = [];
+
+  for (const r of recs) {
+    // まず、標準スキーマ(type,email,amount,maker,id,date,notes)に合っていればそのまま採用
+    if (r.type || r.email || r.amount || r.maker) {
+      const t = String(r.type||"").trim().toLowerCase();
+      if (["approval","sales","maker"].includes(t)) {
+        out.push({
+          type: t as any,
+          email: r.email? String(r.email).toLowerCase(): undefined,
+          amount: numOrUndefined(r.amount),
+          maker: r.maker? String(r.maker).trim(): undefined,
+          id: r.id? String(r.id).trim(): undefined,
+          date: r.date? String(r.date).trim(): undefined,
+          notes: r.notes? String(r.notes): undefined,
+        });
+        continue;
+      }
+    }
+
+    // 自由形式ヘッダから推定
+    const kEmail  = firstMatchKey(r, C_EMAIL);
+    const kMaker  = firstMatchKey(r, C_MAKER);
+    const kAmt    = firstMatchKey(r, C_AMOUNT);
+    const kId     = firstMatchKey(r, C_ID);
+    const kDate   = firstMatchKey(r, C_DATE);
+    const kApf    = firstMatchKey(r, C_APPROV);
+    const kType   = firstMatchKey(r, C_TYPE);
+
+    const email = kEmail ? String(r[kEmail]||"").toLowerCase().trim() : undefined;
+    const maker = kMaker ? String(r[kMaker]||"").trim() : undefined;
+    const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
+    const rid = kId ? String(r[kId]||"").trim() : undefined;
+    const date = kDate ? String(r[kDate]||"").trim() : undefined;
+
+    // type列の指定があれば優先
+    let explicitType: "approval"|"sales"|"maker"|undefined;
+    if (kType) {
+      const t = String(r[kType]||"").trim().toLowerCase();
+      if (["approval","sales","maker"].includes(t)) explicitType = t as any;
+    }
+
+    // 承認フラグっぽい列
+    const approved = kApf ? truthyJP(r[kApf]) : false;
+
+    // 生成方針：
+    // 1) 金額>0 → sales
+    // 2) 承認っぽい → approval
+    // 3) メーカー名があって、明確なtypeが無い → maker（＋ダッシュボード反映のため approval も同時に1件作成）
+    // 4) typeが明示されていればそれに従う
+    if (explicitType === "sales" || (explicitType===undefined && amount && amount>0)) {
+      out.push({ type:"sales", email, amount, maker, id: rid, date, notes:"from CSV(auto)" });
+      continue;
+    }
+    if (explicitType === "approval" || approved) {
+      out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(auto)" });
+      continue;
+    }
+    if (explicitType === "maker" || maker) {
+      // メーカー成果 → バッジ/XPin加え、ダッシュボード可視化のため approval も1件
+      out.push({ type:"maker",   email, maker, id: rid, date, notes:"from CSV(auto)" });
+      out.push({ type:"approval",email, maker, id: rid, date, notes:"from CSV(auto,maker-as-approval)" });
+      continue;
+    }
+
+    // どれにも当たらない場合はスキップ（静かに無視）
+  }
+  return out;
+}
+
 function requireBearerCsv(req: Request, res: Response): boolean {
   const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
   if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length===0) { res.status(500).json({ok:false,error:"missing tokens"}); return false; }
@@ -574,39 +686,95 @@ function requireBearerCsv(req: Request, res: Response): boolean {
   if (CSV_UPLOAD_TOKENS.includes(token)) return true;
   res.status(401).json({ok:false,error:"auth"}); return false;
 }
-app.post("/admin/csv", express.text({ type:"text/csv", limit:"10mb" }));
+
+app.post("/admin/csv", express.text({ type:"text/csv", limit:"20mb" }));
 app.post("/admin/csv", async (req: Request, res: Response)=>{
   if(!requireBearerCsv(req,res)) return;
   const text = String((req as any).body||"");
-  const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
+
+  // 標準 or 自由形式を吸収
+  const normalized = normalizeCsv(text);
+
   let nA=0, nS=0, nM=0, sum=0;
-  for (const r of recs) {
-    const type = String(r.type||"").trim();
-    const email = r.email? String(r.email).toLowerCase(): undefined;
-    const amount = r.amount!=null? Number(String(r.amount).replace(/[^\d.-]/g,"")): undefined;
-    const maker = r.maker? String(r.maker).trim(): undefined;
+  for (const r of normalized) {
+    const type = r.type;
+    const email = r.email ? String(r.email).toLowerCase() : undefined;
+    const amount = r.amount != null ? Number(r.amount) : undefined;
+    const maker = r.maker ? String(r.maker).trim() : undefined;
     const id = String(r.id || `${type}:${email||"-"}:${maker||"-"}`).trim();
-    const date = r.date? String(r.date): undefined;
-    if (type==="approval") { nA++; appendJsonl("data/events/approvals.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addApproval(cred,1, "CSV"); }
-    if (type==="sales")    { nS++; sum+=(amount||0); appendJsonl("data/events/sales.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker,amount}); const cred=getHabitica(email); if(!DRY_RUN&&cred&&amount) await addSales(cred, amount, "CSV"); }
-    if (type==="maker")    { nM++; appendJsonl("data/events/maker.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addMakerAward(cred,1); }
+    const date = r.date ? String(r.date) : undefined;
+
+    if (type==="approval") {
+      nA++;
+      appendJsonl("data/events/approvals.jsonl",{
+        at:new Date().toISOString(), day:isoDay(date), email,
+        actor: email? {name: email.split("@")[0], email}: undefined,
+        id, maker
+      });
+      const cred = getHabitica(email);
+      if (!DRY_RUN && cred) await addApproval(cred, 1, "CSV");
+    }
+
+    if (type==="sales") {
+      nS++; sum+=(amount||0);
+      appendJsonl("data/events/sales.jsonl",{
+        at:new Date().toISOString(), day:isoDay(date), email,
+        actor: email? {name: email.split("@")[0], email}: undefined,
+        id, maker, amount
+      });
+      const cred = getHabitica(email);
+      if (!DRY_RUN && cred && amount) await addSales(cred, amount, "CSV");
+    }
+
+    if (type==="maker") {
+      nM++;
+      appendJsonl("data/events/maker.jsonl",{
+        at:new Date().toISOString(), day:isoDay(date), email,
+        actor: email? {name: email.split("@")[0], email}: undefined,
+        id, maker
+      });
+      const cred = getHabitica(email);
+      if (!DRY_RUN && cred) await addMakerAward(cred,1);
+    }
   }
-  try{ await sendChatworkMessage(`[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`);}catch{}
-  res.json({ ok:true, mode:"upsert", received:recs.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales:sum, duplicates:0, errors:0 });
+
+  try {
+    await sendChatworkMessage(
+      `[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`
+    );
+  } catch {}
+
+  res.json({
+    ok:true,
+    mode:"upsert",
+    received: normalized.length,
+    accepted:{approval:nA,sales:nS,maker:nM},
+    totalSales: sum,
+    duplicates: 0,
+    errors: 0
+  });
 });
+
 app.get("/admin/template.csv", (_req,res)=>{
   res.setHeader("Content-Type","text/csv; charset=utf-8");
   res.setHeader("Content-Disposition",'attachment; filename="template.csv"');
-  res.send("type,email,amount,maker,id,date,notes\napproval,info@example.com,0,,A-001,2025-09-08,承認OK\nsales,info@example.com,150000,,S-001,2025-09-08,受注\nmaker,info@example.com,,ACME,M-ACME-1,2025-09-08,最多メーカー\n");
+  res.send(
+    "type,email,amount,maker,id,date,notes\n"+
+    "approval,info@example.com,0,,A-001,2025-09-08,承認OK\n"+
+    "sales,info@example.com,150000,,S-001,2025-09-08,受注\n"+
+    "maker,info@example.com,,ACME,M-ACME-1,2025-09-08,最多メーカー\n"
+  );
 });
+
 app.get("/admin/upload", (_req,res)=>{
   const html = `<!doctype html><meta charset="utf-8"/><title>CSV取込（手動）</title>
   <style>body{font-family:system-ui;max-width:860px;margin:2rem auto;padding:0 1rem}textarea{width:100%;min-height:160px}</style>
   <h1>CSV取込（手動）</h1>
+  <p>標準形式 <code>type,email,amount,maker,id,date,notes</code> だけでなく、<b>日本語見出しの自由形式</b>も自動マッピングで取り込めます（例：メーカー名/担当者 メールアドレス/受注金額/承認 など）。</p>
   <div><label>Base URL</label> <input id="base" size="40" value="${PUBLIC_BASE_URL||""}"/>
        <label>AUTH_TOKEN</label> <input id="tok" size="40"/></div>
   <p><input type="file" id="file" accept=".csv,text/csv"/> <button id="upload">アップロード</button></p>
-  <p><textarea id="csv" placeholder="type,email,amount,maker,id,date,notes&#10;approval,info@example.com,0,,A-001,2025-09-08,承認OK"></textarea></p>
+  <p><textarea id="csv" placeholder="ここにCSVを貼り付けても送信できます（自動マッピング対応）"></textarea></p>
   <p><button id="send">貼り付けCSVを送信</button></p>
   <pre id="out"></pre>
   <script>
@@ -626,6 +794,7 @@ app.get("/admin/upload", (_req,res)=>{
   </script>`;
   res.type("html").send(html);
 });
+
 
 // =============== ダッシュボード ===============
 app.get("/admin/dashboard", (_req,res)=>{
