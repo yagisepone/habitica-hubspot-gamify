@@ -1,7 +1,7 @@
-// server.ts  — final
+// server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
-import Busboy from "busboy";              // いま未使用（将来のファイル受信で使えます）
+import Busboy from "busboy"; // 将来の拡張用に残してOK
 import { parse as csvParse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
@@ -17,7 +17,6 @@ app.use(
     },
   })
 );
-
 // CORS（/admin配下のみ）
 app.use((req, res, next) => {
   if (req.path.startsWith("/admin/")) {
@@ -36,21 +35,17 @@ function appendJsonl(fp: string, obj: any) {
   ensureDir(path.dirname(fp)); fs.appendFileSync(fp, JSON.stringify(obj) + "\n");
 }
 function readJsonlAll(fp: string): any[] {
-  try {
-    const t = fs.readFileSync(fp, "utf8").trim();
-    if (!t) return [];
-    return t.split("\n").filter(Boolean).map(s => JSON.parse(s));
-  } catch { return []; }
+  try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); } catch { return []; }
 }
 function writeJson(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); }
-function readJson<T = any>(fp: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(fp, "utf8")); } catch { return fallback; } }
+function readJson<T=any>(fp: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(fp,"utf8")); } catch { return fallback; } }
 function isoDay(d?: any) {
   const t = d ? new Date(d) : new Date();
-  return t.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\//g, "-");
+  return t.toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit"}).replace(/\//g,"-");
 }
 function fmtJST(ms?: any) {
-  const n = Number(ms); if (!Number.isFinite(n)) return "-";
-  return new Date(n).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const n = Number(ms); if(!Number.isFinite(n)) return "-";
+  return new Date(n).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
 }
 function timingEqual(a: string, b: string) {
   const A = Buffer.from(a), B = Buffer.from(b);
@@ -58,23 +53,83 @@ function timingEqual(a: string, b: string) {
 }
 function readEnvJsonOrFile(jsonVar: string, fileVar: string): string {
   const j = (process.env as any)[jsonVar]; if (j && String(j).trim()) return String(j).trim();
-  const fp = (process.env as any)[fileVar]; if (fp && String(fp).trim()) { try { return fs.readFileSync(String(fp).trim(), "utf8"); } catch { } }
+  const fp = (process.env as any)[fileVar]; if (fp && String(fp).trim()) { try { return fs.readFileSync(String(fp).trim(),"utf8"); } catch {} }
   return "";
 }
-function safeParse<T = any>(s?: string): T | undefined { try { return s ? JSON.parse(s) as T : undefined; } catch { return undefined; } }
-function normSpace(s?: string) { return (s || "").replace(/\u3000/g, " ").trim(); }
+function safeParse<T=any>(s?: string): T|undefined { try { return s? JSON.parse(s) as T: undefined; } catch { return undefined; } }
+function normSpace(s?: string){ return (s||"").replace(/\u3000/g," ").trim(); }
 function requireBearer(req: Request, res: Response): boolean {
-  const token = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!AUTH_TOKEN) { res.status(500).json({ ok: false, error: "missing AUTH_TOKEN" }); return false; }
-  if (token !== AUTH_TOKEN) { res.status(401).json({ ok: false, error: "auth" }); return false; }
+  const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
+  if (!AUTH_TOKEN) { res.status(500).json({ok:false,error:"missing AUTH_TOKEN"}); return false; }
+  if (token !== AUTH_TOKEN) { res.status(401).json({ok:false,error:"auth"}); return false; }
   return true;
+}
+
+// --- Zoom payload からメール/方向/長さ/ID を安全に抜く ---
+function pickZoomInfo(obj: any) {
+  const o = obj || {};
+  const logs: any[] =
+    Array.isArray(o.call_logs) ? o.call_logs :
+    Array.isArray(o?.object?.call_logs) ? o.object.call_logs :
+    [];
+
+  // アウトバウンド優先で1件選ぶ（なければ先頭）
+  const chosen =
+    logs.find((x) => String(x?.direction || "").toLowerCase() === "outbound") ||
+    logs[0] || o;
+
+  // メール候補（トップレベル → ログ内）を順に採用
+  const emailRaw =
+    o.user_email || o.owner_email || o.caller_email || o.callee_email ||
+    chosen?.caller_email || chosen?.callee_email || "";
+
+  const email = String(emailRaw || "").toLowerCase() || undefined;
+
+  // user/owner のID（ZOOM_EMAIL_MAP_JSON で補完する用）
+  const zid =
+    o.zoom_user_id || o.user_id || o.owner_id ||
+    chosen?.zoom_user_id || chosen?.user_id || chosen?.owner_id || undefined;
+
+  // 方向
+  const dir = String(chosen?.direction || o.direction || "").toLowerCase(); // 'outbound' / 'inbound' / ''
+
+  // かかった時間（ms）。秒で来たらmsへ換算。なければ start/end から算出
+  let ms = 0;
+  const cands = [
+    o.duration_ms, o.call_duration_ms, o.duration,
+    chosen?.duration_ms, chosen?.call_duration_ms, chosen?.talk_time
+  ];
+  for (const v of cands) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) {
+      ms = n < 100000 ? n * 1000 : n;
+      break;
+    }
+  }
+  if (ms <= 0 && (chosen?.start_time || o.start_time) && (chosen?.end_time || o.end_time)) {
+    const st = new Date(chosen?.start_time || o.start_time).getTime();
+    const et = new Date(chosen?.end_time || o.end_time).getTime();
+    if (Number.isFinite(st) && Number.isFinite(et)) {
+      ms = Math.max(0, et - st);
+    }
+  }
+
+  // callId
+  const callId =
+    o.call_id || o.session_id || chosen?.call_id || chosen?.session_id ||
+    `zoom:${Date.now()}`;
+
+  // 終了時刻（あれば）
+  const endedAt = chosen?.end_time || o.end_time || undefined;
+
+  return { email, zid, dir, ms, callId, endedAt };
 }
 
 // =============== ENV ===============
 const PORT = Number(process.env.PORT || 10000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const DRY_RUN = String(process.env.DRY_RUN || "0") === "1";
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/+$/, "");
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/+$/,"");
 
 // HubSpot v3
 const WEBHOOK_SECRET = process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET || process.env.HUBSPOT_APP_SECRET || "";
@@ -86,20 +141,22 @@ const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
 const ZOOM_SIG_SKEW = Number(process.env.ZOOM_SIG_SKEW || 300);
 
 // だれ判定マップ
-const HUBSPOT_USER_MAP_JSON = readEnvJsonOrFile("HUBSPOT_USER_MAP_JSON", "HUBSPOT_USER_MAP_FILE");
-const HABITICA_USERS_JSON = readEnvJsonOrFile("HABITICA_USERS_JSON", "HABITICA_USERS_FILE");
-const NAME_EMAIL_MAP_JSON = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON", "NAME_EMAIL_MAP_FILE");
-const ZOOM_EMAIL_MAP_JSON = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON", "ZOOM_EMAIL_MAP_FILE");
+const HUBSPOT_USER_MAP_JSON = readEnvJsonOrFile("HUBSPOT_USER_MAP_JSON","HUBSPOT_USER_MAP_FILE");
+const HABITICA_USERS_JSON = readEnvJsonOrFile("HABITICA_USERS_JSON","HABITICA_USERS_FILE");
+const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL_MAP_FILE");
+const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
-// 通話XP 設定（★ +1XP は環境変数いらずで既定1）
+// 通話XP（累計5分ごと）
+// ★ +1XPは環境変数いらずで常時有効（デフォルト1）
 const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "1") === "1";
-const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "") ? 1 : Number(process.env.CALL_XP_PER_CALL);
-const CALL_XP_PER_5MIN = Number(process.env.CALL_XP_PER_5MIN || 2);
-const CALL_XP_UNIT_MS = Number(process.env.CALL_XP_UNIT_MS || 300000);
+const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
+  ? 1 : Number(process.env.CALL_XP_PER_CALL);
+const CALL_XP_PER_5MIN   = Number(process.env.CALL_XP_PER_5MIN || 2);
+const CALL_XP_UNIT_MS    = Number(process.env.CALL_XP_UNIT_MS || 300000);
 const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
 
-// CSV UI 設定（簡略）
-const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s => s.trim()).filter(Boolean);
+// CSV UI 設定
+const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s=>s.trim()).filter(Boolean);
 
 // =============== 外部コネクタ ===============
 import { sendChatworkMessage } from "../connectors/chatwork.js";
@@ -107,208 +164,135 @@ import { createTodo, completeTask, addApproval, addSales, addMakerAward } from "
 
 // =============== マップ構築 ===============
 type HabiticaCred = { userId: string; apiToken: string };
-function buildHabiticaMap(s: string) {
-  const p = safeParse<Record<string, HabiticaCred>>(s) || {};
-  const out: Record<string, HabiticaCred> = {};
-  for (const [k, v] of Object.entries(p)) { if (v?.userId && v?.apiToken) out[k.toLowerCase()] = { userId: String(v.userId), apiToken: String(v.apiToken) }; }
-  return out;
-}
-function buildNameEmailMap(s: string) {
-  const p = safeParse<Record<string, string>>(s) || {};
-  const out: Record<string, string> = {};
-  for (const [n, e] of Object.entries(p)) { if (!n || !e) continue; out[normSpace(n)] = e.toLowerCase(); }
-  return out;
-}
-function buildZoomEmailMap(s: string) {
-  const p = safeParse<Record<string, string>>(s) || {};
-  const out: Record<string, string> = {};
-  for (const [z, e] of Object.entries(p)) { if (!z || !e) continue; out[z] = e.toLowerCase(); }
-  return out;
-}
+function buildHabiticaMap(s: string){ const p = safeParse<Record<string,HabiticaCred>>(s)||{}; const out:Record<string,HabiticaCred>={}; for(const [k,v] of Object.entries(p)){ if(v?.userId && v?.apiToken) out[k.toLowerCase()]={userId:String(v.userId),apiToken:String(v.apiToken)}; } return out; }
+function buildNameEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [n,e] of Object.entries(p)){ if(!n||!e) continue; out[normSpace(n)] = e.toLowerCase(); } return out; }
+function buildZoomEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [z,e] of Object.entries(p)){ if(!z||!e) continue; out[z]=e.toLowerCase(); } return out; }
 const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
 const NAME2MAIL = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
 const ZOOM_UID2MAIL = buildZoomEmailMap(ZOOM_EMAIL_MAP_JSON);
-const getHabitica = (email?: string) => email ? HAB_MAP[email.toLowerCase()] : undefined;
+const getHabitica = (email?: string)=> email? HAB_MAP[email.toLowerCase()]: undefined;
 
 // =============== 重複抑止 ===============
 const seen = new Map<string, number>();
-const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24 * 60 * 60);
-function hasSeen(id?: any) {
-  if (id == null) return false;
-  const key = String(id);
-  const now = Date.now();
-  for (const [k, ts] of seen) { if (now - ts > DEDUPE_TTL_SEC * 1000) seen.delete(k); }
-  return seen.has(key);
-}
-function markSeen(id?: any) { if (id == null) return; seen.set(String(id), Date.now()); }
+const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24*60*60);
+function hasSeen(id?: any){ if(id==null) return false; const key=String(id); const now=Date.now(); for(const [k,ts] of seen){ if(now-ts>DEDUPE_TTL_SEC*1000) seen.delete(k); } return seen.has(key); }
+function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now()); }
 
 // =============== Health/Support ===============
-app.get("/healthz", (_req, res) => {
-  res.json({
-    ok: true,
-    version: "2025-09-18-outbound-only",
-    tz: process.env.TZ || "Asia/Tokyo",
-    now: new Date().toISOString(),
-    baseUrl: PUBLIC_BASE_URL || null,
-    dryRun: DRY_RUN,
-    habiticaUserCount: Object.keys(HAB_MAP).length,
-    nameMapCount: Object.keys(NAME2MAIL).length
+app.get("/healthz", (_req,res)=>{
+  res.json({ ok:true, version:"2025-09-18-zoom-calllogs", tz:process.env.TZ||"Asia/Tokyo",
+    now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
+    habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length
   });
 });
-app.get("/support", (_req, res) => res.type("text/plain").send("Support page"));
+app.get("/support", (_req,res)=>res.type("text/plain").send("Support page"));
 
 // =============== HubSpot v3 Webhook（署名検証） ===============
-app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: Response) => {
-  const method = (req.method || "POST").toUpperCase();
+app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: Response)=>{
+  const method = (req.method||"POST").toUpperCase();
   const withQuery = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
   const urlObj = new URL(withQuery, "http://dummy.local");
-  const pathOnly = urlObj.pathname + (urlObj.search || "");
+  const pathOnly = urlObj.pathname + (urlObj.search||"");
   const tsHeader = req.header("x-hubspot-request-timestamp") || "";
   const sigHeader = req.header("x-hubspot-signature-v3") || "";
-  const raw: Buffer = (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body || ""), "utf8");
+  const raw: Buffer = (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body||""),"utf8");
 
   // 署名候補（RenderのX-ForwardedやPUBLIC_BASE_URL差を吸収）
-  const proto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() || (req as any).protocol || "https";
-  const hostHdr = String(req.headers["x-forwarded-host"] || req.headers["host"] || "").split(",")[0].trim();
+  const proto = String(req.headers["x-forwarded-proto"]||"").split(",")[0].trim() || (req as any).protocol || "https";
+  const hostHdr = String(req.headers["x-forwarded-host"]||req.headers["host"]||"").split(",")[0].trim();
   const candidates = new Set<string>();
-  const add = (u: string) => { if (!u) return; candidates.add(u); candidates.add(u.endsWith("/") ? u.slice(0, -1) : u + "/"); };
+  const add = (u:string)=>{ if(!u) return; candidates.add(u); candidates.add(u.endsWith("/")?u.slice(0,-1):u+"/"); };
   add(withQuery); add(pathOnly);
-  if (hostHdr) { add(`${proto}://${hostHdr}${withQuery}`); add(`${proto}://${hostHdr}${pathOnly}`); }
-  if (PUBLIC_BASE_URL) { add(new URL(withQuery, PUBLIC_BASE_URL).toString()); add(new URL(pathOnly, PUBLIC_BASE_URL).toString()); }
+  if(hostHdr){ add(`${proto}://${hostHdr}${withQuery}`); add(`${proto}://${hostHdr}${pathOnly}`); }
+  if(PUBLIC_BASE_URL){ add(new URL(withQuery, PUBLIC_BASE_URL).toString()); add(new URL(pathOnly, PUBLIC_BASE_URL).toString()); }
 
-  const calc = Array.from(candidates).map(u => {
+  const calc = Array.from(candidates).map(u=>{
     const base = Buffer.concat([Buffer.from(method), Buffer.from(u), raw, Buffer.from(tsHeader)]);
     const h = crypto.createHmac("sha256", WEBHOOK_SECRET).update(base).digest("base64");
     return { u, h };
   });
-  const ok = calc.some(c => timingEqual(c.h, sigHeader));
+  const ok = calc.some(c=>timingEqual(c.h, sigHeader));
   res.status(204).end();
 
-  let parsed: any = null; try { parsed = JSON.parse(raw.toString("utf8")); } catch { }
+  let parsed:any=null; try{ parsed=JSON.parse(raw.toString("utf8")); } catch {}
   if (!ok || !Array.isArray(parsed)) return;
 
   for (const e of parsed) {
-    const isCall = String(e.subscriptionType || "").toLowerCase().includes("call") || String(e.objectTypeId || "") === "0-48";
-    if (isCall && e.propertyName === "hs_call_disposition") {
-      await handleNormalizedEvent({ source: "v3", eventId: e.eventId ?? e.attemptNumber, callId: e.objectId, outcome: e.propertyValue, occurredAt: e.occurredAt, raw: e });
+    const isCall = String(e.subscriptionType||"").toLowerCase().includes("call") || String(e.objectTypeId||"")==="0-48";
+    if (isCall && e.propertyName==="hs_call_disposition") {
+      await handleNormalizedEvent({ source:"v3", eventId:e.eventId??e.attemptNumber, callId:e.objectId, outcome:e.propertyValue, occurredAt:e.occurredAt, raw:e });
     }
-    if (isCall && e.propertyName === "hs_call_duration") {
+    if (isCall && e.propertyName==="hs_call_duration") {
       const ms = inferDurationMs(e.propertyValue);
-      await handleCallDurationEvent({ source: "v3", eventId: e.eventId ?? e.attemptNumber, callId: e.objectId, durationMs: ms, occurredAt: e.occurredAt, raw: e });
+      await handleCallDurationEvent({ source:"v3", eventId:e.eventId??e.attemptNumber, callId:e.objectId, durationMs:ms, occurredAt:e.occurredAt, raw:e });
     }
   }
 });
 
 // =============== HubSpot Workflow（Bearerのみ） ===============
-app.post("/webhooks/workflow", async (req: Request, res: Response) => {
-  if (!requireBearer(req, res)) return;
-  const b: any = (req as any).body || {};
+app.post("/webhooks/workflow", async (req: Request, res: Response)=>{
+  if(!requireBearer(req,res)) return;
+  const b:any = (req as any).body || {};
   const outcome = b.outcome || b.hs_call_disposition || b.properties?.hs_call_disposition;
   const callId = b.callId || b.engagementId || b.id;
   const occurredAt = b.endedAt || b.occurredAt || b.timestamp || b.properties?.hs_timestamp;
-  await handleNormalizedEvent({ source: "workflow", eventId: b.eventId || callId, callId, outcome, occurredAt, raw: b });
-  if (b.type === "call.duration") {
+  await handleNormalizedEvent({ source:"workflow", eventId:b.eventId||callId, callId, outcome, occurredAt, raw:b });
+  if (b.type==="call.duration") {
     const ms = inferDurationMs(b.durationMs ?? b.durationSec);
-    await handleCallDurationEvent({ source: "workflow", eventId: b.eventId || callId || `dur:${Date.now()}`, callId: callId || b.id, durationMs: ms, occurredAt, raw: b });
+    await handleCallDurationEvent({ source:"workflow", eventId:b.eventId||callId||`dur:${Date.now()}`, callId:callId||b.id, durationMs:ms, occurredAt, raw:b });
   }
-  res.json({ ok: true });
+  res.json({ok:true});
 });
 
-// =============== Zoom Webhook（ts+base64 / HEX 両対応） ===============
-function readBearerFromHeaders(req: Request) {
-  for (const k of ["authorization", "x-authorization", "x-auth", "x-zoom-authorization", "zoom-authorization"]) {
-    const v = req.get(k); if (!v) continue; const m = v.trim().match(/^Bearer\s+(.+)$/i); return (m ? m[1] : v).trim();
-  }
-  return "";
-}
-function verifyZoomSignature(req: Request & { rawBody?: Buffer }) {
+// =============== Zoom Webhook（ts+base64 / HEXのみ 両対応） ===============
+function readBearerFromHeaders(req: Request){ for(const k of ["authorization","x-authorization","x-auth","x-zoom-authorization","zoom-authorization"]) { const v=req.get(k); if(!v) continue; const m=v.trim().match(/^Bearer\s+(.+)$/i); return (m?m[1]:v).trim(); } return ""; }
+function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   const header = req.get("x-zm-signature") || "";
-  if (!header) return { ok: false, why: "no_header" };
+  if(!header) return { ok:false, why:"no_header" };
   const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
 
-  // HEX variant
+  // HEXのみ variant (Zoom Phone 稀に)
   const mHex = header.match(/^v0=([a-f0-9]{64})$/i);
   if (mHex) {
     const sigHex = mHex[1].toLowerCase();
-    const eq = (hex: string) => { try { return crypto.timingSafeEqual(Buffer.from(sigHex, "hex"), Buffer.from(hex, "hex")); } catch { return false; } };
+    const eq = (hex:string)=>{ try{ return crypto.timingSafeEqual(Buffer.from(sigHex,"hex"), Buffer.from(hex,"hex")); }catch{return false;} };
     if (ZOOM_VERIFICATION_TOKEN) {
       const vt = crypto.createHmac("sha256", ZOOM_VERIFICATION_TOKEN).update(body).digest("hex");
-      if (eq(vt)) return { ok: true, variant: "hex_vtoken" };
+      if (eq(vt)) return { ok:true, variant:"hex_vtoken" };
     }
     if (ZOOM_WEBHOOK_SECRET) {
       const h1 = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(body).digest("hex");
-      const h2 = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update("v0" + body).digest("hex");
-      const h3 = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update("v0:" + body).digest("hex");
-      if (eq(h1) || eq(h2) || eq(h3)) return { ok: true, variant: "hex_secret" };
+      const h2 = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update("v0"+body).digest("hex");
+      const h3 = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update("v0:"+body).digest("hex");
+      if (eq(h1)||eq(h2)||eq(h3)) return { ok:true, variant:"hex_secret" };
     }
-    return { ok: false, why: "signature_mismatch_hex" };
+    return { ok:false, why:"signature_mismatch_hex" };
   }
 
   // v0:<ts>:<base64> / v0=<ts>:<base64>
   const m = header.match(/^v0[:=](\d+):([A-Za-z0-9+/=]+)$/);
-  if (!m) return { ok: false, why: "bad_format" };
+  if(!m) return { ok:false, why:"bad_format" };
   const ts = Number(m[1]); const sig = m[2];
-  const now = Math.floor(Date.now() / 1000); if (Math.abs(now - ts) > ZOOM_SIG_SKEW) return { ok: false, why: "timestamp_skew" };
-  if (!ZOOM_WEBHOOK_SECRET) return { ok: false, why: "no_secret" };
+  const now = Math.floor(Date.now()/1000); if(Math.abs(now-ts) > ZOOM_SIG_SKEW) return { ok:false, why:"timestamp_skew" };
+  if(!ZOOM_WEBHOOK_SECRET) return { ok:false, why:"no_secret" };
 
-  const macA = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(String(ts) + body).digest("base64");
+  const macA = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(String(ts)+body).digest("base64");
   const macB = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(`v0:${ts}:${body}`).digest("base64");
-  const eqB64 = (mac: string) => { try { return crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(sig)); } catch { return false; } };
-  return { ok: eqB64(macA) || eqB64(macB), variant: "v0_ts_b64" };
+  const eqB64 = (mac:string)=>{ try{ return crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(sig)); }catch{return false;} };
+  return { ok: eqB64(macA)||eqB64(macB), variant:"v0_ts_b64" };
 }
 
-// 方向（発信/着信）判定
-function detectDirection(raw: any, evType?: string): "outbound" | "inbound" | "unknown" {
-  const d = String(
-    raw?.direction ||
-    raw?.call_direction ||
-    raw?.callLog?.direction ||
-    raw?.call_logs?.[0]?.direction ||
-    ""
-  ).toLowerCase();
-
-  if (d.includes("out")) return "outbound";
-  if (d.includes("in")) return "inbound";
-
-  const et = String(evType || "").toLowerCase();
-  if (et.includes("caller_call_history_completed")) return "outbound";
-  if (et.includes("callee_call_history_completed")) return "inbound";
-
-  return "unknown";
-}
-
-// Zoom から duration を堅牢に取得
-function zoomDurationMs(raw: any): number {
-  // 代表的な候補（ms値 / 秒値 / start-end）
-  const tryNums = (...vals: any[]) => vals.map(Number).find(v => Number.isFinite(v) && v > 0);
-  const talkSec =
-    tryNums(raw?.talk_time, raw?.call_log?.talk_time, raw?.call_logs?.[0]?.talk_time);
-  const msCandidate = tryNums(
-    raw?.duration_ms, raw?.call_duration_ms, raw?.durationMs, raw?.duration, raw?.call_duration
-  );
-  let ms = 0;
-  if (msCandidate) ms = msCandidate >= 100000 ? Math.floor(msCandidate) : Math.floor(msCandidate * 1000);
-  if (!ms && talkSec) ms = Math.floor(Number(talkSec) * 1000);
-
-  if (!ms && raw?.start_time && raw?.end_time) {
-    const st = new Date(raw.start_time).getTime();
-    const et = new Date(raw.end_time).getTime();
-    if (Number.isFinite(st) && Number.isFinite(et)) ms = Math.max(0, et - st);
-  }
-  return ms || 0;
-}
-
-app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Response) => {
-  const rawText = req.rawBody ? req.rawBody.toString("utf8") : undefined;
-  let b: any = (req as any).body || {};
-  if (!b || (Object.keys(b).length === 0 && rawText)) { try { b = JSON.parse(rawText!); } catch { } }
+app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Response)=>{
+  const rawText = req.rawBody? req.rawBody.toString("utf8"): undefined;
+  let b:any = (req as any).body || {};
+  if(!b || (Object.keys(b).length===0 && rawText)) { try{ b=JSON.parse(rawText!);}catch{} }
 
   // URL検証
   const plain = b?.plainToken || b?.payload?.plainToken || b?.event?.plainToken;
-  if (plain) {
+  if(plain){
     const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "dummy";
     const enc = crypto.createHmac("sha256", key).update(String(plain)).digest("hex");
-    return res.json({ plainToken: String(plain), encryptedToken: enc });
+    return res.json({ plainToken:String(plain), encryptedToken:enc });
   }
 
   // 認証
@@ -318,94 +302,90 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     const expected = ZOOM_BEARER_TOKEN || ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
     if (expected && readBearerFromHeaders(req) === expected) ok = true;
   }
-  if (!ok) return res.status(401).json({ ok: false, error: "auth" });
+  if(!ok) return res.status(401).json({ok:false,error:"auth"});
 
-  const raw = b?.payload?.object || b?.object || b || {};
-  const evType = String(b?.event || b?.payload?.event || raw?.event || "").trim();
+  // ==== ここから：Zoomの実データ処理 ====
+  const obj = b?.payload?.object || b?.object || {};
+  const info = pickZoomInfo(obj);
+  const resolvedEmail = info.email || (info.zid && ZOOM_UID2MAIL[String(info.zid)]) || undefined;
 
-  // 誰か（メール/ユーザーID）
-  const email =
-    raw.user_email || raw.owner_email || raw.caller_email || raw.callee_email || b.email;
-  const zid = raw.zoom_user_id || raw.user_id || raw.owner_id;
-  const whoRaw = { userEmail: email || (zid && ZOOM_UID2MAIL[String(zid)]) || undefined };
+  // 着信はスキップ（記録のみ）
+  if (String(info.dir) === "inbound") {
+    log(`[call] inbound (no XP) by=担当者 ${fmtJST(b.timestamp || info.endedAt || Date.now())}`);
+    appendJsonl("data/events/calls.jsonl", {
+      at: new Date().toISOString(),
+      day: isoDay(b.timestamp || info.endedAt),
+      callId: info.callId,
+      ms: info.ms || 0,
+      dir: info.dir || "inbound",
+      actor: { name: "担当者", email: resolvedEmail },
+    });
+    return res.json({ ok: true, accepted: true, inbound: true });
+  }
 
-  // 方向（発信/着信）
-  const direction = detectDirection(raw, evType);
-  raw.direction = direction;
-
-  // XPターゲットは発信者のみ。caller 以外は即スキップ（記録も不要ならここで返す）
-  const isCallerEvent =
-    /phone\.caller_call_history_completed/i.test(evType) ||
-    /caller call history completed/i.test(evType);
-  const isAiSummary =
-    /phone\.ai_call_summary_changed/i.test(evType) ||
-    /call summary changed/i.test(evType);
-
-  // Summary はXP付与しない（今は無視）
-  if (!isCallerEvent && !isAiSummary) return res.json({ ok: true, skipped: "non-caller event" });
-
-  // duration
-  const ms = zoomDurationMs(raw);
-  const callId =
-    raw.call_id || raw.session_id || raw.callID || raw.sessionID || b.id || `zoom:${Date.now()}`;
-
-  log(`[zoom] accepted event=${evType} callId=${callId} ms=${ms} dir=${direction}`);
+  // 発信のみXP（0秒でも +1XP は必ず付与）
+  log(`[zoom] accepted event=${b?.event || "unknown"} callId=${info.callId} ms=${info.ms||0} dir=${info.dir||"unknown"}`);
   await handleCallDurationEvent({
     source: "workflow",
-    eventId: b.event_id || callId,
-    callId,
-    durationMs: inferDurationMs(ms),
-    occurredAt: b.timestamp || raw.end_time || Date.now(),
-    raw: { ...whoRaw, ...raw }
+    eventId: b.event_id || info.callId,
+    callId: info.callId,
+    durationMs: inferDurationMs(info.ms),
+    occurredAt: b.timestamp || info.endedAt || Date.now(),
+    raw: { userEmail: resolvedEmail },
   });
-  res.json({ ok: true, accepted: true, ms, direction, evType });
+  return res.json({ ok:true, accepted:true, ms: info.ms || 0, dir: info.dir || "unknown" });
 });
 
 // =============== 正規化処理 & だれ特定 ===============
-type Normalized = { source: "v3" | "workflow"; eventId?: any; callId?: any; outcome?: string; occurredAt?: any; raw?: any; };
-function resolveActor(ev: { source: "v3" | "workflow"; raw?: any }): { name: string; email?: string } {
-  const raw = ev.raw || {};
-  let email: string | undefined =
-    raw.actorEmail || raw.ownerEmail || raw.userEmail ||
-    raw?.owner?.email || raw?.properties?.hs_created_by_user_id?.email || raw?.userEmail;
+type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
+function extractDxPortNameFromText(s?: string): string|undefined {
+  if(!s) return; const m=String(s).match(/DX\s*PORT(?:の|:)?\s*([^\n\r、，。・;；【】\[\]\(\)]+?)(?:\s*(?:さん|様|殿|君))?(?:$|[。．、，\s])/i);
+  return m?.[1] ? normSpace(m[1]).replace(/\s+/g," ").trim(): undefined;
+}
+function resolveActor(ev:{source:"v3"|"workflow"; raw?:any}):{name:string; email?:string}{
+  const raw = ev.raw||{};
+  let email: string|undefined =
+    raw.actorEmail || raw.ownerEmail || raw.userEmail || raw?.owner?.email || raw?.properties?.hs_created_by_user_id?.email || raw?.userEmail;
 
   const zid = raw.zoomUserId || raw.zoom_user_id || raw.user_id || raw.owner_id || raw.actorId || raw.userId;
-  if (!email && zid && ZOOM_UID2MAIL[String(zid)]) email = ZOOM_UID2MAIL[String(zid)];
+  if(!email && zid && ZOOM_UID2MAIL[String(zid)]) email = ZOOM_UID2MAIL[String(zid)];
 
   const hsUserId = raw.hsUserId || raw.createdById || raw.actorId || raw.userId;
-  const hsMap = safeParse<Record<string, { name?: string; email?: string }>>(HUBSPOT_USER_MAP_JSON);
+  const hsMap = safeParse<Record<string,{name?:string; email?:string}>>(HUBSPOT_USER_MAP_JSON);
   const mapped = hsUserId && hsMap ? hsMap[String(hsUserId)] : undefined;
 
-  const display = (mapped?.name) || (email ? String(email).split("@")[0] : undefined) || "担当者";
+  const display = (mapped?.name) || (email?String(email).split("@")[0]: undefined) || "担当者";
   const finalEmail = (email || mapped?.email || "").toLowerCase() || undefined;
   return { name: display, email: finalEmail };
 }
 
-async function handleNormalizedEvent(ev: Normalized) {
+async function handleNormalizedEvent(ev: Normalized){
   const id = ev.eventId ?? ev.callId;
   if (hasSeen(id)) return; markSeen(id);
 
-  const isAppt = String(ev.outcome || "").trim() && ["appointment_scheduled", "新規アポ"].includes(String(ev.outcome).toLowerCase());
+  const isAppt = String(ev.outcome||"").trim() && ["appointment_scheduled","新規アポ"].includes(String(ev.outcome).toLowerCase());
   if (isAppt) { await awardXpForAppointment(ev); await notifyChatworkAppointment(ev); }
-  else { log(`non-appointment outcome=${ev.outcome || "(empty)"}`); }
+  else { log(`non-appointment outcome=${ev.outcome||"(empty)"}`); }
 }
 
-// =============== Habitica付与（アポ） & Chatwork通知 ===============
-async function awardXpForAppointment(ev: Normalized) {
-  const who = resolveActor({ source: ev.source, raw: ev.raw });
+// =============== Habitica付与（アポ） & Chatwork通知（読みやすく） ===============
+async function awardXpForAppointment(ev: Normalized){
+  const who = resolveActor({source:ev.source, raw:ev.raw});
   const cred = getHabitica(who.email);
   const when = fmtJST(ev.occurredAt);
   if (!cred || DRY_RUN) {
-    log(`[XP] appointment (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name} @${when}`);
-    appendJsonl("data/events/appointments.jsonl", { at: new Date().toISOString(), day: isoDay(ev.occurredAt), callId: ev.callId, actor: who });
+    log(`[XP] appointment scheduled (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name} @${when}`);
+    appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
     return;
   }
   const todo = await createTodo(`🟩 新規アポ（${who.name}）`, `source=${ev.source}\ncallId=${ev.callId}\nwhen=${when}`, undefined, cred);
   const id = (todo as any)?.id; if (id) await completeTask(id, cred);
-  appendJsonl("data/events/appointments.jsonl", { at: new Date().toISOString(), day: isoDay(ev.occurredAt), callId: ev.callId, actor: who });
+  appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
 }
-function cwApptMessage(ev: Normalized) {
-  const who = resolveActor({ source: ev.source, raw: ev.raw });
+
+// Chatwork（ユーザーファーストで簡潔に）
+function cwApptMessage(ev: Normalized){
+  const who = resolveActor({source:ev.source, raw:ev.raw});
   const when = fmtJST(ev.occurredAt);
   return [
     "[info]",
@@ -418,63 +398,45 @@ function cwApptMessage(ev: Normalized) {
     "[/info]",
   ].join("\n");
 }
-function cwCallTotalizeMessage(name: string, addSteps: number, xp: number, day: string, totalMs: number) {
+function cwCallTotalizeMessage(name:string, addSteps:number, xp:number, day:string, totalMs:number){
   return [
     "[info]",
     "[title]📞 架電XP（累計）[/title]",
     `・担当：**${name}**`,
     `・付与：+${xp} XP（5分×${addSteps}）`,
-    `・本日累計：${(totalMs / 60000).toFixed(1)} 分`,
+    `・本日累計：${(totalMs/60000).toFixed(1)} 分`,
     `・日付：${day}`,
     "[/info]",
   ].join("\n");
 }
-async function notifyChatworkAppointment(ev: Normalized) {
-  try { await sendChatworkMessage(cwApptMessage(ev)); } catch { }
+async function notifyChatworkAppointment(ev: Normalized){
+  try { await sendChatworkMessage(cwApptMessage(ev)); } catch {}
 }
 
-// =============== 通話（+1XP & 累計5分ごと） ===============
-type CallDurEv = { source: "v3" | "workflow"; eventId?: any; callId?: any; durationMs: number; occurredAt?: any; raw?: any; };
-function inferDurationMs(v: any) { const n = Number(v); if (!Number.isFinite(n) || n <= 0) return 0; return n >= 100000 ? Math.floor(n) : Math.floor(n * 1000); }
+// =============== 通話（累計5分ごとXP） ===============
+type CallDurEv = { source:"v3"|"workflow"; eventId?:any; callId?:any; durationMs:number; occurredAt?:any; raw?:any; };
+function inferDurationMs(v:any){ const n=Number(v); if(!Number.isFinite(n)||n<=0) return 0; return n>=100000?Math.floor(n):Math.floor(n*1000); }
 
 // 累計ステート（日×メール）
 const CALL_STATE_FP = "data/state/call_totals.json";
-type CallState = Record<string, Record<string, { total_ms: number; steps_awarded: number }>>;
+type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:number }>>;
 function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
-function saveCallState(s: CallState) { writeJson(CALL_STATE_FP, s); }
+function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
 
-// per-call 追加加点（旧モード）
-function computePerCallExtra(ms: number) { return ms > 0 ? Math.floor(ms / CALL_XP_UNIT_MS) * CALL_XP_PER_5MIN : 0; }
-function computeNewSteps(totalMs: number, prevSteps: number) { const nowSteps = Math.floor(totalMs / CALL_XP_UNIT_MS); const add = Math.max(0, nowSteps - (prevSteps || 0)); return { nowSteps, add }; }
+// “5分ごと加点（ベース抜き）”
+function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
+function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
-async function awardXpForCallDuration(ev: CallDurEv) {
+async function awardXpForCallDuration(ev: CallDurEv){
   const when = fmtJST(ev.occurredAt);
-  const who = resolveActor({ source: ev.source, raw: ev.raw });
+  const who = resolveActor({source:ev.source, raw:ev.raw});
+  appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:ev.durationMs, actor:who});
 
-  // 方向（発信のみ XP 付与）
-  const dir = String(ev?.raw?.direction || "").toLowerCase();
-  const isOutbound = dir === "outbound" || dir === "caller";
-
-  // ログ保存（ダッシュボード用）— 着信も見えるように dir を保持
-  appendJsonl("data/events/calls.jsonl", {
-    at: new Date().toISOString(),
-    day: isoDay(ev.occurredAt),
-    callId: ev.callId,
-    ms: ev.durationMs,
-    dir: dir || "unknown",
-    actor: who
-  });
-
-  if (!isOutbound) {
-    log(`[call] inbound (no XP) by=${who.name} @${when}`);
-    return;
-  }
-
-  // 毎コール +1XP（環境変数不要 / 既定1）
+  // 仕様：毎コール +1XP（0秒でも付与）
   if (CALL_XP_PER_CALL > 0) {
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
-      log(`[call] per-call +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
+      log(`[call] per-call base +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
     } else {
       const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
       const notes = `rule=per-call+${CALL_XP_PER_CALL}`;
@@ -482,24 +444,24 @@ async function awardXpForCallDuration(ev: CallDurEv) {
         const todo = await createTodo(title, notes, undefined, cred);
         const id = (todo as any)?.id;
         if (id) await completeTask(id, cred);
-      } catch (e: any) {
-        console.error("[call] per-call habitica failed:", e?.message || e);
+      } catch(e:any){
+        console.error("[call] per-call habitica failed:", e?.message||e);
       }
     }
   }
 
-  // 累計方式（当日 5分ごと +2XP）
+  // 累計方式で付与（当日 5分ごと +2XP）
   if (CALL_TOTALIZE_5MIN) {
     const day = isoDay(ev.occurredAt);
-    const email = (who.email || "").toLowerCase();
+    const email = (who.email||"").toLowerCase();
     if (!email) { log("[call] totalize: no email"); return; }
 
     const st = loadCallState();
-    st[day] ??= {}; st[day][email] ??= { total_ms: 0, steps_awarded: 0 };
+    st[day] ??= {}; st[day][email] ??= { total_ms:0, steps_awarded:0 };
     st[day][email].total_ms += Math.max(0, Math.floor(ev.durationMs));
 
     const { nowSteps, add } = computeNewSteps(st[day][email].total_ms, st[day][email].steps_awarded);
-    if (add <= 0) { saveCallState(st); return; }
+    if (add<=0) { saveCallState(st); return; }
 
     const xp = add * CALL_XP_PER_5MIN;
     st[day][email].steps_awarded = nowSteps; saveCallState(st);
@@ -511,71 +473,66 @@ async function awardXpForCallDuration(ev: CallDurEv) {
     }
     const title = `📞 累計架電（${who.name}） +${xp}XP`;
     const notes = `day=${day}\nemail=${email}\ntotal_ms=${st[day][email].total_ms}\nsteps_awarded=${st[day][email].steps_awarded}`;
-    try {
-      const todo = await createTodo(title, notes, undefined, cred);
-      const id = (todo as any)?.id; if (id) await completeTask(id, cred);
-    } catch (e: any) {
-      console.error("[call-totalize] habitica failed:", e?.message || e);
-    }
-    if (CALL_CHATWORK_NOTIFY) { try { await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); } catch { } }
+    try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call-totalize] habitica failed:", e?.message||e); }
+    if (CALL_CHATWORK_NOTIFY) { try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{} }
     return;
   }
 
-  // （参考）旧：1コール内 “5分ごと” のみ
+  // 旧：1コール内で“5分ごと”の加点のみ（ベース+1は上で既に付与済）
   const xpExtra = computePerCallExtra(ev.durationMs);
-  if (xpExtra <= 0) return;
+  if (xpExtra<=0) return;
   const cred = getHabitica(who.email);
   if (!cred || DRY_RUN) { log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`); return; }
   const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
   const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${ev.durationMs}/${CALL_XP_UNIT_MS})`;
-  try { const todo = await createTodo(title, notes, undefined, cred); const id = (todo as any)?.id; if (id) await completeTask(id, cred); } catch (e: any) { console.error("[call] habitica extra failed:", e?.message || e); }
+  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
 }
 
-async function handleCallDurationEvent(ev: CallDurEv) {
+async function handleCallDurationEvent(ev: CallDurEv){
   const id = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
   if (hasSeen(id)) return; markSeen(id);
-  if (ev.durationMs <= 0 && CALL_XP_PER_CALL <= 0) return; // 0秒でも +1XP は付与するので、ベースが0の時だけ弾く
+  // ★ 0秒でも +1XP を付与するため、durationMs が 0 でも実行する
   await awardXpForCallDuration(ev);
 }
 
 // =============== CSV（簡略・既存互換） ===============
 function requireBearerCsv(req: Request, res: Response): boolean {
-  const token = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length === 0) { res.status(500).json({ ok: false, error: "missing tokens" }); return false; }
-  if (token === AUTH_TOKEN) return true;
+  const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
+  if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length===0) { res.status(500).json({ok:false,error:"missing tokens"}); return false; }
+  if (token===AUTH_TOKEN) return true;
   if (CSV_UPLOAD_TOKENS.includes(token)) return true;
-  res.status(401).json({ ok: false, error: "auth" }); return false;
+  res.status(401).json({ok:false,error:"auth"}); return false;
 }
-app.post("/admin/csv", express.text({ type: "text/csv", limit: "10mb" }));
-app.post("/admin/csv", async (req: Request, res: Response) => {
-  if (!requireBearerCsv(req, res)) return;
-  const text = String((req as any).body || "");
-  const recs: any[] = csvParse(text, { columns: true, bom: true, skip_empty_lines: true, trim: true, relax_column_count: true });
-  let nA = 0, nS = 0, nM = 0, sum = 0;
+app.post("/admin/csv", express.text({ type:"text/csv", limit:"10mb" }));
+app.post("/admin/csv", async (req: Request, res: Response)=>{
+  if(!requireBearerCsv(req,res)) return;
+  const text = String((req as any).body||"");
+  const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
+  let nA=0, nS=0, nM=0, sum=0;
   for (const r of recs) {
-    const type = String(r.type || "").trim();
-    const email = r.email ? String(r.email).toLowerCase() : undefined;
-    const amount = r.amount != null ? Number(String(r.amount).replace(/[^\d.-]/g, "")) : undefined;
-    const maker = r.maker ? String(r.maker).trim() : undefined;
-    const id = String(r.id || `${type}:${email || "-"}:${maker || "-"}`).trim();
-    const date = r.date ? String(r.date) : undefined;
-    if (type === "approval") { nA++; appendJsonl("data/events/approvals.jsonl", { at: new Date().toISOString(), day: isoDay(date), email, actor: email ? { name: email.split("@")[0], email } : undefined, id, maker }); const cred = getHabitica(email); if (!DRY_RUN && cred) await addApproval(cred, 1, "CSV"); }
-    if (type === "sales") { nS++; sum += (amount || 0); appendJsonl("data/events/sales.jsonl", { at: new Date().toISOString(), day: isoDay(date), email, actor: email ? { name: email.split("@")[0], email } : undefined, id, maker, amount }); const cred = getHabitica(email); if (!DRY_RUN && cred && amount) await addSales(cred, amount, "CSV"); }
-    if (type === "maker") { nM++; appendJsonl("data/events/maker.jsonl", { at: new Date().toISOString(), day: isoDay(date), email, actor: email ? { name: email.split("@")[0], email } : undefined, id, maker }); const cred = getHabitica(email); if (!DRY_RUN && cred) await addMakerAward(cred, 1); }
+    const type = String(r.type||"").trim();
+    const email = r.email? String(r.email).toLowerCase(): undefined;
+    const amount = r.amount!=null? Number(String(r.amount).replace(/[^\d.-]/g,"")): undefined;
+    const maker = r.maker? String(r.maker).trim(): undefined;
+    const id = String(r.id || `${type}:${email||"-"}:${maker||"-"}`).trim();
+    const date = r.date? String(r.date): undefined;
+    if (type==="approval") { nA++; appendJsonl("data/events/approvals.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addApproval(cred,1, "CSV"); }
+    if (type==="sales")    { nS++; sum+=(amount||0); appendJsonl("data/events/sales.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker,amount}); const cred=getHabitica(email); if(!DRY_RUN&&cred&&amount) await addSales(cred, amount, "CSV"); }
+    if (type==="maker")    { nM++; appendJsonl("data/events/maker.jsonl",{at:new Date().toISOString(),day:isoDay(date),email,actor:email?{name:email.split("@")[0],email}:undefined,id,maker}); const cred=getHabitica(email); if(!DRY_RUN&&cred) await addMakerAward(cred,1); }
   }
-  try { await sendChatworkMessage(`[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`); } catch { }
-  res.json({ ok: true, mode: "upsert", received: recs.length, accepted: { approval: nA, sales: nS, maker: nM }, totalSales: sum, duplicates: 0, errors: 0 });
+  try{ await sendChatworkMessage(`[info][title]CSV取込[/title]承認 ${nA} / 売上 ${nS}(計¥${sum.toLocaleString()}) / メーカー ${nM}[/info]`);}catch{}
+  res.json({ ok:true, mode:"upsert", received:recs.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales:sum, duplicates:0, errors:0 });
 });
-app.get("/admin/template.csv", (_req, res) => {
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", 'attachment; filename="template.csv"');
+app.get("/admin/template.csv", (_req,res)=>{
+  res.setHeader("Content-Type","text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition",'attachment; filename="template.csv"');
   res.send("type,email,amount,maker,id,date,notes\napproval,info@example.com,0,,A-001,2025-09-08,承認OK\nsales,info@example.com,150000,,S-001,2025-09-08,受注\nmaker,info@example.com,,ACME,M-ACME-1,2025-09-08,最多メーカー\n");
 });
-app.get("/admin/upload", (_req, res) => {
+app.get("/admin/upload", (_req,res)=>{
   const html = `<!doctype html><meta charset="utf-8"/><title>CSV取込（手動）</title>
   <style>body{font-family:system-ui;max-width:860px;margin:2rem auto;padding:0 1rem}textarea{width:100%;min-height:160px}</style>
   <h1>CSV取込（手動）</h1>
-  <div><label>Base URL</label> <input id="base" size="40" value="${PUBLIC_BASE_URL || ""}"/>
+  <div><label>Base URL</label> <input id="base" size="40" value="${PUBLIC_BASE_URL||""}"/>
        <label>AUTH_TOKEN</label> <input id="tok" size="40"/></div>
   <p><input type="file" id="file" accept=".csv,text/csv"/> <button id="upload">アップロード</button></p>
   <p><textarea id="csv" placeholder="type,email,amount,maker,id,date,notes&#10;approval,info@example.com,0,,A-001,2025-09-08,承認OK"></textarea></p>
@@ -599,66 +556,62 @@ app.get("/admin/upload", (_req, res) => {
   res.type("html").send(html);
 });
 
-// =============== ダッシュボード（発信のみ集計） ===============
-app.get("/admin/dashboard", (_req, res) => {
-  const today = isoDay(), yest = isoDay(new Date(Date.now() - 86400000));
-  const rd = (fp: string) => readJsonlAll(fp);
-  const calls = rd("data/events/calls.jsonl");        // Zoom/HubSpotからの通話
+// =============== ダッシュボード（Zoom反映済） ===============
+app.get("/admin/dashboard", (_req,res)=>{
+  const today = isoDay(), yest = isoDay(new Date(Date.now()-86400000));
+  const rd = (fp:string)=> readJsonlAll(fp);
+  const calls = rd("data/events/calls.jsonl");        // Zoom/HubSpotからの通話（累計対象）
   const appts = rd("data/events/appointments.jsonl");
   const apprs = rd("data/events/approvals.jsonl");
   const sales = rd("data/events/sales.jsonl");
 
-  function agg(day: string) {
-    const by: Record<string, any> = {};
-    const nm = (a: any) => a?.actor?.name || (a?.email?.split?.("@")[0]) || "担当者";
-    // ★ 発信のみで集計
-    for (const x of calls.filter(v => v.day === day && v.dir !== 'inbound')) {
-      const k = nm(x); by[k] ??= { name: k, calls: 0, min: 0, appts: 0, apprs: 0, sales: 0 };
-      by[k].calls += 1; by[k].min += Math.round((x.ms || 0) / 60000);
-    }
-    for (const x of appts.filter(v => v.day === day)) { const k = nm(x); by[k] ??= { name: k, calls: 0, min: 0, appts: 0, apprs: 0, sales: 0 }; by[k].appts += 1; }
-    for (const x of apprs.filter(v => v.day === day)) { const k = nm(x); by[k] ??= { name: k, calls: 0, min: 0, appts: 0, apprs: 0, sales: 0 }; by[k].apprs += 1; }
-    for (const x of sales.filter(v => v.day === day)) { const k = nm(x); by[k] ??= { name: k, calls: 0, min: 0, appts: 0, apprs: 0, sales: 0 }; by[k].sales += Number(x.amount || 0); }
-    for (const k of Object.keys(by)) { const v = by[k]; v.rate = v.appts > 0 ? Math.round((v.apprs / v.appts) * 100) : 0; }
-    return Object.values(by).sort((a: any, b: any) => a.name.localeCompare(b.name));
+  function agg(day:string){
+    const by:Record<string, any> = {};
+    const nm = (a:any)=> a?.actor?.name || (a?.email?.split?.("@")[0]) || "担当者";
+    for(const x of calls.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].calls+=1; by[k].min+=Math.round((x.ms||0)/60000); }
+    for(const x of appts.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].appts+=1; }
+    for(const x of apprs.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].apprs+=1; }
+    for(const x of sales.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].sales+=Number(x.amount||0); }
+    for(const k of Object.keys(by)){ const v=by[k]; v.rate = v.appts>0? Math.round((v.apprs/v.appts)*100):0; }
+    return Object.values(by).sort((a:any,b:any)=>a.name.localeCompare(b.name));
   }
 
-  function aggMakers(day: string) {
-    const by: Record<string, { maker: string; count: number; sales: number }> = {};
-    for (const x of apprs.filter(v => v.day === day)) { const m = (x.maker || "").trim(); if (!m) continue; by[m] ??= { maker: m, count: 0, sales: 0 }; by[m].count += 1; }
-    for (const x of sales.filter(v => v.day === day)) { const m = (x.maker || "").trim(); if (!m) continue; by[m] ??= { maker: m, count: 0, sales: 0 }; by[m].sales += Number(x.amount || 0); }
-    return Object.values(by).sort((a, b) => b.count - a.count || b.sales - a.sales || a.maker.localeCompare(b.maker));
+  function aggMakers(day:string){
+    const by:Record<string,{maker:string;count:number;sales:number}> = {};
+    for(const x of apprs.filter(v=>v.day===day)){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].count+=1; }
+    for(const x of sales.filter(v=>v.day===day)){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].sales+=Number(x.amount||0); }
+    return Object.values(by).sort((a,b)=> b.count-a.count || b.sales-a.sales || a.maker.localeCompare(b.maker));
   }
 
-  const T = agg(today), Y = agg(yest), TM = aggMakers(today), YM = aggMakers(yest);
-  const Row = (r: any) => `<tr><td>${r.name}</td><td style="text-align:right">${r.calls}</td><td style="text-align:right">${r.min}</td><td style="text-align:right">${r.appts}</td><td style="text-align:right">${r.apprs}</td><td style="text-align:right">${r.rate}%</td><td style="text-align:right">¥${(r.sales || 0).toLocaleString()}</td></tr>`;
-  const RowM = (r: any) => `<tr><td>${r.maker}</td><td style="text-align:right">${r.count}</td><td style="text-align:right">¥${(r.sales || 0).toLocaleString()}</td></tr>`;
+  const T=agg(today), Y=agg(yest), TM=aggMakers(today), YM=aggMakers(yest);
+  const Row = (r:any)=>`<tr><td>${r.name}</td><td style="text-align:right">${r.calls}</td><td style="text-align:right">${r.min}</td><td style="text-align:right">${r.appts}</td><td style="text-align:right">${r.apprs}</td><td style="text-align:right">${r.rate}%</td><td style="text-align:right">¥${(r.sales||0).toLocaleString()}</td></tr>`;
+  const RowM= (r:any)=>`<tr><td>${r.maker}</td><td style="text-align:right">${r.count}</td><td style="text-align:right">¥${(r.sales||0).toLocaleString()}</td></tr>`;
   const html = `<!doctype html><meta charset="utf-8"><title>ダッシュボード</title>
   <style>body{font-family:system-ui;margin:2rem}table{border-collapse:collapse;min-width:760px}th,td{border:1px solid #ddd;padding:.45rem .55rem}th{background:#f7f7f7}h2{margin-top:2rem}</style>
   <h1>ダッシュボード</h1>
   <h2>本日 ${today}</h2>
-  <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead><tbody>${T.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
+  <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead><tbody>${T.map(Row).join("")||'<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
   <h2>メーカー別（承認ベース） 本日 ${today}</h2>
-  <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead><tbody>${TM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
+  <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead><tbody>${TM.map(RowM).join("")||'<tr><td colspan="3">データなし</td></tr>'}</tbody></table>
   <h2>前日 ${yest}</h2>
-  <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead><tbody>${Y.map(Row).join("") || '<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
+  <table><thead><tr><th>担当</th><th>コール</th><th>分</th><th>アポ</th><th>承認</th><th>承認率</th><th>売上</th></tr></thead><tbody>${Y.map(Row).join("")||'<tr><td colspan="7">データなし</td></tr>'}</tbody></table>
   <h2>メーカー別（承認ベース） 前日 ${yest}</h2>
-  <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead><tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>`;
+  <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead><tbody>${YM.map(RowM).join("")||'<tr><td colspan="3">データなし</td></tr>'}</tbody></table>`;
   res.type("html").send(html);
 });
 
 // =============== 診断API（誰が誰に紐づいてるか） ===============
-app.get("/admin/mapping", (req, res) => {
-  if (!requireBearer(req, res)) return;
-  res.json({ ok: true, habiticaEmails: Object.keys(HAB_MAP).sort(), nameEmailEntries: Object.keys(NAME2MAIL).length, zoomUserIdMapCount: Object.keys(ZOOM_UID2MAIL).length });
+app.get("/admin/mapping", (req,res)=>{
+  if(!requireBearer(req,res)) return;
+  res.json({ ok:true, habiticaEmails:Object.keys(HAB_MAP).sort(), nameEmailEntries:Object.keys(NAME2MAIL).length, zoomUserIdMapCount:Object.keys(ZOOM_UID2MAIL).length });
 });
-app.get("/admin/state/calls", (req, res) => {
-  if (!requireBearer(req, res)) return;
-  res.json({ ok: true, state: loadCallState() });
+app.get("/admin/state/calls", (req,res)=>{
+  if(!requireBearer(req,res)) return;
+  res.json({ ok:true, state: loadCallState() });
 });
 
 // =============== Start ===============
-app.listen(PORT, () => {
+app.listen(PORT, ()=>{
   log(`listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL}`);
   log(`[habitica] users=${Object.keys(HAB_MAP).length}, [name->email] entries=${Object.keys(NAME2MAIL).length}`);
 });
