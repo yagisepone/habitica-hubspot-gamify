@@ -584,7 +584,6 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
     const m = set.get(lc(c));
     if (m) return m;
   }
-  // 前方一致も許容
   for (const key of keys) {
     const k = lc(key);
     if (candidates.some(c => k.includes(lc(c)))) return key;
@@ -594,13 +593,10 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
 
 /**
  * 任意スキーマCSV -> 標準レコード配列に正規化
- * 標準レコード: { type:'approval'|'sales'|'maker', email?, amount?, maker?, id?, date? }
- * 1行から複数typeを生成可（例: メーカー成果→ maker + approval）
  */
 function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
-  // よくある見出しの候補
   const C_EMAIL  = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
   const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker"];
   const C_AMOUNT = ["金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額"];
@@ -608,28 +604,11 @@ function normalizeCsv(text: string){
   const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at"];
   const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果"];
   const C_TYPE   = ["type","種別","イベント種別"];
+  const C_NOTES  = ["notes","メモ","備考","コメント"];
 
   const out: Array<{type:"approval"|"sales"|"maker"; email?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string}> = [];
 
   for (const r of recs) {
-    // まず、標準スキーマ(type,email,amount,maker,id,date,notes)に合っていればそのまま採用
-    if (r.type || r.email || r.amount || r.maker) {
-      const t = String(r.type||"").trim().toLowerCase();
-      if (["approval","sales","maker"].includes(t)) {
-        out.push({
-          type: t as any,
-          email: r.email? String(r.email).toLowerCase(): undefined,
-          amount: numOrUndefined(r.amount),
-          maker: r.maker? String(r.maker).trim(): undefined,
-          id: r.id? String(r.id).trim(): undefined,
-          date: r.date? String(r.date).trim(): undefined,
-          notes: r.notes? String(r.notes): undefined,
-        });
-        continue;
-      }
-    }
-
-    // 自由形式ヘッダから推定
     const kEmail  = firstMatchKey(r, C_EMAIL);
     const kMaker  = firstMatchKey(r, C_MAKER);
     const kAmt    = firstMatchKey(r, C_AMOUNT);
@@ -637,44 +616,38 @@ function normalizeCsv(text: string){
     const kDate   = firstMatchKey(r, C_DATE);
     const kApf    = firstMatchKey(r, C_APPROV);
     const kType   = firstMatchKey(r, C_TYPE);
+    const kNotes  = firstMatchKey(r, C_NOTES);
 
     const email = kEmail ? String(r[kEmail]||"").toLowerCase().trim() : undefined;
     const maker = kMaker ? String(r[kMaker]||"").trim() : undefined;
     const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
     const rid = kId ? String(r[kId]||"").trim() : undefined;
     const date = kDate ? String(r[kDate]||"").trim() : undefined;
+    const notes = kNotes ? String(r[kNotes]||"").trim() : undefined;
 
-    // type列の指定があれば優先
+    // type列優先
     let explicitType: "approval"|"sales"|"maker"|undefined;
     if (kType) {
       const t = String(r[kType]||"").trim().toLowerCase();
       if (["approval","sales","maker"].includes(t)) explicitType = t as any;
     }
 
-    // 承認フラグっぽい列
-    const approved = kApf ? truthyJP(r[kApf]) : false;
+    // 承認判定（修正点: notesに"承認"を含めてもtrue）
+    const approved = kApf ? truthyJP(r[kApf]) : /承認/.test(String(notes||""));
 
-    // 生成方針：
-    // 1) 金額>0 → sales
-    // 2) 承認っぽい → approval
-    // 3) メーカー名があって、明確なtypeが無い → maker（＋ダッシュボード反映のため approval も同時に1件作成）
-    // 4) typeが明示されていればそれに従う
     if (explicitType === "sales" || (explicitType===undefined && amount && amount>0)) {
-      out.push({ type:"sales", email, amount, maker, id: rid, date, notes:"from CSV(auto)" });
+      out.push({ type:"sales", email, amount, maker, id: rid, date, notes });
       continue;
     }
     if (explicitType === "approval" || approved) {
-      out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(auto)" });
+      out.push({ type:"approval", email, maker, id: rid, date, notes });
       continue;
     }
     if (explicitType === "maker" || maker) {
-      // メーカー成果 → バッジ/XPin加え、ダッシュボード可視化のため approval も1件
-      out.push({ type:"maker",   email, maker, id: rid, date, notes:"from CSV(auto)" });
-      out.push({ type:"approval",email, maker, id: rid, date, notes:"from CSV(auto,maker-as-approval)" });
+      out.push({ type:"maker",   email, maker, id: rid, date, notes });
+      out.push({ type:"approval",email, maker, id: rid, date, notes:"(maker→approval)" });
       continue;
     }
-
-    // どれにも当たらない場合はスキップ（静かに無視）
   }
   return out;
 }
