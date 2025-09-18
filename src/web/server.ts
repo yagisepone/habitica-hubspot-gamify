@@ -31,9 +31,7 @@ app.use((req, res, next) => {
 // =============== Utils ===============
 function log(...a: any[]) { console.log("[web]", ...a); }
 function ensureDir(p: string) { fs.mkdirSync(p, { recursive: true }); }
-function appendJsonl(fp: string, obj: any) {
-  ensureDir(path.dirname(fp)); fs.appendFileSync(fp, JSON.stringify(obj) + "\n");
-}
+function appendJsonl(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.appendFileSync(fp, JSON.stringify(obj) + "\n"); }
 function readJsonlAll(fp: string): any[] {
   try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); } catch { return []; }
 }
@@ -66,7 +64,7 @@ function requireBearer(req: Request, res: Response): boolean {
 }
 
 // =============== 定数（安全弁） ===============
-const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms
+const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
 
 // --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
 // - 会話時間は talk_time（秒）最優先
@@ -165,13 +163,15 @@ const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",")
 
 // 日報ボーナス: ENV
 const DAILY_BONUS_XP = Number(process.env.DAILY_BONUS_XP || 10);
-const DAILY_TASK_MATCH = String(process.env.DAILY_TASK_MATCH || "日報")
-  .split(",").map(s => s.trim()).filter(Boolean);
+const DAILY_TASK_MATCH = String(process.env.DAILY_TASK_MATCH || "日報").split(",").map(s => s.trim()).filter(Boolean);
 const HABITICA_WEBHOOK_SECRET = process.env.HABITICA_WEBHOOK_SECRET || AUTH_TOKEN || "";
 
 // 新規アポ（仕様：+20XP＋バッジ）
 const APPOINTMENT_XP = Number(process.env.APPOINTMENT_XP || 20);
 const APPOINTMENT_BADGE_LABEL = process.env.APPOINTMENT_BADGE_LABEL || "🎯 新規アポ";
+// 受理アウトカム（カンマ区切り、大小区別なし）
+const APPOINTMENT_VALUES = String(process.env.APPOINTMENT_VALUES || "appointment_scheduled,新規アポ")
+  .split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
 
 // =============== 外部コネクタ ===============
 import { sendChatworkMessage } from "../connectors/chatwork.js";
@@ -195,9 +195,10 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-18-final3", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-18-final4", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
-    habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length
+    habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
+    apptValues: APPOINTMENT_VALUES
   });
 });
 app.get("/support", (_req,res)=>res.type("text/plain").send("Support page"));
@@ -375,9 +376,17 @@ async function handleNormalizedEvent(ev: Normalized){
   const id = ev.eventId ?? ev.callId;
   if (hasSeen(id)) return; markSeen(id);
 
-  const isAppt = String(ev.outcome||"").trim() && ["appointment_scheduled","新規アポ"].includes(String(ev.outcome).toLowerCase());
-  if (isAppt) { await awardXpForAppointment(ev); await notifyChatworkAppointment(ev); }
-  else { log(`non-appointment outcome=${ev.outcome||"(empty)"}`); }
+  const rawOutcome = String(ev.outcome || "").trim();
+  const outcomeLc = rawOutcome.toLowerCase();
+  const isAppt = !!rawOutcome && APPOINTMENT_VALUES.includes(outcomeLc);
+
+  if (isAppt) {
+    log(`[appt] matched outcome="${rawOutcome}" via APPOINTMENT_VALUES=${JSON.stringify(APPOINTMENT_VALUES)}`);
+    await awardXpForAppointment(ev);
+    await notifyChatworkAppointment(ev);
+  } else {
+    log(`non-appointment outcome=${rawOutcome||"(empty)"}`);
+  }
 }
 
 // =============== Habitica付与（アポ） & Chatwork通知 ===============
@@ -395,7 +404,7 @@ async function awardXpForAppointment(ev: Normalized){
   }
 
   try {
-    // 1) 専用APIがあれば最優先
+    // 1) コネクタ側の専用APIがあれば優先
     if (typeof habiticaAny.addAppointment === "function") {
       await habiticaAny.addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
     } else {
@@ -422,7 +431,7 @@ function cwApptMessage(ev: Normalized){
     `[title]🎉 新規アポ 獲得[/title]`,
     `・担当：**${who.name}**`,
     `・時刻：${when}`,
-    `・ソース：${ev.source.toUpperCase()}`,
+    `・ソース：${(ev.source || "").toUpperCase()}`,
     "",
     "この勢いで次の1件、行きましょう！💪",
     "[/info]",
@@ -781,5 +790,6 @@ app.listen(PORT, ()=>{
   log(`listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL}`);
   log(`[habitica] users=${Object.keys(HAB_MAP).length}, [name->email] entries=${Object.keys(NAME2MAIL).length}`);
   log(`[env] APPOINTMENT_XP=${APPOINTMENT_XP} DAILY_BONUS_XP=${DAILY_BONUS_XP} CALL_TOTALIZE_5MIN=${CALL_TOTALIZE_5MIN}`);
+  log(`[env] APPOINTMENT_VALUES=${JSON.stringify(APPOINTMENT_VALUES)}`);
 });
 export {};
