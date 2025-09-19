@@ -66,9 +66,9 @@ function requireBearer(req: Request, res: Response): boolean {
 // =============== 定数（安全弁） ===============
 const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
 
-// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
+// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠+異常値ガード） ---
 // - 会話時間は talk_time（秒）最優先
-// - 予備として start_time/end_time 差分を許容
+// - 予備として start_time/end_time 差分を許容（ただし talk_time が無いのに 2h 超は異常値として 0 に丸める）
 // - 1コールは最大3時間に丸める（無効値は0）
 // - endedAt は epoch(ms)
 function pickZoomInfo(obj: any) {
@@ -102,7 +102,9 @@ function pickZoomInfo(obj: any) {
     chosen?.talk_time ?? o.talk_time ?? chosen?.talkTime ?? o.talkTime;
 
   let ms = 0;
-  if (typeof talkSecCand === "number" && isFinite(talkSecCand)) {
+  const usedTalk = (typeof talkSecCand === "number" && isFinite(talkSecCand) && talkSecCand > 0);
+
+  if (usedTalk) {
     // 秒→ms
     ms = Math.max(0, Math.floor(talkSecCand * 1000));
   } else {
@@ -113,8 +115,10 @@ function pickZoomInfo(obj: any) {
     const et = etIso ? Date.parse(etIso) : NaN;
     if (Number.isFinite(st) && Number.isFinite(et)) {
       ms = Math.max(0, et - st);
+      // ★安全弁：talk_timeが無いのに差分が2時間超は異常値とみなして 0 に落とす
+      if (ms > 2 * 60 * 60 * 1000) ms = 0;
     } else {
-      ms = 0; // 無効は0に落とす（ここが重要）
+      ms = 0; // 無効は0に落とす
     }
   }
   // 最終クランプ
@@ -155,7 +159,7 @@ const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL
 const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
 // 架電XP
-// ★ +1XPは環境変数いらずで常時有効（デフォルト1）
+//+1XPは環境変数いらずで常時有効（デフォルト1）
 const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "0") === "1"; // 0=「コール内5分ごと」モード（既定）
 const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
   ? 1 : Number(process.env.CALL_XP_PER_CALL);
@@ -200,7 +204,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-18-final5", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-18-final6", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES
@@ -547,7 +551,14 @@ async function awardXpForCallDuration(ev: CallDurEv){
   }
 
   // B) コール内で5分ごと +2XP（コール終了でリセット）
-  const xpExtra = computePerCallExtra(durMs);
+  // ★安全弁：durMs が MAX_CALL_MS ちょうど（3h）は異常の可能性が高いので 5分加点は抑止（+1XP のみ）
+  let xpExtraBaseMs = durMs;
+  if (xpExtraBaseMs === MAX_CALL_MS) {
+    console.log("[call] guard: durMs hit MAX_CALL_MS; suppress 5min extra, keep +1XP only");
+    xpExtraBaseMs = 0;
+  }
+
+  const xpExtra = computePerCallExtra(xpExtraBaseMs);
   if (xpExtra<=0) return;
   const cred = getHabitica(who.email);
   if (!cred || DRY_RUN) {
@@ -556,7 +567,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
   const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
-  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${durMs}/${CALL_XP_UNIT_MS})`;
+  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${xpExtraBaseMs}/${CALL_XP_UNIT_MS})`;
   try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); console.log(`(5分加点) +${xpExtra}XP`); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
 }
 
@@ -584,6 +595,7 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
     const m = set.get(lc(c));
     if (m) return m;
   }
+  // 前方一致も許容
   for (const key of keys) {
     const k = lc(key);
     if (candidates.some(c => k.includes(lc(c)))) return key;
@@ -632,7 +644,7 @@ function normalizeCsv(text: string){
       if (["approval","sales","maker"].includes(t)) explicitType = t as any;
     }
 
-    // 承認判定（修正点: notesに"承認"を含めてもtrue）
+    // 承認判定（notesに"承認"を含めてもtrue）
     const approved = kApf ? truthyJP(r[kApf]) : /承認/.test(String(notes||""));
 
     if (explicitType === "sales" || (explicitType===undefined && amount && amount>0)) {
