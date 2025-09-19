@@ -1,5 +1,5 @@
 // server.ts
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import Busboy from "busboy"; // 将来の拡張用に残してOK
 import { parse as csvParse } from "csv-parse/sync";
@@ -15,6 +15,7 @@ app.use(
     verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
       (req as any).rawBody = Buffer.from(buf);
     },
+    limit: "1mb",
   })
 );
 // CORS（/admin配下のみ）
@@ -25,6 +26,8 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     if (req.method === "OPTIONS") return res.status(204).end();
   }
+  // 軽いセキュリティ系ヘッダ
+  res.setHeader("X-Content-Type-Options", "nosniff");
   next();
 });
 
@@ -63,9 +66,13 @@ function requireBearer(req: Request, res: Response): boolean {
   if (token !== AUTH_TOKEN) { res.status(401).json({ok:false,error:"auth"}); return false; }
   return true;
 }
+// 共通：非同期ルータを安全に実行
+const asyncHandler = <T extends (req: Request, res: Response, next: NextFunction) => any>(fn: T) =>
+  (req: Request, res: Response, next: NextFunction) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // =============== 定数（安全弁） ===============
 const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
+const MAX_XP_PER_CALL = Number(process.env.MAX_XP_PER_CALL || 20); // 1コールのXP上限
 
 // --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
 function pickZoomInfo(obj: any) {
@@ -195,16 +202,16 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-19-nototalize1", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-19-nototalize1+guard", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
-    apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
+    apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN, maxXpPerCall: MAX_XP_PER_CALL
   });
 });
 app.get("/support", (_req,res)=>res.type("text/plain").send("Support page"));
 
 // =============== HubSpot v3 Webhook（署名検証） ===============
-app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: Response)=>{
+app.post("/webhooks/hubspot", asyncHandler(async (req: Request & { rawBody?: Buffer }, res: Response)=>{
   const method = (req.method||"POST").toUpperCase();
   const withQuery = (req as any).originalUrl || (req as any).url || "/webhooks/hubspot";
   const urlObj = new URL(withQuery, "http://dummy.local");
@@ -243,10 +250,10 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
       await handleCallDurationEvent({ source:"v3", eventId:e.eventId??e.attemptNumber, callId:e.objectId, durationMs:ms, occurredAt:e.occurredAt, raw:e });
     }
   }
-});
+}));
 
 // =============== HubSpot Workflow（Bearerのみ） ===============
-app.post("/webhooks/workflow", async (req: Request, res: Response)=>{
+app.post("/webhooks/workflow", asyncHandler(async (req: Request, res: Response)=>{
   if(!requireBearer(req,res)) return;
   const b:any = (req as any).body || {};
   const outcome = b.outcome || b.hs_call_disposition || b.properties?.hs_call_disposition;
@@ -258,7 +265,7 @@ app.post("/webhooks/workflow", async (req: Request, res: Response)=>{
     await handleCallDurationEvent({ source:"workflow", eventId:b.eventId||callId||`dur:${Date.now()}`, callId:callId||b.id, durationMs:ms, occurredAt, raw:b });
   }
   res.json({ok:true});
-});
+}));
 
 // =============== Zoom Webhook（ts+base64 / HEXのみ 両対応） ===============
 function readBearerFromHeaders(req: Request){ for(const k of ["authorization","x-authorization","x-auth","x-zoom-authorization","zoom-authorization"]) { const v=req.get(k); if(!v) continue; const m=v.trim().match(/^Bearer\s+(.+)$/i); return (m?m[1]:v).trim(); } return ""; }
@@ -298,7 +305,7 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   return { ok: eqB64(macA)||eqB64(macB), variant:"v0_ts_b64" };
 }
 
-app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Response)=>{
+app.post("/webhooks/zoom", asyncHandler(async (req: Request & { rawBody?: Buffer }, res: Response)=>{
   const rawText = req.rawBody? req.rawBody.toString("utf8"): undefined;
   let b:any = (req as any).body || {};
   if(!b || (Object.keys(b).length===0 && rawText)) { try{ b=JSON.parse(rawText!);}catch{} }
@@ -313,7 +320,11 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
 
   // 認証
   let ok = false;
-  if (req.get("x-zm-signature")) ok = verifyZoomSignature(req).ok;
+  if (req.get("x-zm-signature")) {
+    const vr = verifyZoomSignature(req);
+    ok = vr.ok;
+    if (!ok) console.warn("[zoom] signature verify failed:", vr.why);
+  }
   if (!ok) {
     const expected = ZOOM_BEARER_TOKEN || ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "";
     if (expected && readBearerFromHeaders(req) === expected) ok = true;
@@ -350,7 +361,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     raw: { userEmail: resolvedEmail },
   });
   return res.json({ ok:true, accepted:true, ms: info.ms || 0, dir: info.dir || "unknown" });
-});
+}));
 
 // =============== 正規化処理 & だれ特定 ===============
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
@@ -475,6 +486,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
   appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:durMs, actor:who});
 
   // 仕様：毎コール +1XP（0秒でも付与）
+  let awardedBase = 0;
   if (CALL_XP_PER_CALL > 0) {
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
@@ -492,6 +504,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
         console.error("[call] per-call habitica failed:", e?.message||e);
       }
     }
+    awardedBase = CALL_XP_PER_CALL;
   }
 
   // ガード：MAX_CALL_MS ちょうど（または超えた結果でクランプ）になった通話は「長時間異常」の可能性があるので5分加点は抑止
@@ -500,18 +513,25 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
 
-  // B) コール内で5分ごと +2XP（コール終了でリセット）
-  const xpExtra = computePerCallExtra(durMs);
+  // 5分ごと +2XP（コール終了でリセット）＋ 1コール合計XP上限
+  let xpExtra = computePerCallExtra(durMs);
   if (xpExtra<=0) return;
-  const cred = getHabitica(who.email);
-  if (!cred || DRY_RUN) {
-    log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`);
-    console.log(`(5分加点) +${xpExtra}XP`);
+  // 上限キャップ
+  const capExtra = Math.max(0, Math.min(xpExtra, MAX_XP_PER_CALL - awardedBase));
+  if (capExtra <= 0) {
+    console.log(`[call] cap reached: total per-call XP capped at ${MAX_XP_PER_CALL}`);
     return;
   }
-  const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
-  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${durMs}/${CALL_XP_UNIT_MS})`;
-  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); console.log(`(5分加点) +${xpExtra}XP`); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
+
+  const cred = getHabitica(who.email);
+  if (!cred || DRY_RUN) {
+    log(`[call] per-call extra (5min) xp=${capExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`);
+    console.log(`(5分加点) +${capExtra}XP`);
+    return;
+  }
+  const title = `📞 架電（${who.name}） +${capExtra}XP（5分加点）`;
+  const notes = `extra: min(${CALL_XP_PER_5MIN}×floor(${durMs}/${CALL_XP_UNIT_MS}), cap=${MAX_XP_PER_CALL - awardedBase})`;
+  try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); console.log(`(5分加点) +${capExtra}XP`); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
 }
 
 async function handleCallDurationEvent(ev: CallDurEv){
@@ -639,7 +659,7 @@ function requireBearerCsv(req: Request, res: Response): boolean {
 }
 
 app.post("/admin/csv", express.text({ type:"text/csv", limit:"20mb" }));
-app.post("/admin/csv", async (req: Request, res: Response)=>{
+app.post("/admin/csv", asyncHandler(async (req: Request, res: Response)=>{
   if(!requireBearerCsv(req,res)) return;
   const text = String((req as any).body||"");
 
@@ -704,7 +724,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     duplicates: 0,
     errors: 0
   });
-});
+}));
 
 app.get("/admin/template.csv", (_req,res)=>{
   res.setHeader("Content-Type","text/csv; charset=utf-8");
@@ -811,7 +831,7 @@ function markDailyBonusGiven(email: string, day: string) {
   markSeen(key);
 }
 
-app.post("/webhooks/habitica", async (req: Request, res: Response) => {
+app.post("/webhooks/habitica", asyncHandler(async (req: Request, res: Response) => {
   const token = String((req.query.t || req.query.token || "")).trim();
   if (!token || token !== HABITICA_WEBHOOK_SECRET) {
     return res.status(401).json({ ok: false, error: "auth" });
@@ -856,7 +876,7 @@ app.post("/webhooks/habitica", async (req: Request, res: Response) => {
     console.error("[daily] habitica award failed:", e?.message || e);
     res.status(500).json({ ok: false });
   }
-});
+}));
 
 // === Habitica Webhook を全員分に自動登録（管理API） ===
 async function ensureHabiticaWebhook(email: string, cred: { userId: string; apiToken: string }) {
@@ -891,7 +911,7 @@ async function ensureHabiticaWebhook(email: string, cred: { userId: string; apiT
   return { ok: !!cj?.success, created: true };
 }
 
-app.post("/admin/habitica/setup-webhooks", async (req: Request, res: Response) => {
+app.post("/admin/habitica/setup-webhooks", asyncHandler(async (req: Request, res: Response) => {
   if (!requireBearer(req, res)) return;
   if (!HABITICA_WEBHOOK_SECRET) return res.status(400).json({ ok: false, error: "missing HABITICA_WEBHOOK_SECRET" });
 
@@ -905,11 +925,26 @@ app.post("/admin/habitica/setup-webhooks", async (req: Request, res: Response) =
     }
   }
   res.json({ ok: true, results });
+}));
+
+// =============== 予期しないエラー捕捉（プロセス） ===============
+process.on("unhandledRejection", (reason:any)=> {
+  console.error("[fatal] UnhandledRejection:", reason?.stack||reason);
+});
+process.on("uncaughtException", (err:any)=> {
+  console.error("[fatal] UncaughtException:", err?.stack||err);
+});
+
+// =============== Express エラーハンドラ ===============
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("[express-error]", err?.stack || err);
+  // Webhookは送信元に 2xx/4xx 返せないと再送地獄になるため、500でもJSONで応答
+  res.status(500).json({ ok:false, error:"internal_error" });
 });
 
 // =============== Start ===============
 app.listen(PORT, ()=>{
-  log(`listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL}`);
+  log(`listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL} maxXpPerCall=${MAX_XP_PER_CALL}`);
   log(`[habitica] users=${Object.keys(HAB_MAP).length}, [name->email] entries=${Object.keys(NAME2MAIL).length}`);
   log(`[env] APPOINTMENT_XP=${APPOINTMENT_XP} DAILY_BONUS_XP=${DAILY_BONUS_XP}`);
   log(`[env] APPOINTMENT_VALUES=${JSON.stringify(APPOINTMENT_VALUES)}`);
