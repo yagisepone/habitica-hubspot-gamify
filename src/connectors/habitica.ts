@@ -36,7 +36,7 @@ export async function createTodo(
     method: "POST",
     headers: h,
     body: JSON.stringify(body),
-  });
+  } as any);
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Habitica createTodo ${res.status}: ${JSON.stringify(json)}`);
   return json.data; // { id, ... }
@@ -49,10 +49,17 @@ export async function completeTask(taskId: string, cred?: HabiticaCred) {
   const res = await fetch(`${BASE}/tasks/${taskId}/score/up`, {
     method: "POST",
     headers: h,
-  });
+  } as any);
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Habitica completeTask ${res.status}: ${JSON.stringify(json)}`);
   return json.data;
+}
+
+/** 任意の“バッジ”（実態は記念ToDo）を演出付与 */
+export async function addBadge(cred: HabiticaCred, label: string, note?: string) {
+  const todo = await createTodo(`🏅 ${label}`, note ?? "badge", undefined, cred);
+  const id = (todo as any)?.id;
+  if (id) await completeTask(id, cred);
 }
 
 /** メーカー賞の演出（To-Do作成→即完了）。count 分だけ付与可 */
@@ -62,24 +69,46 @@ export async function addMakerAward(cred: HabiticaCred, count = 1) {
     const id = (todo as any)?.id;
     if (id) await completeTask(id, cred);
   }
+  // 記念バッジも追加（重複OK）
+  await addBadge(cred, "⚙ メーカー賞", "top maker of the day");
 }
 
-/** 互換：承認イベントをToDoとして記録（CSV取り込み向け） */
+/** 新規アポの“付与相当”演出（XP量はタイトル/notesで明示） */
+export async function addAppointment(
+  cred: HabiticaCred,
+  xp: number,
+  badgeLabel?: string
+) {
+  const title = `🟩 新規アポ +${xp}XP`;
+  const notes = `rule=appointment+${xp}`;
+  const todo = await createTodo(title, notes, undefined, cred);
+  const id = (todo as any)?.id;
+  if (id) await completeTask(id, cred);
+  if (badgeLabel) await addBadge(cred, badgeLabel, "appointment achieved");
+}
+
+/** 互換：承認イベント（CSV取り込み向け） */
 export async function addApproval(
   cred: HabiticaCred,
   amount: number,
   note?: string
 ) {
-  const title = `✅ 承認 ${Number(amount || 0).toLocaleString()}円`;
-  return createTodo(title, note ?? "CSV取り込み", undefined, cred);
+  const title = `✅ 承認 +30XP`;
+  const notes = `rule=approval+30\n${note ?? "CSV"}`;
+  const todo = await createTodo(title, notes, undefined, cred);
+  const id = (todo as any)?.id;
+  if (id) await completeTask(id, cred);
 }
 
-/** 互換：売上イベントをToDoとして記録（CSV取り込み向け） */
+/** 互換：売上イベント（CSV取り込み向け） */
 export async function addSales(
   cred: HabiticaCred,
   amount: number,
   note?: string
 ) {
-  const title = `💰 売上 ${Number(amount || 0).toLocaleString()}円`;
-  return createTodo(title, note ?? "CSV取り込み", undefined, cred);
+  const title = `💰 売上 +50XP（¥${Number(amount || 0).toLocaleString()}）`;
+  const notes = `rule=sales+50\n${note ?? "CSV"}`;
+  const todo = await createTodo(title, notes, undefined, cred);
+  const id = (todo as any)?.id;
+  if (id) await completeTask(id, cred);
 }

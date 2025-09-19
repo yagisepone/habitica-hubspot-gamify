@@ -67,7 +67,7 @@ function requireBearer(req: Request, res: Response): boolean {
 // =============== 定数（安全弁） ===============
 const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
 
-// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（caller_email最優先） ---
+// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
 function pickZoomInfo(obj: any) {
   const o = obj || {};
   const logs: any[] =
@@ -75,27 +75,34 @@ function pickZoomInfo(obj: any) {
     Array.isArray(o?.object?.call_logs) ? o.object.call_logs :
     [];
 
-  // アウトバウンド優先（なければ先頭）
+  // アウトバウンド優先で1件選ぶ（なければ先頭）
   const chosen =
     logs.find((x) => String(x?.direction || "").toLowerCase() === "outbound") ||
     logs[0] || o;
 
-  // ★ メールは caller_email を最優先（次点の候補は保険）
+  // メール候補
   const emailRaw =
-    chosen?.caller_email ||
-    o.caller_email ||
-    o.user_email || o.owner_email || o.callee_email ||
-    chosen?.callee_email || "";
+    o.user_email || o.owner_email || o.caller_email || o.callee_email ||
+    chosen?.caller_email || chosen?.callee_email || "";
   const email = String(emailRaw || "").toLowerCase() || undefined;
 
+  // user/owner のID（ZOOM_EMAIL_MAP_JSON 補完用）
+  const zid =
+    o.zoom_user_id || o.user_id || o.owner_id ||
+    chosen?.zoom_user_id || chosen?.user_id || chosen?.owner_id || undefined;
+
+  // 方向
   const dir = (String(chosen?.direction || o.direction || "").toLowerCase() || "unknown");
 
   // ====== 会話時間：talk_time（秒）最優先 ======
-  const talkSecCand = chosen?.talk_time ?? o.talk_time ?? chosen?.talkTime ?? o.talkTime;
+  const talkSecCand =
+    chosen?.talk_time ?? o.talk_time ?? chosen?.talkTime ?? o.talkTime;
+
   let ms = 0;
   if (typeof talkSecCand === "number" && isFinite(talkSecCand)) {
     ms = Math.max(0, Math.floor(talkSecCand * 1000)); // 秒→ms
   } else {
+    // 予備：start_time / end_time 差分（ISO文字列）
     const stIso = chosen?.start_time || o.start_time;
     const etIso = chosen?.end_time   || o.end_time   || chosen?.ended_at || o.ended_at;
     const st = stIso ? Date.parse(stIso) : NaN;
@@ -103,21 +110,23 @@ function pickZoomInfo(obj: any) {
     if (Number.isFinite(st) && Number.isFinite(et)) {
       ms = Math.max(0, et - st);
     } else {
-      ms = 0;
+      ms = 0; // 無効は0に落とす
     }
   }
   // 最終クランプ
   if (!Number.isFinite(ms) || ms < 0) ms = 0;
   if (ms > MAX_CALL_MS) ms = MAX_CALL_MS;
 
+  // callId
   const callId =
     o.call_id || o.session_id || chosen?.call_id || chosen?.session_id ||
     `zoom:${Date.now()}`;
 
+  // 終了時刻（epoch ms に正規化）
   const endIso = chosen?.end_time || o.end_time || chosen?.ended_at || o.ended_at;
   const endedAt = Number.isFinite(Date.parse(endIso)) ? Date.parse(endIso) : Date.now();
 
-  return { email, dir, ms, callId, endedAt };
+  return { email, zid, dir, ms, callId, endedAt };
 }
 
 // =============== ENV ===============
@@ -165,8 +174,22 @@ const APPOINTMENT_VALUES = String(process.env.APPOINTMENT_VALUES || "appointment
   .split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
 
 // =============== 外部コネクタ ===============
-import { sendChatworkMessage } from "../connectors/chatwork.js";
-import { createTodo, completeTask, addApproval, addSales, addMakerAward } from "../connectors/habitica.js";
+import {
+  sendChatworkMessage,
+  cwApptText,
+  cwApprovalText,
+  cwSalesText,
+  cwMakerAchievementText,
+} from "../connectors/chatwork.js";
+import {
+  createTodo,
+  completeTask,
+  addApproval,
+  addSales,
+  addMakerAward,
+  addAppointment,
+  addBadge,
+} from "../connectors/habitica.js";
 
 // =============== マップ構築 ===============
 type HabiticaCred = { userId: string; apiToken: string };
@@ -186,7 +209,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-19-nototalize1-caller-email", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-19-nototalize1", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -314,7 +337,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   // ==== Zoomの実データ処理 ====
   const obj = b?.payload?.object || b?.object || {};
   const info = pickZoomInfo(obj);
-  const resolvedEmail = info.email || undefined;
+  const resolvedEmail = info.email || (info.zid && ZOOM_UID2MAIL[String(info.zid)]) || undefined;
 
   // 着信はスキップ（記録のみ）
   if (String(info.dir) === "inbound") {
@@ -346,47 +369,21 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
 // =============== 正規化処理 & だれ特定 ===============
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
 function extractDxPortNameFromText(_s?: string): string|undefined { return undefined; } // 仕様外なら未使用
-
-// email最優先。NAME_EMAIL_MAP で email→名前 を逆引きして表示名を決定
 function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string; email?:string}{
-  const raw = ev.raw || {};
+  const raw = ev.raw||{};
+  let email: string|undefined =
+    raw.actorEmail || raw.ownerEmail || raw.userEmail || raw?.owner?.email || raw?.properties?.hs_created_by_user_id?.email || raw?.userEmail;
 
-  // 1) メールは zoom: raw.userEmail を最優先
-  let email: string | undefined =
-    raw.userEmail || raw.actorEmail || raw.ownerEmail ||
-    raw?.owner?.email || raw?.user?.email ||
-    raw?.properties?.hs_created_by_user_id?.email ||
-    raw?.createdBy?.email || undefined;
+  const zid = raw.zoomUserId || raw.zoom_user_id || raw.user_id || raw.owner_id || raw.actorId || raw.userId;
+  if(!email && zid && ZOOM_UID2MAIL[String(zid)]) email = ZOOM_UID2MAIL[String(zid)];
 
-  if (email) email = String(email).toLowerCase();
+  const hsUserId = raw.hsUserId || raw.createdById || raw.actorId || raw.userId;
+  const hsMap = safeParse<Record<string,{name?:string; email?:string}>>(HUBSPOT_USER_MAP_JSON);
+  const mapped = hsUserId && hsMap ? hsMap[String(hsUserId)] : undefined;
 
-  // 2) 名前候補（HubSpot経由など）
-  const nameCands: string[] = [
-    raw.actorName, raw.ownerName, raw.userName,
-    raw?.owner?.name, raw?.user?.name,
-    raw?.properties?.hs_created_by_user_id?.name,
-    raw?.createdBy?.name,
-  ].filter(Boolean).map((s:string)=>normSpace(String(s)));
-
-  // 3) emailが無ければ、名前→email 補完（NAME2MAIL）
-  if (!email) {
-    for (const n of nameCands) {
-      const via = NAME2MAIL[n];
-      if (via) { email = via.toLowerCase(); break; }
-    }
-  }
-
-  // 4) 表示名は email→名前 の逆引きを最優先（DX PORTの獲得者名をきれいに出す）
-  let display: string | undefined;
-  if (email) {
-    const rev = Object.entries(NAME2MAIL).find(([,m]) => String(m).toLowerCase() === email!)?.[0];
-    if (rev) display = normSpace(rev);
-  }
-  if (!display && nameCands.length) display = nameCands[0];
-  if (!display && email) display = email.split("@")[0];
-  if (!display) display = "担当者";
-
-  return { name: display, email };
+  const display = (mapped?.name) || (email?String(email).split("@")[0]: undefined) || "担当者";
+  const finalEmail = (email || mapped?.email || "").toLowerCase() || undefined;
+  return { name: display, email: finalEmail };
 }
 
 async function handleNormalizedEvent(ev: Normalized){
@@ -411,7 +408,6 @@ async function awardXpForAppointment(ev: Normalized){
   const who = resolveActor({source:ev.source as any, raw:ev.raw});
   const cred = getHabitica(who.email);
   const when = fmtJST(ev.occurredAt);
-  const habiticaAny: any = (() => { try { return require("../connectors/habitica.js"); } catch { return {}; } })();
 
   appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
 
@@ -421,38 +417,19 @@ async function awardXpForAppointment(ev: Normalized){
   }
 
   try {
-    // 1) コネクタ側に専用APIがあれば優先
-    if (typeof habiticaAny.addAppointment === "function") {
-      await habiticaAny.addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
-    } else {
-      // 2) フォールバック：Todo作成→即完了
-      const title = `🟩 新規アポ（${who.name}） +${APPOINTMENT_XP}XP`;
-      const notes = `rule=appointment+${APPOINTMENT_XP}\nbadge=${APPOINTMENT_BADGE_LABEL}\nwhen=${when}\ncallId=${ev.callId}`;
-      const todo = await createTodo(title, notes, undefined, cred);
-      const id = (todo as any)?.id; if (id) await completeTask(id, cred);
-      // 3) addBadge があれば付与
-      if (typeof habiticaAny.addBadge === "function") {
-        await habiticaAny.addBadge(cred, APPOINTMENT_BADGE_LABEL);
-      }
-    }
+    // +20XP相当 & バッジ演出
+    await addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
   } catch (e:any) {
     console.error("[appointment] habitica award failed:", e?.message||e);
   }
 }
 
-// 読みやすい通知文
-function cwApptMessage(ev: Normalized){
-  const who = resolveActor({source:ev.source as any, raw:ev.raw});
-  const when = fmtJST(ev.occurredAt);
-  return [
-    `🔥 **${who.name}** さんが「**新規アポ✨**」を獲得しました！`,
-    `時刻：${when} / ソース：${(ev.source || "").toUpperCase()}`,
-    "",
-    `ナイスコール！🙌 この調子でもう1件お願いします！`
-  ].join("\n");
-}
+// Chatwork: スクショ準拠の短文
 async function notifyChatworkAppointment(ev: Normalized){
-  try { await sendChatworkMessage(cwApptMessage(ev)); } catch {}
+  try {
+    const who = resolveActor({source:ev.source as any, raw:ev.raw});
+    await sendChatworkMessage(cwApptText(who.name));
+  } catch {}
 }
 
 // =============== 通話（+1XP ＆ 5分ごとXP） ===============
@@ -508,7 +485,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     }
   }
 
-  // ガード：MAX_CALL_MS に達した通話は異常の可能性 → 5分加点は抑止
+  // ガード：MAX_CALL_MS ちょうど（または超えた結果でクランプ）になった通話は「長時間異常」の可能性があるので5分加点は抑止
   if (durMs >= MAX_CALL_MS) {
     console.log("[call] guard: durMs hit MAX_CALL_MS; suppress 5min extra, keep +1XP only");
     return;
@@ -569,12 +546,12 @@ function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
   // よくある見出しの候補
-  const C_EMAIL  = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール","誰が獲得したか","獲得者メール"];
-  const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker","メーカー名(BillOneなど...)"];
-  const C_AMOUNT = ["金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額","報酬"];
+  const C_EMAIL  = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
+  const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker"];
+  const C_AMOUNT = ["金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額"];
   const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号"];
-  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at","商談開始日時","商談終了日時"];
-  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果","商談ステータス(承認 or 却下)"];
+  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at"];
+  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果"];
   const C_TYPE   = ["type","種別","イベント種別"];
 
   const out: Array<{type:"approval"|"sales"|"maker"; email?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string}> = [];
@@ -606,17 +583,7 @@ function normalizeCsv(text: string){
     const kApf    = firstMatchKey(r, C_APPROV);
     const kType   = firstMatchKey(r, C_TYPE);
 
-    let email = kEmail ? String(r[kEmail]||"").toLowerCase().trim() : undefined;
-
-    // 「獲得者の名前」だけが入るケースは NAME2MAIL で名前→メールに補完
-    if (!email) {
-      for (const [nm, em] of Object.entries(NAME2MAIL)) {
-        // ざっくり一致（全角/半角スペース正規化）
-        const val = (kEmail ? String(r[kEmail]||"") : "").replace(/\u3000/g," ").trim();
-        if (val && normSpace(nm) === normSpace(val)) { email = em.toLowerCase(); break; }
-      }
-    }
-
+    const email = kEmail ? String(r[kEmail]||"").toLowerCase().trim() : undefined;
     const maker = kMaker ? String(r[kMaker]||"").trim() : undefined;
     const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
     const rid = kId ? String(r[kId]||"").trim() : undefined;
@@ -683,33 +650,52 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
       nA++;
       appendJsonl("data/events/approvals.jsonl",{
         at:new Date().toISOString(), day:isoDay(date), email,
-        actor: email? {name: (Object.entries(NAME2MAIL).find(([,m]) => m===email)?.[0] || email.split("@")[0]), email}: undefined,
+        actor: email? {name: email.split("@")[0], email}: undefined,
         id, maker
       });
       const cred = getHabitica(email);
       if (!DRY_RUN && cred) await addApproval(cred, 1, "CSV");
+      // Chatwork 通知（承認）
+      try {
+        const actorName = email ? (email.split("@")[0]) : "担当者";
+        await sendChatworkMessage(cwApprovalText(actorName, maker));
+      } catch {}
     }
 
     if (type==="sales") {
       nS++; sum+=(amount||0);
       appendJsonl("data/events/sales.jsonl",{
         at:new Date().toISOString(), day:isoDay(date), email,
-        actor: email? {name: (Object.entries(NAME2MAIL).find(([,m]) => m===email)?.[0] || email.split("@")[0]), email}: undefined,
+        actor: email? {name: email.split("@")[0], email}: undefined,
         id, maker, amount
       });
       const cred = getHabitica(email);
       if (!DRY_RUN && cred && amount) await addSales(cred, amount, "CSV");
+      // Chatwork 通知（売上）
+      try {
+        const actorName = email ? (email.split("@")[0]) : "担当者";
+        await sendChatworkMessage(cwSalesText(actorName, amount, maker));
+      } catch {}
     }
 
     if (type==="maker") {
       nM++;
       appendJsonl("data/events/maker.jsonl",{
         at:new Date().toISOString(), day:isoDay(date), email,
-        actor: email? {name: (Object.entries(NAME2MAIL).find(([,m]) => m===email)?.[0] || email.split("@")[0]), email}: undefined,
+        actor: email? {name: email.split("@")[0], email}: undefined,
         id, maker
       });
       const cred = getHabitica(email);
-      if (!DRY_RUN && cred) await addMakerAward(cred,1);
+      if (!DRY_RUN && cred) {
+        await addMakerAward(cred,1); // 🏆メーカー賞 + 記念バッジ
+      }
+      // Chatwork 通知（メーカー別成果）
+      try {
+        const actorName = email ? (email.split("@")[0]) : "担当者";
+        await sendChatworkMessage(
+          cwMakerAchievementText(actorName, maker /* メーカー名 */)
+        );
+      } catch {}
     }
   }
 

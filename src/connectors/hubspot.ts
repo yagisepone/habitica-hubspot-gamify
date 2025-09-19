@@ -9,10 +9,10 @@ async function hsFetch(url: string, init: RequestInit = {}) {
     "Content-Type": "application/json",
     ...(init.headers || {}),
   };
-  const res = await fetch(url, { ...init, headers });
+  const res = await fetch(url, { ...init, headers } as any);
   const json = await res.json().catch(() => undefined);
   if (!res.ok) {
-    const msg = JSON.stringify(json);
+    const msg = json ? JSON.stringify(json) : String(await res.text().catch(() => ""));
     throw new Error(`HubSpot ${res.status}: ${msg}`);
   }
   return json;
@@ -40,7 +40,7 @@ export async function hsFindContactIdByEmail(email: string): Promise<string | un
       limit: 1,
     }),
   });
-  const id = res?.results?.[0]?.id;
+  const id = (res as any)?.results?.[0]?.id;
   return typeof id === "string" ? id : undefined;
 }
 
@@ -54,7 +54,7 @@ export async function hsAssociateNoteToContact(noteId: string, contactId: string
 /** 便利ワンショット：Note作成→（あれば）emailの連絡先に紐付け */
 export async function hsCreateNoteOptionallyAssociate(body: string, email?: string) {
   const note = await hsCreateNote(body);
-  const noteId = note?.id;
+  const noteId = (note as any)?.id;
   if (email && noteId) {
     const cid = await hsFindContactIdByEmail(email).catch(() => undefined);
     if (cid) {
