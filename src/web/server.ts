@@ -63,6 +63,17 @@ function requireBearer(req: Request, res: Response): boolean {
   if (token !== AUTH_TOKEN) { res.status(401).json({ok:false,error:"auth"}); return false; }
   return true;
 }
+function parseDateLoose(v:any): number|undefined {
+  if (!v) return undefined;
+  const s = String(v).trim();
+  if (!s) return undefined;
+  const t = Date.parse(s);
+  if (Number.isFinite(t)) return t;
+  // 2025-09-19 11:00 のような半角スペース区切りも許容
+  const ss = s.replace(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})(?::\d{2})?/, "$1T$2:00");
+  const t2 = Date.parse(ss);
+  return Number.isFinite(t2) ? t2 : undefined;
+}
 
 // =============== 定数（安全弁） ===============
 const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
@@ -180,8 +191,8 @@ import { createTodo, completeTask, addApproval, addSales, addMakerAward } from "
 // =============== マップ構築 ===============
 type HabiticaCred = { userId: string; apiToken: string };
 function buildHabiticaMap(s: string){ const p = safeParse<Record<string,HabiticaCred>>(s)||{}; const out:Record<string,HabiticaCred>={}; for(const [k,v] of Object.entries(p)){ if(v?.userId && v?.apiToken) out[k.toLowerCase()]={userId:String(v.userId),apiToken:String(v.apiToken)}; } return out; }
-function buildNameEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [n,e] of Object.entries(p)){ if(!n||!e) continue; out[normSpace(n)] = String(e).toLowerCase(); } return out; }
-function buildZoomEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [z,e] of Object.entries(p)){ if(!z||!e) continue; out[z]=String(e).toLowerCase(); } return out; }
+function buildNameEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [n,e] of Object.entries(p)){ if(!n||!e) continue; out[normSpace(n)] = e.toLowerCase(); } return out; }
+function buildZoomEmailMap(s: string){ const p = safeParse<Record<string,string>>(s)||{}; const out:Record<string,string>={}; for(const [z,e] of Object.entries(p)){ if(!z||!e) continue; out[z]=e.toLowerCase(); } return out; }
 const HAB_MAP = buildHabiticaMap(HABITICA_USERS_JSON);
 const NAME2MAIL = buildNameEmailMap(NAME_EMAIL_MAP_JSON);
 const ZOOM_UID2MAIL = buildZoomEmailMap(ZOOM_EMAIL_MAP_JSON);
@@ -195,7 +206,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-19-fullcsv1", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-19-nototalize1-dxportname", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -423,17 +434,18 @@ async function awardXpForAppointment(ev: Normalized){
   }
 }
 
-// ★ご指定の Chatwork 文言に変更
 function cwApptMessage(ev: Normalized){
   const who = resolveActor({source:ev.source as any, raw:ev.raw});
   const when = fmtJST(ev.occurredAt);
   return [
-    "皆さんお疲れ様です！",
+    "[info]",
+    `[title]🎉 新規アポ 獲得[/title]`,
+    `・担当：**${who.name}**`,
+    `・時刻：${when}`,
+    `・ソース：${(ev.source || "").toUpperCase()}`,
     "",
-    `🔥 **${who.name}** さんが「**新規アポ**」を獲得しました！ 💪🔥`,
-    `時刻：${when} / ソース：${(ev.source || "").toUpperCase()}`,
-    "",
-    "ナイスコール！🙌 この調子でもう1件お願いします！💥",
+    "この勢いで次の1件、行きましょう！💪",
+    "[/info]",
   ].join("\n");
 }
 async function notifyChatworkAppointment(ev: Normalized){
@@ -519,137 +531,95 @@ async function handleCallDurationEvent(ev: CallDurEv){
   await awardXpForCallDuration(ev); // ★ durationMs=0 でも per-call +1XP のため実行
 }
 
-// =============== CSV（承認・売上・メーカー賞 取り込み：自動マッピング対応） ===============
-// 承認判定の強化
+// =============== CSV（承認・売上・メーカー賞 取り込み：DX PORT獲得者名 -> email解決） ===============
 function truthyJP(v: any) {
   const s = String(v ?? "").trim().toLowerCase();
-  if (!s) return false;
-  const yes = ["1","true","yes","y","on","済","◯","〇","ok","承認","approved","approve","accept","accepted","success","合格"];
-  return yes.some(t => s.includes(t));
-}
-function falsyJP(v: any) {
-  const s = String(v ?? "").trim().toLowerCase();
-  if (!s) return false;
-  const no = ["0","false","no","n","off","未","×","✗","却下","reject","rejected","fail","失敗","否","ng"];
-  return no.some(t => s.includes(t));
-}
-function isApprovedStatus(v: any) {
-  if (truthyJP(v)) return true;
-  if (falsyJP(v)) return false;
-  return false;
-}
-function emailFromNameLike(name?: string) {
-  const n = normSpace(name);
-  if (!n) return undefined;
-  return NAME2MAIL[n];
+  return ["1","true","yes","y","on","済","◯","〇","ok","承認","approved","done"].some(t => s.includes(t));
 }
 function numOrUndefined(v:any){
   if (v==null) return undefined;
   const n = Number(String(v).replace(/[^\d.-]/g,""));
   return Number.isFinite(n) ? n : undefined;
 }
-function firstMatchKey(row: any, candidates: string[]): string|undefined {
+function firstMatchKey(row: any, candidates: string[], {excludeKeys=[]}:{excludeKeys?:string[]} = {}){
   const keys = Object.keys(row||{});
   const lc = (x:string)=>x.toLowerCase().replace(/\s+/g,"");
   const set = new Map(keys.map(k=>[lc(k),k]));
   for (const c of candidates) {
     const m = set.get(lc(c));
-    if (m) return m;
+    if (m && !excludeKeys.some(x => lc(m).includes(lc(x)))) return m;
   }
   // 前方一致も許容
   for (const key of keys) {
     const k = lc(key);
+    if (excludeKeys.some(x=>k.includes(lc(x)))) continue;
     if (candidates.some(c => k.includes(lc(c)))) return key;
   }
   return undefined;
 }
-function pickDateFromRow(row: any, kEnd?: string, kStart?: string, kGeneric?: string) {
-  const endRaw   = kEnd   ? row[kEnd]   : undefined;
-  const startRaw = kStart ? row[kStart] : undefined;
-  const genRaw   = kGeneric ? row[kGeneric] : undefined;
-  const cand = [endRaw, startRaw, genRaw].find(v => !!String(v||"").trim());
-  return cand ? String(cand).trim() : undefined;
-}
 
 /**
- * 任意スキーマCSV -> 標準レコード配列に正規化
+ * 任意スキーマCSV -> 標準レコード配列に正規化（DX PORT「獲得者の名前」優先でメール解決）
  * 標準レコード: { type:'approval'|'sales'|'maker', email?, amount?, maker?, id?, date? }
  * 1行から複数typeを生成可（例: メーカー成果→ maker + approval）
- * 追加対応: メーカー名(BillOne...), 報酬, 商談開始/終了日時, 商談ステータス(承認/却下), 獲得者の名前
  */
 function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
-  // ヘッダー候補
-  const C_EMAIL   = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
-  const C_NAME    = ["獲得者の名前","担当者名","担当","担当者","営業","だれ","誰が獲得したか"];
-  const C_MAKER   = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker","メーカー名(BillOneなど...)"];
+  // よくある見出しの候補（※相手企業の「担当者」列は意図的に使わない）
+  const C_MAKER   = ["メーカー名","メーカー","brand","maker","メーカー名（取引先）"];
   const C_AMOUNT  = ["報酬","金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額"];
   const C_ID      = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号"];
-  const C_DATEGEN = ["date","日付","作成日","成約日","承認日","登録日","received at","created at"];
-  const C_DATE_ST = ["商談開始日時","開始日時","start time","started at","start_at"];
-  const C_DATE_EN = ["商談終了日時","終了日時","end time","ended at","end_at","完了日時"];
-  const C_STATUS  = ["商談ステータス","ステータス","結果","承認","承認済み","status","approval","approved"];
-  const C_TYPE    = ["type","種別","イベント種別"];
+  const C_DATE_END= ["商談終了日時","終了日時","end","ended at","closedate","ended_at"];
+  const C_DATE_ST = ["商談開始日時","開始日時","start","started at","startdate","started_at"];
+  const C_STATUS  = ["商談ステータス","ステータス","結果","status","approval"];
+  const C_WINNER  = ["獲得者の名前","獲得者","承認条件 回答23","承認条件回答23","DX PORT 獲得者の名前","DXPORT獲得者の名前"];
 
   const out: Array<{type:"approval"|"sales"|"maker"; email?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string}> = [];
 
   for (const r of recs) {
-    const kEmail   = firstMatchKey(r, C_EMAIL);
-    const kName    = firstMatchKey(r, C_NAME);
+    // 値の抽出
     const kMaker   = firstMatchKey(r, C_MAKER);
     const kAmt     = firstMatchKey(r, C_AMOUNT);
     const kId      = firstMatchKey(r, C_ID);
-    const kDateG   = firstMatchKey(r, C_DATEGEN);
-    const kDateSt  = firstMatchKey(r, C_DATE_ST);
-    const kDateEn  = firstMatchKey(r, C_DATE_EN);
+    const kDateE   = firstMatchKey(r, C_DATE_END);
+    const kDateS   = firstMatchKey(r, C_DATE_ST);
     const kStatus  = firstMatchKey(r, C_STATUS);
-    const kType    = firstMatchKey(r, C_TYPE);
+    const kWinner  = firstMatchKey(r, C_WINNER);
 
-    // email 確定：メール列 > 名前→NAME_EMAIL_MAP の順
-    let email = kEmail ? String(r[kEmail]||"").toLowerCase().trim() : undefined;
-    if (!email && kName) {
-      const byName = emailFromNameLike(String(r[kName]||""));
-      if (byName) email = String(byName).toLowerCase();
-    }
-
-    const maker  = kMaker ? String(r[kMaker]||"").trim() : undefined;
+    const maker = kMaker ? String(r[kMaker]||"").trim() : undefined;
     const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
-    const rid    = kId ? String(r[kId]||"").trim() : undefined;
-    const date   = pickDateFromRow(r, kDateEn, kDateSt, kDateG);
-    const approved = kStatus ? isApprovedStatus(r[kStatus]) : false;
+    const rid = kId ? String(r[kId]||"").trim() : undefined;
 
-    let explicitType: "approval"|"sales"|"maker"|undefined;
-    if (kType) {
-      const t = String(r[kType]||"").trim().toLowerCase();
-      if (["approval","sales","maker"].includes(t)) explicitType = t as any;
-    }
+    // 日付：終了 > 開始 > 取込日（本日）
+    const dtE = kDateE ? parseDateLoose(r[kDateE]) : undefined;
+    const dtS = (!dtE && kDateS) ? parseDateLoose(r[kDateS]) : undefined;
+    const date = isoDay(dtE ?? dtS ?? Date.now());
 
-    // 優先：type 指定
-    if (explicitType === "sales") {
-      out.push({ type:"sales", email, amount, maker, id: rid, date, notes:"from CSV(type=sales)" });
-      continue;
-    }
-    if (explicitType === "approval") {
-      out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(type=approval)" });
-      continue;
-    }
-    if (explicitType === "maker") {
-      out.push({ type:"maker", email, maker, id: rid, date, notes:"from CSV(type=maker)" });
-      out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(maker-as-approval)" });
-      continue;
-    }
+    // 承認ステータス
+    const statusVal = kStatus ? String(r[kStatus]||"").trim() : "";
+    const approved = truthyJP(statusVal);
 
-    // 自動判定
-    if (amount && amount > 0) {
-      out.push({ type:"sales", email, amount, maker, id: rid, date, notes:"from CSV(auto:amount)" });
+    // DX PORT「獲得者の名前」→ email解決（NAME_EMAIL_MAP）
+    const winnerName = kWinner ? normSpace(String(r[kWinner]||"")) : "";
+    const email = winnerName && NAME2MAIL[winnerName] ? NAME2MAIL[winnerName] : undefined;
+
+    // 生成方針：
+    // 1) 金額>0 → sales
+    // 2) 承認っぽい → approval
+    // 3) メーカー名があれば → maker（ダッシュボード反映用に approval も1件作る、ただしすでに承認が立っていれば重複しない）
+    if (amount && amount>0) {
+      out.push({ type:"sales", email, amount, maker, id: rid, date, notes:`from CSV(auto) winner=${winnerName}` });
     }
     if (approved) {
-      out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(auto:status)" });
+      out.push({ type:"approval", email, maker, id: rid, date, notes:`from CSV(auto) winner=${winnerName}` });
     }
     if (maker) {
-      out.push({ type:"maker",   email, maker, id: rid, date, notes:"from CSV(auto:maker)" });
-      out.push({ type:"approval",email, maker, id: rid, date, notes:"from CSV(auto:maker-as-approval)" });
+      // 承認が既に追加済みでない場合のみ maker-as-approval を追加
+      if (!approved) {
+        out.push({ type:"approval", email, maker, id: rid, date, notes:`from CSV(auto,maker-as-approval) winner=${winnerName}` });
+      }
+      out.push({ type:"maker", email, maker, id: rid, date, notes:`from CSV(auto) winner=${winnerName}` });
     }
   }
   return out;
@@ -668,7 +638,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
   if(!requireBearerCsv(req,res)) return;
   const text = String((req as any).body||"");
 
-  // 標準 or 自由形式を吸収
+  // 標準 or 自由形式を吸収（DX PORTの「獲得者の名前」優先でメール解決）
   const normalized = normalizeCsv(text);
 
   let nA=0, nS=0, nM=0, sum=0;
@@ -688,7 +658,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
         id, maker
       });
       const cred = getHabitica(email);
-      if (!DRY_RUN && cred) await addApproval(cred, 1, "CSV");
+      if (!DRY_RUN && cred) try { await addApproval(cred, 1, "CSV"); } catch {}
     }
 
     if (type==="sales") {
@@ -699,7 +669,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
         id, maker, amount
       });
       const cred = getHabitica(email);
-      if (!DRY_RUN && cred && amount) await addSales(cred, amount, "CSV");
+      if (!DRY_RUN && cred && amount) try { await addSales(cred, amount, "CSV"); } catch {}
     }
 
     if (type==="maker") {
@@ -710,7 +680,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
         id, maker
       });
       const cred = getHabitica(email);
-      if (!DRY_RUN && cred) await addMakerAward(cred,1);
+      if (!DRY_RUN && cred) try { await addMakerAward(cred,1); } catch {}
     }
   }
 
@@ -735,8 +705,9 @@ app.get("/admin/template.csv", (_req,res)=>{
   res.setHeader("Content-Type","text/csv; charset=utf-8");
   res.setHeader("Content-Disposition",'attachment; filename="template.csv"');
   res.send(
-    "メーカー名(BillOneなど...),報酬,商談開始日時,商談終了日時,商談ステータス,獲得者の名前,ID\n"+
-    "ACME,50000,2025-09-18 10:00,2025-09-18 10:30,承認,川原 太郎,A-001\n"
+    // 最低限の日本語ヘッダー例（DX PORT獲得者の名前を使う）
+    "メーカー名,報酬,商談開始日時,商談終了日時,商談ステータス,獲得者の名前\n"+
+    "BillOne,150000,2025-09-19 10:30,2025-09-19 11:00,承認,荒井 太郎\n"
   );
 });
 
@@ -744,13 +715,13 @@ app.get("/admin/upload", (_req,res)=>{
   const html = `<!doctype html><meta charset="utf-8"/><title>CSV取込（手動）</title>
   <style>body{font-family:system-ui;max-width:860px;margin:2rem auto;padding:0 1rem}textarea{width:100%;min-height:160px}</style>
   <h1>CSV取込（手動）</h1>
-  <p>標準形式 <code>type,email,amount,maker,id,date,notes</code> に加えて、以下の日本語見出しにも対応します：<br>
-  「メーカー名(BillOneなど...) / 報酬 / 商談開始日時 / 商談終了日時 / 商談ステータス / 獲得者の名前」</p>
+  <p>DX PORTの<b>「獲得者の名前」</b>と <code>NAME_EMAIL_MAP</code> を突合して担当のメールを決定します。<br>
+     相手企業側の「担当者」「連絡先」等の列は無視します。</p>
   <div><label>Base URL</label> <input id="base" size="40" value="${PUBLIC_BASE_URL||""}"/>
        <label>AUTH_TOKEN</label> <input id="tok" size="40"/></div>
   <p><input type="file" id="file" accept=".csv,text/csv"/> <button id="upload">アップロード</button></p>
-  <p><textarea id="csv" placeholder="ここにCSVを貼り付けても送信できます（自動マッピング対応）"></textarea></p>
-  <p><button id="send">貼り付けCSVを送信</button> <a href="/admin/template.csv" target="_blank">テンプレートをダウンロード</a></p>
+  <p><textarea id="csv" placeholder="ここにCSVを貼り付けても送信できます（日本語ヘッダーOK：メーカー名/報酬/商談開始日時/商談終了日時/商談ステータス/獲得者の名前）"></textarea></p>
+  <p><button id="send">貼り付けCSVを送信</button></p>
   <pre id="out"></pre>
   <script>
     const qs=s=>document.querySelector(s); const out=qs('#out');
