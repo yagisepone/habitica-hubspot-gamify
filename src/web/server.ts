@@ -51,7 +51,8 @@ function timingEqual(a: string, b: string) {
 }
 function readEnvJsonOrFile(jsonVar: string, fileVar: string): string {
   const j = (process.env as any)[jsonVar]; if (j && String(j).trim()) return String(j).trim();
-  const fp = (process.env as any)[fileVar]; if (fp && String(fp).trim()) { try { return fs.readFileSync(String(fp).trim(),"utf8"); } catch {} }
+  const fp = (process.env as any)[fileVar]; if (fp && String(fp).trim()) { try { return fs.readFileSync(String(fp).trim(),"utf8"); } catch {}
+  }
   return "";
 }
 function safeParse<T=any>(s?: string): T|undefined { try { return s? JSON.parse(s) as T: undefined; } catch { return undefined; } }
@@ -66,11 +67,7 @@ function requireBearer(req: Request, res: Response): boolean {
 // =============== 定数（安全弁） ===============
 const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
 
-// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠+異常値ガード） ---
-// - 会話時間は talk_time（秒）最優先
-// - 予備として start_time/end_time 差分を許容（ただし talk_time が無いのに 2h 超は異常値として 0 に丸める）
-// - 1コールは最大3時間に丸める（無効値は0）
-// - endedAt は epoch(ms)
+// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
 function pickZoomInfo(obj: any) {
   const o = obj || {};
   const logs: any[] =
@@ -102,11 +99,8 @@ function pickZoomInfo(obj: any) {
     chosen?.talk_time ?? o.talk_time ?? chosen?.talkTime ?? o.talkTime;
 
   let ms = 0;
-  const usedTalk = (typeof talkSecCand === "number" && isFinite(talkSecCand) && talkSecCand > 0);
-
-  if (usedTalk) {
-    // 秒→ms
-    ms = Math.max(0, Math.floor(talkSecCand * 1000));
+  if (typeof talkSecCand === "number" && isFinite(talkSecCand)) {
+    ms = Math.max(0, Math.floor(talkSecCand * 1000)); // 秒→ms
   } else {
     // 予備：start_time / end_time 差分（ISO文字列）
     const stIso = chosen?.start_time || o.start_time;
@@ -115,8 +109,6 @@ function pickZoomInfo(obj: any) {
     const et = etIso ? Date.parse(etIso) : NaN;
     if (Number.isFinite(st) && Number.isFinite(et)) {
       ms = Math.max(0, et - st);
-      // ★安全弁：talk_timeが無いのに差分が2時間超は異常値とみなして 0 に落とす
-      if (ms > 2 * 60 * 60 * 1000) ms = 0;
     } else {
       ms = 0; // 無効は0に落とす
     }
@@ -159,13 +151,12 @@ const NAME_EMAIL_MAP_JSON  = readEnvJsonOrFile("NAME_EMAIL_MAP_JSON","NAME_EMAIL
 const ZOOM_EMAIL_MAP_JSON  = readEnvJsonOrFile("ZOOM_EMAIL_MAP_JSON","ZOOM_EMAIL_MAP_FILE");
 
 // 架電XP
-//+1XPは環境変数いらずで常時有効（デフォルト1）
-const CALL_TOTALIZE_5MIN = String(process.env.CALL_TOTALIZE_5MIN || "0") === "1"; // 0=「コール内5分ごと」モード（既定）
+// ★ 累計モードは廃止。常に「コール内5分ごと」方式のみ。
+const CALL_TOTALIZE_5MIN = false as const;
 const CALL_XP_PER_CALL = (process.env.CALL_XP_PER_CALL === undefined || process.env.CALL_XP_PER_CALL === "")
   ? 1 : Number(process.env.CALL_XP_PER_CALL);
 const CALL_XP_PER_5MIN   = Number(process.env.CALL_XP_PER_5MIN || 2);
 const CALL_XP_UNIT_MS    = Number(process.env.CALL_XP_UNIT_MS || 300000);
-const CALL_CHATWORK_NOTIFY = String(process.env.CALL_CHATWORK_NOTIFY || "0") === "1";
 
 // CSV UI 設定
 const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s=>s.trim()).filter(Boolean);
@@ -204,10 +195,10 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-18-final6", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-19-nototalize1", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
-    apptValues: APPOINTMENT_VALUES
+    apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
   });
 });
 app.get("/support", (_req,res)=>res.type("text/plain").send("Support page"));
@@ -222,7 +213,7 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const sigHeader = req.header("x-hubspot-signature-v3") || "";
   const raw: Buffer = (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body||""),"utf8");
 
-  // 署名候補（RenderのX-ForwardedやPUBLIC_BASE_URL差を吸収）
+  // 署名候補
   const proto = String(req.headers["x-forwarded-proto"]||"").split(",")[0].trim() || (req as any).protocol || "https";
   const hostHdr = String(req.headers["x-forwarded-host"]||req.headers["host"]||"").split(",")[0].trim();
   const candidates = new Set<string>();
@@ -276,7 +267,7 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   if(!header) return { ok:false, why:"no_header" };
   const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
 
-  // HEXのみ variant (Zoom Phone 稀に)
+  // HEXのみ variant
   const mHex = header.match(/^v0=([a-f0-9]{64})$/i);
   if (mHex) {
     const sigHex = mHex[1].toLowerCase();
@@ -446,17 +437,6 @@ function cwApptMessage(ev: Normalized){
     "[/info]",
   ].join("\n");
 }
-function cwCallTotalizeMessage(name:string, addSteps:number, xp:number, day:string, totalMs:number){
-  return [
-    "[info]",
-    "[title]📞 架電XP（累計）[/title]",
-    `・担当：**${name}**`,
-    `・付与：+${xp} XP（5分×${addSteps}）`,
-    `・本日累計：${(totalMs/60000).toFixed(1)} 分`,
-    `・日付：${day}`,
-    "[/info]",
-  ].join("\n");
-}
 async function notifyChatworkAppointment(ev: Normalized){
   try { await sendChatworkMessage(cwApptMessage(ev)); } catch {}
 }
@@ -471,15 +451,8 @@ function inferDurationMs(v:any){
   return Math.min(Math.max(0, ms), MAX_CALL_MS);
 }
 
-// 累計ステート（日×メール）
-const CALL_STATE_FP = "data/state/call_totals.json";
-type CallState = Record<string, Record<string, { total_ms:number; steps_awarded:number }>>;
-function loadCallState(): CallState { return readJson(CALL_STATE_FP, {} as CallState); }
-function saveCallState(s: CallState){ writeJson(CALL_STATE_FP, s); }
-
 // “5分ごと加点（ベース抜き）”
 function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
-function computeNewSteps(totalMs:number, prevSteps:number){ const nowSteps=Math.floor(totalMs/CALL_XP_UNIT_MS); const add=Math.max(0, nowSteps-(prevSteps||0)); return {nowSteps, add}; }
 
 async function awardXpForCallDuration(ev: CallDurEv){
   // ★ Zoom（通話）以外は付与しない（HubSpot経路などは記録のみ）
@@ -488,7 +461,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
 
-  // 最終クランプ（どこから来ても3時間超は切り捨て、無効は0）
+  // 最終クランプ
   let durMs = Math.floor(Number(ev.durationMs||0));
   if (!Number.isFinite(durMs) || durMs < 0) durMs = 0;
   if (durMs > MAX_CALL_MS) durMs = MAX_CALL_MS;
@@ -521,44 +494,14 @@ async function awardXpForCallDuration(ev: CallDurEv){
     }
   }
 
-  // A) 累計方式（当日 5分ごと +2XP）
-  if (CALL_TOTALIZE_5MIN) {
-    const day = isoDay(ev.occurredAt);
-    const email = (who.email||"").toLowerCase();
-    if (!email) { log("[call] totalize: no email"); return; }
-
-    const st = loadCallState();
-    st[day] ??= {}; st[day][email] ??= { total_ms:0, steps_awarded:0 };
-    st[day][email].total_ms += Math.max(0, Math.floor(durMs));
-
-    const { nowSteps, add } = computeNewSteps(st[day][email].total_ms, st[day][email].steps_awarded);
-    if (add<=0) { saveCallState(st); return; }
-
-    const xp = add * CALL_XP_PER_5MIN;
-    st[day][email].steps_awarded = nowSteps; saveCallState(st);
-
-    const cred = getHabitica(who.email);
-    if (!cred || DRY_RUN) {
-      log(`[call] totalize +${xp}XP (${add} steps) (DRY_RUN or no-cred) by=${who.name} @${when}`);
-      console.log(`(5分加点) +${xp}XP`);
-      return;
-    }
-    const title = `📞 累計架電（${who.name}） +${xp}XP`;
-    const notes = `day=${day}\nemail=${email}\ntotal_ms=${st[day][email].total_ms}\nsteps_awarded=${st[day][email].steps_awarded}`;
-    try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); console.log(`(5分加点) +${xp}XP`); } catch(e:any){ console.error("[call-totalize] habitica failed:", e?.message||e); }
-    if (CALL_CHATWORK_NOTIFY) { try{ await sendChatworkMessage(cwCallTotalizeMessage(who.name, add, xp, day, st[day][email].total_ms)); }catch{} }
+  // ガード：MAX_CALL_MS ちょうど（または超えた結果でクランプ）になった通話は「長時間異常」の可能性があるので5分加点は抑止
+  if (durMs >= MAX_CALL_MS) {
+    console.log("[call] guard: durMs hit MAX_CALL_MS; suppress 5min extra, keep +1XP only");
     return;
   }
 
   // B) コール内で5分ごと +2XP（コール終了でリセット）
-  // ★安全弁：durMs が MAX_CALL_MS ちょうど（3h）は異常の可能性が高いので 5分加点は抑止（+1XP のみ）
-  let xpExtraBaseMs = durMs;
-  if (xpExtraBaseMs === MAX_CALL_MS) {
-    console.log("[call] guard: durMs hit MAX_CALL_MS; suppress 5min extra, keep +1XP only");
-    xpExtraBaseMs = 0;
-  }
-
-  const xpExtra = computePerCallExtra(xpExtraBaseMs);
+  const xpExtra = computePerCallExtra(durMs);
   if (xpExtra<=0) return;
   const cred = getHabitica(who.email);
   if (!cred || DRY_RUN) {
@@ -567,7 +510,7 @@ async function awardXpForCallDuration(ev: CallDurEv){
     return;
   }
   const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
-  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${xpExtraBaseMs}/${CALL_XP_UNIT_MS})`;
+  const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${durMs}/${CALL_XP_UNIT_MS})`;
   try { const todo = await createTodo(title, notes, undefined, cred); const id=(todo as any)?.id; if(id) await completeTask(id, cred); console.log(`(5分加点) +${xpExtra}XP`); } catch(e:any){ console.error("[call] habitica extra failed:", e?.message||e); }
 }
 
@@ -605,10 +548,13 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
 
 /**
  * 任意スキーマCSV -> 標準レコード配列に正規化
+ * 標準レコード: { type:'approval'|'sales'|'maker', email?, amount?, maker?, id?, date? }
+ * 1行から複数typeを生成可（例: メーカー成果→ maker + approval）
  */
 function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
+  // よくある見出しの候補
   const C_EMAIL  = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
   const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker"];
   const C_AMOUNT = ["金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額"];
@@ -616,11 +562,28 @@ function normalizeCsv(text: string){
   const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at"];
   const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果"];
   const C_TYPE   = ["type","種別","イベント種別"];
-  const C_NOTES  = ["notes","メモ","備考","コメント"];
 
   const out: Array<{type:"approval"|"sales"|"maker"; email?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string}> = [];
 
   for (const r of recs) {
+    // まず、標準スキーマ(type,email,amount,maker,id,date,notes)に合っていればそのまま採用
+    if (r.type || r.email || r.amount || r.maker) {
+      const t = String(r.type||"").trim().toLowerCase();
+      if (["approval","sales","maker"].includes(t)) {
+        out.push({
+          type: t as any,
+          email: r.email? String(r.email).toLowerCase(): undefined,
+          amount: numOrUndefined(r.amount),
+          maker: r.maker? String(r.maker).trim(): undefined,
+          id: r.id? String(r.id).trim(): undefined,
+          date: r.date? String(r.date).trim(): undefined,
+          notes: r.notes? String(r.notes): undefined,
+        });
+        continue;
+      }
+    }
+
+    // 自由形式ヘッダから推定
     const kEmail  = firstMatchKey(r, C_EMAIL);
     const kMaker  = firstMatchKey(r, C_MAKER);
     const kAmt    = firstMatchKey(r, C_AMOUNT);
@@ -628,36 +591,39 @@ function normalizeCsv(text: string){
     const kDate   = firstMatchKey(r, C_DATE);
     const kApf    = firstMatchKey(r, C_APPROV);
     const kType   = firstMatchKey(r, C_TYPE);
-    const kNotes  = firstMatchKey(r, C_NOTES);
 
     const email = kEmail ? String(r[kEmail]||"").toLowerCase().trim() : undefined;
     const maker = kMaker ? String(r[kMaker]||"").trim() : undefined;
     const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
     const rid = kId ? String(r[kId]||"").trim() : undefined;
     const date = kDate ? String(r[kDate]||"").trim() : undefined;
-    const notes = kNotes ? String(r[kNotes]||"").trim() : undefined;
 
-    // type列優先
+    // type列の指定があれば優先
     let explicitType: "approval"|"sales"|"maker"|undefined;
     if (kType) {
       const t = String(r[kType]||"").trim().toLowerCase();
       if (["approval","sales","maker"].includes(t)) explicitType = t as any;
     }
 
-    // 承認判定（notesに"承認"を含めてもtrue）
-    const approved = kApf ? truthyJP(r[kApf]) : /承認/.test(String(notes||""));
+    // 承認フラグっぽい列
+    const approved = kApf ? truthyJP(r[kApf]) : false;
 
+    // 生成方針：
+    // 1) 金額>0 → sales
+    // 2) 承認っぽい → approval
+    // 3) メーカー名があって、明確なtypeが無い → maker（＋ダッシュボード反映のため approval も同時に1件作成）
+    // 4) typeが明示されていればそれに従う
     if (explicitType === "sales" || (explicitType===undefined && amount && amount>0)) {
-      out.push({ type:"sales", email, amount, maker, id: rid, date, notes });
+      out.push({ type:"sales", email, amount, maker, id: rid, date, notes:"from CSV(auto)" });
       continue;
     }
     if (explicitType === "approval" || approved) {
-      out.push({ type:"approval", email, maker, id: rid, date, notes });
+      out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(auto)" });
       continue;
     }
     if (explicitType === "maker" || maker) {
-      out.push({ type:"maker",   email, maker, id: rid, date, notes });
-      out.push({ type:"approval",email, maker, id: rid, date, notes:"(maker→approval)" });
+      out.push({ type:"maker",   email, maker, id: rid, date, notes:"from CSV(auto)" });
+      out.push({ type:"approval",email, maker, id: rid, date, notes:"from CSV(auto,maker-as-approval)" });
       continue;
     }
   }
@@ -780,7 +746,6 @@ app.get("/admin/upload", (_req,res)=>{
   res.type("html").send(html);
 });
 
-
 // =============== ダッシュボード ===============
 app.get("/admin/dashboard", (_req,res)=>{
   const today = isoDay(), yest = isoDay(new Date(Date.now()-86400000));
@@ -829,10 +794,6 @@ app.get("/admin/dashboard", (_req,res)=>{
 app.get("/admin/mapping", (req,res)=>{
   if(!requireBearer(req,res)) return;
   res.json({ ok:true, habiticaEmails:Object.keys(HAB_MAP).sort(), nameEmailEntries:Object.keys(NAME2MAIL).length, zoomUserIdMapCount:Object.keys(ZOOM_UID2MAIL).length });
-});
-app.get("/admin/state/calls", (req,res)=>{
-  if(!requireBearer(req,res)) return;
-  res.json({ ok:true, state: loadCallState() });
 });
 
 // =============== 日報 Webhook（Habitica完了→+10XP） ===============
@@ -950,7 +911,7 @@ app.post("/admin/habitica/setup-webhooks", async (req: Request, res: Response) =
 app.listen(PORT, ()=>{
   log(`listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL}`);
   log(`[habitica] users=${Object.keys(HAB_MAP).length}, [name->email] entries=${Object.keys(NAME2MAIL).length}`);
-  log(`[env] APPOINTMENT_XP=${APPOINTMENT_XP} DAILY_BONUS_XP=${DAILY_BONUS_XP} CALL_TOTALIZE_5MIN=${CALL_TOTALIZE_5MIN}`);
+  log(`[env] APPOINTMENT_XP=${APPOINTMENT_XP} DAILY_BONUS_XP=${DAILY_BONUS_XP}`);
   log(`[env] APPOINTMENT_VALUES=${JSON.stringify(APPOINTMENT_VALUES)}`);
 });
 export {};
