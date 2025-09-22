@@ -1,7 +1,7 @@
 // server.ts
 import express, { Request, Response } from "express";
 import crypto from "crypto";
-import Busboy from "busboy"; // 将来の拡張用に残してOK
+import Busboy from "busboy";
 import { parse as csvParse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
@@ -65,9 +65,9 @@ function requireBearer(req: Request, res: Response): boolean {
 }
 
 // =============== 定数（安全弁） ===============
-const MAX_CALL_MS = 3 * 60 * 60 * 1000; // 10,800,000ms（1コール上限）
+const MAX_CALL_MS = 3 * 60 * 60 * 1000;
 
-// --- Zoom payload からメール/方向/長さ/ID を安全に抜く（仕様準拠） ---
+// --- Zoom payload からメール/方向/長さ/ID を安全に抜く ---
 function pickZoomInfo(obj: any) {
   const o = obj || {};
   const logs: any[] =
@@ -75,34 +75,28 @@ function pickZoomInfo(obj: any) {
     Array.isArray(o?.object?.call_logs) ? o.object.call_logs :
     [];
 
-  // アウトバウンド優先で1件選ぶ（なければ先頭）
   const chosen =
     logs.find((x) => String(x?.direction || "").toLowerCase() === "outbound") ||
     logs[0] || o;
 
-  // メール候補
   const emailRaw =
     o.user_email || o.owner_email || o.caller_email || o.callee_email ||
     chosen?.caller_email || chosen?.callee_email || "";
   const email = String(emailRaw || "").toLowerCase() || undefined;
 
-  // user/owner のID（ZOOM_EMAIL_MAP_JSON 補完用）
   const zid =
     o.zoom_user_id || o.user_id || o.owner_id ||
     chosen?.zoom_user_id || chosen?.user_id || chosen?.owner_id || undefined;
 
-  // 方向
   const dir = (String(chosen?.direction || o.direction || "").toLowerCase() || "unknown");
 
-  // ====== 会話時間：talk_time（秒）最優先 ======
   const talkSecCand =
     chosen?.talk_time ?? o.talk_time ?? chosen?.talkTime ?? o.talkTime;
 
   let ms = 0;
   if (typeof talkSecCand === "number" && isFinite(talkSecCand)) {
-    ms = Math.max(0, Math.floor(talkSecCand * 1000)); // 秒→ms
+    ms = Math.max(0, Math.floor(talkSecCand * 1000));
   } else {
-    // 予備：start_time / end_time 差分（ISO文字列）
     const stIso = chosen?.start_time || o.start_time;
     const etIso = chosen?.end_time   || o.end_time   || chosen?.ended_at || o.ended_at;
     const st = stIso ? Date.parse(stIso) : NaN;
@@ -110,19 +104,16 @@ function pickZoomInfo(obj: any) {
     if (Number.isFinite(st) && Number.isFinite(et)) {
       ms = Math.max(0, et - st);
     } else {
-      ms = 0; // 無効は0に落とす
+      ms = 0;
     }
   }
-  // 最終クランプ
   if (!Number.isFinite(ms) || ms < 0) ms = 0;
   if (ms > MAX_CALL_MS) ms = MAX_CALL_MS;
 
-  // callId
   const callId =
     o.call_id || o.session_id || chosen?.call_id || chosen?.session_id ||
     `zoom:${Date.now()}`;
 
-  // 終了時刻（epoch ms に正規化）
   const endIso = chosen?.end_time || o.end_time || chosen?.ended_at || o.ended_at;
   const endedAt = Number.isFinite(Date.parse(endIso)) ? Date.parse(endIso) : Date.now();
 
@@ -138,7 +129,7 @@ const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || process.env.BASE_U
 // HubSpot v3
 const WEBHOOK_SECRET = process.env.HUBSPOT_WEBHOOK_SIGNING_SECRET || process.env.HUBSPOT_APP_SECRET || "";
 
-// Zoom 署名
+// Zoom
 const ZOOM_WEBHOOK_SECRET = String(process.env.ZOOM_WEBHOOK_SECRET || process.env.ZOOM_SECRET || "").trim();
 const ZOOM_VERIFICATION_TOKEN = String(process.env.ZOOM_VERIFICATION_TOKEN || process.env.ZOOM_VTOKEN || "").trim();
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || "";
@@ -160,15 +151,14 @@ const CALL_XP_UNIT_MS    = Number(process.env.CALL_XP_UNIT_MS || 300000);
 // CSV UI 設定
 const CSV_UPLOAD_TOKENS = String(process.env.CSV_UPLOAD_TOKENS || "").split(",").map(s=>s.trim()).filter(Boolean);
 
-// 日報ボーナス: ENV
+// 日報ボーナス
 const DAILY_BONUS_XP = Number(process.env.DAILY_BONUS_XP || 10);
 const DAILY_TASK_MATCH = String(process.env.DAILY_TASK_MATCH || "日報").split(",").map(s => s.trim()).filter(Boolean);
 const HABITICA_WEBHOOK_SECRET = process.env.HABITICA_WEBHOOK_SECRET || AUTH_TOKEN || "";
 
-// 新規アポ（仕様：+20XP＋バッジ）
+// 新規アポ
 const APPOINTMENT_XP = Number(process.env.APPOINTMENT_XP || 20);
 const APPOINTMENT_BADGE_LABEL = process.env.APPOINTMENT_BADGE_LABEL || "🎯 新規アポ";
-// 受理アウトカム（カンマ区切り、大小区別なし）
 const APPOINTMENT_VALUES = String(process.env.APPOINTMENT_VALUES || "appointment_scheduled,新規アポ")
   .split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
 
@@ -231,7 +221,6 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
   const sigHeader = req.header("x-hubspot-signature-v3") || "";
   const raw: Buffer = (req as any).rawBody ?? Buffer.from(JSON.stringify((req as any).body||""),"utf8");
 
-  // 署名候補生成
   const proto = String(req.headers["x-forwarded-proto"]||"").split(",")[0].trim() || (req as any).protocol || "https";
   const hostHdr = String(req.headers["x-forwarded-host"]||req.headers["host"]||"").split(",")[0].trim();
   const candidates = new Set<string>();
@@ -257,7 +246,7 @@ app.post("/webhooks/hubspot", async (req: Request & { rawBody?: Buffer }, res: R
       await handleNormalizedEvent({ source:"v3", eventId:e.eventId??e.attemptNumber, callId:e.objectId, outcome:e.propertyValue, occurredAt:e.occurredAt, raw:e });
     }
     if (isCall && e.propertyName==="hs_call_duration") {
-      const ms = inferDurationMs(e.propertyValue); // v3は秒の場合が多い
+      const ms = inferDurationMs(e.propertyValue);
       await handleCallDurationEvent({ source:"v3", eventId:e.eventId??e.attemptNumber, callId:e.objectId, durationMs:ms, occurredAt:e.occurredAt, raw:e });
     }
   }
@@ -278,14 +267,13 @@ app.post("/webhooks/workflow", async (req: Request, res: Response)=>{
   res.json({ok:true});
 });
 
-// =============== Zoom Webhook（ts+base64 / HEXのみ 両対応） ===============
+// =============== Zoom Webhook ===============
 function readBearerFromHeaders(req: Request){ for(const k of ["authorization","x-authorization","x-auth","x-zoom-authorization","zoom-authorization"]) { const v=req.get(k); if(!v) continue; const m=v.trim().match(/^Bearer\s+(.+)$/i); return (m?m[1]:v).trim(); } return ""; }
 function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   const header = req.get("x-zm-signature") || "";
   if(!header) return { ok:false, why:"no_header" };
   const body = (req.rawBody ?? Buffer.from("", "utf8")).toString("utf8");
 
-  // HEXのみ variant
   const mHex = header.match(/^v0=([a-f0-9]{64})$/i);
   if (mHex) {
     const sigHex = mHex[1].toLowerCase();
@@ -303,7 +291,6 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
     return { ok:false, why:"signature_mismatch_hex" };
   }
 
-  // v0:<ts>:<base64> / v0=<ts>:<base64>
   const m = header.match(/^v0[:=](\d+):([A-Za-z0-9+/=]+)$/);
   if(!m) return { ok:false, why:"bad_format" };
   const ts = Number(m[1]); const sig = m[2];
@@ -321,7 +308,6 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   let b:any = (req as any).body || {};
   if(!b || (Object.keys(b).length===0 && rawText)) { try{ b=JSON.parse(rawText!);}catch{} }
 
-  // URL検証
   const plain = b?.plainToken || b?.payload?.plainToken || b?.event?.plainToken;
   if(plain){
     const key = ZOOM_WEBHOOK_SECRET || AUTH_TOKEN || "dummy";
@@ -329,7 +315,6 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     return res.json({ plainToken:String(plain), encryptedToken:enc });
   }
 
-  // 認証
   let ok = false;
   if (req.get("x-zm-signature")) ok = verifyZoomSignature(req).ok;
   if (!ok) {
@@ -338,12 +323,10 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
   }
   if(!ok) return res.status(401).json({ok:false,error:"auth"});
 
-  // ==== Zoomの実データ処理 ====
   const obj = b?.payload?.object || b?.object || {};
   const info = pickZoomInfo(obj);
   const resolvedEmail = info.email || (info.zid && ZOOM_UID2MAIL[String(info.zid)]) || undefined;
 
-  // 着信はスキップ（記録のみ）
   if (String(info.dir) === "inbound") {
     log(`[call] inbound (no XP) by=担当者 ${fmtJST(b.timestamp || info.endedAt || Date.now())}`);
     appendJsonl("data/events/calls.jsonl", {
@@ -357,7 +340,6 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
     return res.json({ ok: true, accepted: true, inbound: true });
   }
 
-  // 発信のみXP（0秒でも +1XP は必ず付与）
   log(`[zoom] accepted event=${b?.event || "unknown"} callId=${info.callId} ms=${info.ms||0} dir=${info.dir||"unknown"}`);
   await handleCallDurationEvent({
     source: "zoom",
@@ -372,25 +354,15 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
 
 // =============== 正規化処理 & だれ特定 ===============
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
-function extractDxPortNameFromText(s?: string): string|undefined {
-  const t = normSpace(s);
-  if (!t) return undefined;
-  const m = t.match(/D\s*X\s*P?\s*O?\s*R?\s*T?\s*の\s*([^\s].*)$/i);
-  if (m && m[1]) return normSpace(m[1]);
-  return undefined;
-}
 
-/** HubSpot ownerId / owner_email を総当りし、日本語名へ寄せる */
 function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string; email?:string}{
   const raw = ev.raw||{};
 
-  // 1) email 候補
   let email: string|undefined =
     raw.actorEmail || raw.ownerEmail || raw.userEmail ||
     raw?.owner?.email || raw?.properties?.owner_email || raw?.properties?.hubspot_owner_email ||
     raw?.userEmail;
 
-  // 2) ownerId 候補（文字列化）
   const ownerId =
     raw?.properties?.hubspot_owner_id ??
     raw?.hubspot_owner_id ??
@@ -402,15 +374,12 @@ function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string
     raw?.actorId ??
     raw?.userId;
 
-  // 3) hubspot_user_map から補完
   const hsMap = safeParse<Record<string,{name?:string; email?:string}>>(HUBSPOT_USER_MAP_JSON) || {};
   const hs = ownerId != null ? hsMap[String(ownerId)] : undefined;
 
-  // 4) email決定
   const finalEmail =
     (email || hs?.email || "").toLowerCase() || undefined;
 
-  // 5) 表示名：NAME_EMAIL_MAP > hubspot.name > local-part > 担当者
   const display =
     (finalEmail && MAIL2NAME[finalEmail]) ||
     (hs?.name) ||
@@ -457,7 +426,6 @@ async function awardXpForAppointment(ev: Normalized){
   }
 }
 
-// Chatwork: スクショ準拠（infoカード）
 async function notifyChatworkAppointment(ev: Normalized){
   try {
     const who = resolveActor({source:ev.source as any, raw:ev.raw});
@@ -563,6 +531,7 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
   return undefined;
 }
 
+// ★★★ ここに唯一の定義（重複排除済み） ★★★
 function extractDxPortNameFromText(s?: string): string|undefined {
   const t = normSpace(s);
   if (!t) return undefined;
@@ -570,6 +539,7 @@ function extractDxPortNameFromText(s?: string): string|undefined {
   if (m && m[1]) return normSpace(m[1]);
   return undefined;
 }
+
 function resolveEmailFromRow(r:any): string|undefined {
   const C_EMAIL = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
   const kEmail  = firstMatchKey(r, C_EMAIL);
@@ -706,7 +676,6 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     }
   }
 
-  // ★ サマリーはプレーン（infoは使わない）…スクショと同じ見え方
   try {
     const today = isoDay();
     await sendChatworkMessage(cwCsvSummaryText(today, nA, nS, nM));
@@ -763,7 +732,7 @@ app.get("/admin/upload", (_req,res)=>{
   res.type("html").send(html);
 });
 
-// =============== ダッシュボード ===============
+// =============== ダッシュボード・診断・日報ボーナス…（以下は元のまま） ===============
 function displayName(a:any){
   const em = a?.actor?.email || a?.email;
   if (em && MAIL2NAME[em]) return MAIL2NAME[em];
@@ -813,13 +782,12 @@ app.get("/admin/dashboard", (_req,res)=>{
   res.type("html").send(html);
 });
 
-// =============== 診断API ===============
 app.get("/admin/mapping", (req,res)=>{
   if(!requireBearer(req,res)) return;
   res.json({ ok:true, habiticaEmails:Object.keys(HAB_MAP).sort(), nameEmailEntries:Object.keys(NAME2MAIL).length, zoomUserIdMapCount:Object.keys(ZOOM_UID2MAIL).length });
 });
 
-// =============== 日報 Webhook（Habitica完了→+10XP） ===============
+// ===== 日報 Webhook（Habitica完了→+10XP） =====
 function isDailyTaskTitle(title?: string) {
   const t = String(title || "").trim();
   if (!t) return false;
@@ -835,7 +803,7 @@ function markDailyBonusGiven(email: string, day: string) {
 }
 
 app.post("/webhooks/habitica", async (req: Request, res: Response) => {
-  const token = String((req.query.t || req.query.token || "")).trim();
+  const token = String(req.query.t || req.query.token || "").trim();
   if (!token || token !== HABITICA_WEBHOOK_SECRET) {
     return res.status(401).json({ ok: false, error: "auth" });
   }
@@ -881,7 +849,6 @@ app.post("/webhooks/habitica", async (req: Request, res: Response) => {
   }
 });
 
-// === Habitica Webhook を全員分に自動登録（管理API） ===
 async function ensureHabiticaWebhook(email: string, cred: { userId: string; apiToken: string }) {
   if (!PUBLIC_BASE_URL) return { ok: false, why: "no PUBLIC_BASE_URL" };
   const base = "https://habitica.com/api/v3";
