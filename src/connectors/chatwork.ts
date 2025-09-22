@@ -54,12 +54,27 @@ export function cwSalesText(actorName: string, amount?: number, maker?: string) 
   ].join("\n");
 }
 
-export function cwMakerAchievementText(actorName: string, maker?: string, approvedCount?: number, totalSalesYen?: number) {
+/**
+ * メーカー別成果（称賛トーン強化版）
+ * - 以前の文面に合わせつつ、“頑張りを褒める”一言を追加
+ */
+export function cwMakerAchievementText(
+  actorName: string,
+  maker?: string,
+  approvedCount?: number,
+  totalSalesYen?: number
+) {
   const n = actorName?.trim() || "担当者";
-  const lines = [`🏆 ${n} さんが『メーカー別 成果』を達成しました！🔥`];
+  const lines = [
+    `🏆 ${n} さんが『メーカー別 成果』を達成しました！🔥`,
+  ];
   if (maker) lines.push(`・メーカー：${maker}`);
   if (typeof approvedCount === "number") lines.push(`・承認数：${approvedCount}件`);
-  if (typeof totalSalesYen === "number") lines.push(`・売上合計：¥${Math.max(0, Math.floor(totalSalesYen)).toLocaleString()}`);
-  lines.push("", "最高です！この勢いで引き続きいきましょう！💪");
+  if (typeof totalSalesYen === "number")
+    lines.push(`・売上合計：¥${Math.max(0, Math.floor(totalSalesYen)).toLocaleString()}`);
+  lines.push(
+    "",
+    `この勢いで次もいきましょう！💪`
+  );
   return lines.join("\n");
 }

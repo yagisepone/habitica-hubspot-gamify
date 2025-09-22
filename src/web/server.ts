@@ -380,21 +380,46 @@ function extractDxPortNameFromText(s?: string): string|undefined {
   if (m && m[1]) return normSpace(m[1]);
   return undefined;
 }
+
+/**
+ * ★ 強化版：HubSpot ownerId / owner_email を総当りで見て、name_email_map / hubspot_user_mapから確実に表示名を解決
+ */
 function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string; email?:string}{
   const raw = ev.raw||{};
+
+  // 1) email 候補を総当りで拾う
   let email: string|undefined =
-    raw.actorEmail || raw.ownerEmail || raw.userEmail || raw?.owner?.email || raw?.properties?.hs_created_by_user_id?.email || raw?.userEmail;
+    raw.actorEmail || raw.ownerEmail || raw.userEmail ||
+    raw?.owner?.email || raw?.properties?.owner_email || raw?.properties?.hubspot_owner_email ||
+    raw?.userEmail;
 
-  const zid = raw.zoomUserId || raw.zoom_user_id || raw.user_id || raw.owner_id || raw.actorId || raw.userId;
-  if(!email && zid && ZOOM_UID2MAIL[String(zid)]) email = ZOOM_UID2MAIL[String(zid)];
+  // 2) HubSpot オーナーID候補（文字列化して扱う）
+  const ownerId =
+    raw?.properties?.hubspot_owner_id ??
+    raw?.hubspot_owner_id ??
+    raw?.ownerId ??
+    raw?.associatedOwnerId ??
+    raw?.owner_id ??
+    raw?.hsUserId ??
+    raw?.createdById ??
+    raw?.actorId ??
+    raw?.userId;
 
-  const hsUserId = raw.hsUserId || raw.createdById || raw.actorId || raw.userId;
-  const hsMap = safeParse<Record<string,{name?:string; email?:string}>>(HUBSPOT_USER_MAP_JSON);
-  const mapped = hsUserId && hsMap ? hsMap[String(hsUserId)] : undefined;
+  // 3) hubspot_user_map から補完
+  const hsMap = safeParse<Record<string,{name?:string; email?:string}>>(HUBSPOT_USER_MAP_JSON) || {};
+  const hs = ownerId != null ? hsMap[String(ownerId)] : undefined;
 
-  const finalEmail = (email || mapped?.email || "").toLowerCase() || undefined;
-  // 表示名優先順位：NAME_EMAIL_MAP(日本語) > hubspot名 > メールlocal部 > "担当者"
-  const display = (finalEmail && MAIL2NAME[finalEmail]) || (mapped?.name) || (finalEmail?String(finalEmail).split("@")[0]: undefined) || "担当者";
+  // 4) 最終 email の決定
+  const finalEmail =
+    (email || hs?.email || "").toLowerCase() || undefined;
+
+  // 5) 表示名優先順位：NAME_EMAIL_MAP(日本語) > hubspot名 > メールlocal部 > "担当者"
+  const display =
+    (finalEmail && MAIL2NAME[finalEmail]) ||
+    (hs?.name) ||
+    (finalEmail ? String(finalEmail).split("@")[0] : undefined) ||
+    "担当者";
+
   return { name: display, email: finalEmail };
 }
 
