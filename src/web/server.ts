@@ -64,6 +64,13 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 
+// HubSpot v3 の sourceId から userId を抜く（例: "userId:81798571" -> "81798571"）
+function parseHubSpotSourceUserId(raw: any): string | undefined {
+  const s = String(raw?.sourceId || raw?.source_id || "");
+  const m = s.match(/userId:(\d+)/i);
+  return m ? m[1] : undefined;
+}
+
 // =============== 定数（安全弁） ===============
 const MAX_CALL_MS = 3 * 60 * 60 * 1000;
 
@@ -297,7 +304,7 @@ function verifyZoomSignature(req: Request & { rawBody?: Buffer }){
   const now = Math.floor(Date.now()/1000); if(Math.abs(now-ts) > ZOOM_SIG_SKEW) return { ok:false, why:"timestamp_skew" };
   if(!ZOOM_WEBHOOK_SECRET) return { ok:false, why:"no_secret" };
 
-  const macA = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(String(ts)+body).digest("base64");
+  const macA = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(`${ts}${body}`).digest("base64");
   const macB = crypto.createHmac("sha256", ZOOM_WEBHOOK_SECRET).update(`v0:${ts}:${body}`).digest("base64");
   const eqB64 = (mac:string)=>{ try{ return crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(sig)); }catch{return false;} };
   return { ok: eqB64(macA)||eqB64(macB), variant:"v0_ts_b64" };
@@ -355,17 +362,21 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
 // =============== 正規化処理 & だれ特定 ===============
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
 
+// ★ HubSpot担当者の解決：sourceId(userId) と hubspot_user_map を使う
 function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string; email?:string}{
   const raw = ev.raw||{};
 
+  // 1) email の明示（あれば最優先）
   let email: string|undefined =
     raw.actorEmail || raw.ownerEmail || raw.userEmail ||
     raw?.owner?.email || raw?.properties?.owner_email || raw?.properties?.hubspot_owner_email ||
     raw?.userEmail;
 
+  // 2) HubSpotの user/owner のID候補を総当り + sourceId(userId:xxxx)
   const ownerId =
     raw?.properties?.hubspot_owner_id ??
     raw?.hubspot_owner_id ??
+    parseHubSpotSourceUserId(raw) ??     // ← ココが今回の修正ポイント
     raw?.ownerId ??
     raw?.associatedOwnerId ??
     raw?.owner_id ??
@@ -374,12 +385,14 @@ function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string
     raw?.actorId ??
     raw?.userId;
 
+  // 3) 環境変数のマップで補完
   const hsMap = safeParse<Record<string,{name?:string; email?:string}>>(HUBSPOT_USER_MAP_JSON) || {};
   const hs = ownerId != null ? hsMap[String(ownerId)] : undefined;
 
-  const finalEmail =
-    (email || hs?.email || "").toLowerCase() || undefined;
+  // 4) 最終 email
+  const finalEmail = (email || hs?.email || "").toLowerCase() || undefined;
 
+  // 5) 表示名
   const display =
     (finalEmail && MAIL2NAME[finalEmail]) ||
     (hs?.name) ||
