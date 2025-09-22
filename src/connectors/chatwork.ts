@@ -25,16 +25,20 @@ export async function sendChatworkMessage(
   return { success: status >= 200 && status < 300, status, json };
 }
 
-/* ===== 文面ビルダー（スクショ準拠） ===== */
+/* ===== 文面ビルダー ===== */
 
+/** アポ通知（スクショと同じ：infoカードで3行、括弧は「」） */
 export function cwApptText(actorName: string) {
   const n = actorName?.trim() || "担当者";
-  return [
-    `🔥 ${n} さんが『新規アポ』を獲得しました！💪🔥`,
-    `ナイスコール！📈 この調子でもう1件お願いします！💥`,
+  const body = [
+    "皆さんお疲れ様です！",
+    `🎉 ${n} さんが「新規アポ」を獲得しました！💪🔥`,
+    `ナイスコール！🙌 この調子でもう1件お願いします！💯`,
   ].join("\n");
+  return `[info]\n${body}\n[/info]`;
 }
 
+/** 承認通知（従来どおり） */
 export function cwApprovalText(actorName: string, maker?: string) {
   const n = actorName?.trim() || "担当者";
   const m = maker ? `（メーカー：${maker}）` : "";
@@ -44,6 +48,7 @@ export function cwApprovalText(actorName: string, maker?: string) {
   ].join("\n");
 }
 
+/** 売上通知（従来どおり） */
 export function cwSalesText(actorName: string, amount?: number, maker?: string) {
   const n = actorName?.trim() || "担当者";
   const am = amount ? `¥${Math.max(0, Math.floor(amount)).toLocaleString()}` : "売上";
@@ -54,10 +59,13 @@ export function cwSalesText(actorName: string, amount?: number, maker?: string) 
   ].join("\n");
 }
 
-/**
- * メーカー別成果（称賛トーン強化版）
- * - 以前の文面に合わせつつ、“頑張りを褒める”一言を追加
- */
+/** CSVサマリー：プレーン表示（スクショのとおり info は使わない） */
+export function cwCsvSummaryText(today: string, ok: number, sales: number, maker: number) {
+  return `CSV取込（${today}）
+承認 ${ok} / 売上 ${sales} / メーカー ${maker}`;
+}
+
+/** メーカー別成果：褒め言葉を一言追加（関数名・引数は既存互換） */
 export function cwMakerAchievementText(
   actorName: string,
   maker?: string,
@@ -65,16 +73,11 @@ export function cwMakerAchievementText(
   totalSalesYen?: number
 ) {
   const n = actorName?.trim() || "担当者";
-  const lines = [
-    `🏆 ${n} さんが『メーカー別 成果』を達成しました！🔥`,
-  ];
+  const lines = [`🏆 ${n} さんが『メーカー別 成果』を達成しました！🔥`];
   if (maker) lines.push(`・メーカー：${maker}`);
   if (typeof approvedCount === "number") lines.push(`・承認数：${approvedCount}件`);
   if (typeof totalSalesYen === "number")
     lines.push(`・売上合計：¥${Math.max(0, Math.floor(totalSalesYen)).toLocaleString()}`);
-  lines.push(
-    "",
-    `この勢いで次もいきましょう！💪`
-  );
+  lines.push("", "この勢いで次もいきましょう！💪");
   return lines.join("\n");
 }
