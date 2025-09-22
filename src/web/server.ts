@@ -210,7 +210,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-19-msfix-csvdxp-jpname", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-22-csv-sjis-autodetect-mapping", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -562,8 +562,8 @@ function extractDxPortNameFromText(s?: string): string|undefined {
 function resolveEmailFromRow(r:any): string|undefined {
   const C_EMAIL = [
     "email","mail",
-    "担当者メール","担当者 メールアドレス","担当メール","担当者email",
-    "owner email","オーナー メール","ユーザー メール","営業担当メール","担当者e-mail","担当e-mail"
+    "担当者メール","担当者 メール","担当者 メールアドレス","担当メール","担当者email",
+    "owner email","オーナー メール","ユーザー メール","営業担当メール","担当者e-mail","担当e-mail","担当者メールアドレス","担当者のメール"
   ];
   const kEmail  = firstMatchKey(r, C_EMAIL);
   if (kEmail) {
@@ -594,11 +594,12 @@ function normalizeCsv(text: string){
   const C_AMOUNT = [
     "金額","売上","受注金額","受注金額（税込）","受注金額（税抜）",
     "売上金額","売上金額（税込）","売上金額（税抜）",
-    "金額(円)","amount","price","契約金額","成約金額","合計金額","売上合計"
+    "金額(円)","amount","price","契約金額","成約金額","合計金額","売上合計",
+    "報酬","追加報酬" // ← 追加（このCSV向け）
   ];
   const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号","伝票番号","管理番号"];
   const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at","発生日","受注日","計上日"];
-  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果","最終結果","判定","合否","承認ステータス"];
+  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果","最終結果","判定","合否","承認ステータス","商談ステータス"]; // ← 追加
   const C_TYPE   = ["type","種別","イベント種別","カテゴリ","区分","種類"];
   const C_APPT   = ["アポ","アポイント","appointment","appointment_scheduled","アポ数","新規アポ"]; // 無視対象
 
@@ -766,19 +767,47 @@ app.get("/admin/upload", (_req,res)=>{
   <p><button id="send">貼り付けCSVを送信</button></p>
   <pre id="out"></pre>
   <script>
-    const qs=s=>document.querySelector(s); const out=qs('#out');
-    function pr(x){ out.textContent= typeof x==='string'? x: JSON.stringify(x,null,2); }
+    const qs = s => document.querySelector(s);
+    const out = qs('#out');
+    function pr(x){ out.textContent = typeof x==='string' ? x : JSON.stringify(x,null,2); }
+
+    function looksBroken(txt){
+      return /�/.test(txt) || !/(メーカー|承認|金額|メール|担当|日付)/.test(txt);
+    }
+
+    async function readFileTextSmart(file){
+      const buf = await file.arrayBuffer();
+      // まずUTF-8で読む
+      let txt = new TextDecoder('utf-8',{fatal:false}).decode(buf);
+      if (looksBroken(txt)) {
+        try { txt = new TextDecoder('shift_jis',{fatal:false}).decode(buf); } catch {}
+      }
+      return txt;
+    }
+
     async function postCsvRaw(text){
-      const base=qs('#base').value.trim(); const tok=qs('#tok').value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
-      const r=await fetch(base.replace(/\\/$/,'')+'/admin/csv',{method:'POST',headers:{'Content-Type':'text/csv','Authorization':'Bearer '+tok},body:text});
-      const t=await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
+      const base = qs('#base').value.trim();
+      const tok  = qs('#tok').value.trim();
+      if(!base || !tok) return pr('Base/Tokenを入力');
+      const r = await fetch(base.replace(/\\/$/,'')+'/admin/csv', {
+        method:'POST',
+        headers:{ 'Content-Type':'text/csv', 'Authorization':'Bearer '+tok },
+        body:text
+      });
+      const t = await r.text(); try{ pr(JSON.parse(t)); }catch{ pr(t); }
     }
+
     async function postCsvFile(file){
-      const base=qs('#base').value.trim(); const tok=qs('#tok').value.trim(); if(!base||!tok) return pr('Base/Tokenを入力');
-      const fr=new FileReader(); fr.onload=()=>postCsvRaw(String(fr.result||'')); fr.readAsText(file);
+      const text = await readFileTextSmart(file);
+      return postCsvRaw(text);
     }
-    qs('#send').onclick=()=>postCsvRaw(qs('#csv').value);
-    qs('#upload').onclick=()=>{ const f=qs('#file').files[0]; if(!f) return pr('CSVファイルを選択'); postCsvFile(f); };
+
+    qs('#send').onclick = () => postCsvRaw(qs('#csv').value);
+    qs('#upload').onclick = () => {
+      const f = qs('#file').files[0];
+      if(!f) return pr('CSVファイルを選択');
+      postCsvFile(f);
+    };
   </script>`;
   res.type("html").send(html);
 });
