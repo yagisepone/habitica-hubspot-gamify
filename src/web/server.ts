@@ -210,7 +210,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 // =============== Health/Support ===============
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-22-csv-sjis-autodetect-mapping", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-22-csv-multipart+sjis-mapping", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -543,10 +543,8 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
     if (m) return m;
   }
   for (const key of keys) {
-    thek: {
-      const k = lc(key);
-      if (candidates.some(c => k.includes(lc(c)))) return key;
-    }
+    const k = lc(key);
+    if (candidates.some(c => k.includes(lc(c)))) return key;
   }
   return undefined;
 }
@@ -586,6 +584,56 @@ function resolveEmailFromRow(r:any): string|undefined {
   return undefined;
 }
 
+// ★ CSV本文を Content-Type に依存せず取得（text/csv / multipart/form-data / raw）
+async function readCsvTextFromReq(req: Request): Promise<string> {
+  const ct = String(req.headers["content-type"] || "");
+
+  // multipart/form-data（Habiticaモーダルの「アップロード」）
+  if (ct.includes("multipart/form-data")) {
+    return await new Promise<string>((resolve, reject) => {
+      const bb = Busboy({ headers: req.headers });
+      const chunks: Buffer[] = [];
+      let gotFile = false;
+
+      bb.on("file", (_name, file /* , info */) => {
+        gotFile = true;
+        file.on("data", (d: Buffer) => chunks.push(Buffer.from(d)));
+      });
+      bb.on("field", (name: string, val: string) => {
+        if (!gotFile && (name.toLowerCase() === "csv" || name.toLowerCase() === "text")) {
+          chunks.push(Buffer.from(val, "utf8"));
+        }
+      });
+      bb.once("error", reject);
+      bb.once("finish", () => {
+        const buf = Buffer.concat(chunks);
+        let txt = buf.toString("utf8");
+        if (txt.charCodeAt(0) === 0xfeff) txt = txt.slice(1); // BOM除去
+        resolve(txt);
+      });
+      (req as any).pipe(bb);
+    });
+  }
+
+  // text/csv は body parser で既に文字列化済み
+  const b: any = (req as any).body;
+  if (typeof b === "string" && b.trim().length > 0) return b;
+
+  // raw fallback
+  return await new Promise<string>((resolve) => {
+    const chunks: Buffer[] = [];
+    (req as any)
+      .on("data", (d: Buffer) => chunks.push(Buffer.from(d)))
+      .on("end", () => {
+        const buf = Buffer.concat(chunks);
+        let txt = buf.toString("utf8");
+        if (txt.charCodeAt(0) === 0xfeff) txt = txt.slice(1);
+        resolve(txt);
+      })
+      .on("error", () => resolve(""));
+  });
+}
+
 // CSV 正規化：日本語ヘッダ & type 無しでも判定。アポ系行は無視（Webhook 任せ）
 function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
@@ -600,8 +648,14 @@ function normalizeCsv(text: string){
     "報酬","追加報酬" // ← 追加（このCSV向け）
   ];
   const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号","伝票番号","管理番号"];
-  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at","発生日","受注日","計上日"];
-  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果","最終結果","判定","合否","承認ステータス","商談ステータス"]; // ← 追加
+  const C_DATE   = [
+    "date","日付","作成日","成約日","承認日","登録日","received at","created at","発生日","受注日","計上日",
+    "承認日時","商談終了日時" // ← 追加
+  ];
+  const C_APPROV = [
+    "承認","承認済み","approval","approved","ステータス","結果","最終結果","判定","合否","承認ステータス","商談ステータス",
+    "承認日時","承認日" // ← 追加
+  ];
   const C_TYPE   = ["type","種別","イベント種別","カテゴリ","区分","種類"];
   const C_APPT   = ["アポ","アポイント","appointment","appointment_scheduled","アポ数","新規アポ"]; // 無視対象
 
@@ -637,7 +691,17 @@ function normalizeCsv(text: string){
     const kType   = firstMatchKey(r, C_TYPE);
 
     const maker = kMaker ? String(r[kMaker]||"").toString().trim() : undefined;
-    const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
+
+    // 金額：必要なら「追加報酬」を加算
+    let amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
+    if (kAmt && /報酬/.test(kAmt)) {
+      const addKey = firstMatchKey(r, ["追加報酬"]);
+      if (addKey) {
+        const add = numOrUndefined(r[addKey]);
+        if (Number.isFinite(add as number)) amount = (amount || 0) + (add as number);
+      }
+    }
+
     const rid = kId ? String(r[kId]||"").toString().trim() : undefined;
     const date = kDate ? String(r[kDate]||"").toString().trim() : undefined;
 
@@ -651,7 +715,17 @@ function normalizeCsv(text: string){
       }
     }
 
-    const approved = kApf ? truthyJP(r[kApf]) : false;
+    // ★ 承認判定を強化：ヘッダ名が「承認日/承認日時」なら「非空=承認」
+    let approved = false;
+    if (kApf) {
+      const header = kApf.toString();
+      const val = r[kApf];
+      if (/承認日/.test(header) || /承認日時/.test(header)) {
+        approved = String(val ?? "").trim().length > 0;
+      } else {
+        approved = truthyJP(val);
+      }
+    }
 
     if (explicitType === "sales" || (explicitType===undefined && amount && amount>0)) {
       out.push({ type:"sales", email, amount, maker, id: rid, date, notes:"from CSV(auto)" });
@@ -687,10 +761,26 @@ app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (
   res.json({ ok:true, rows: rows.length, headers: heads, sample: rows.slice(0,3) });
 });
 
+// text/csv は既存通り受け付け
 app.post("/admin/csv", express.text({ type:"text/csv", limit:"20mb" }));
+// どの Content-Type でも CSV を受け取り可能に
 app.post("/admin/csv", async (req: Request, res: Response)=>{
   if(!requireBearerCsv(req,res)) return;
-  const text = String((req as any).body||"");
+
+  // ★ ここで CSV 文字列を安全に取得
+  const text = await readCsvTextFromReq(req);
+  if (!text || !text.trim()) {
+    return res.json({
+      ok: true,
+      mode: "noop",
+      received: 0,
+      accepted: { approval: 0, sales: 0, maker: 0 },
+      totalSales: 0,
+      duplicates: 0,
+      errors: 0,
+      hint: "empty-or-unparsed-csv",
+    });
+  }
 
   const normalized = normalizeCsv(text);
 
