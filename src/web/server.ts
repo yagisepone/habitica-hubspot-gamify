@@ -376,7 +376,7 @@ function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string
   const ownerId =
     raw?.properties?.hubspot_owner_id ??
     raw?.hubspot_owner_id ??
-    parseHubSpotSourceUserId(raw) ??     // ← ココが今回の修正ポイント
+    parseHubSpotSourceUserId(raw) ??     // ← 追加
     raw?.ownerId ??
     raw?.associatedOwnerId ??
     raw?.owner_id ??
@@ -520,9 +520,14 @@ async function handleCallDurationEvent(ev: CallDurEv){
 }
 
 // =============== CSV（承認・売上・メーカー賞 取り込み） ===============
+// 真偽（承認済み等）のゆるい判定を拡張
 function truthyJP(v: any) {
   const s = String(v ?? "").trim().toLowerCase();
-  return ["1","true","yes","y","on","済","◯","〇","ok","承認","approved","done"].some(t => s.includes(t));
+  return [
+    "1","true","yes","y","on",
+    "済","完","完了","ok","◯","〇","○",
+    "承認","承認済","承認済み","approved","accept","accepted","合格","done"
+  ].some(t => s.includes(t));
 }
 function numOrUndefined(v:any){
   if (v==null) return undefined;
@@ -544,7 +549,7 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
   return undefined;
 }
 
-// ★★★ ここに唯一の定義（重複排除済み） ★★★
+// DXPort の自由記述から氏名を抜く（唯一の定義）
 function extractDxPortNameFromText(s?: string): string|undefined {
   const t = normSpace(s);
   if (!t) return undefined;
@@ -553,15 +558,23 @@ function extractDxPortNameFromText(s?: string): string|undefined {
   return undefined;
 }
 
+// メールの決定：email列 > DXPort自由記述（氏名→メール逆引き）
 function resolveEmailFromRow(r:any): string|undefined {
-  const C_EMAIL = ["email","mail","担当者メール","担当者 メールアドレス","担当メール","担当者email","owner email","ユーザー メール"];
+  const C_EMAIL = [
+    "email","mail",
+    "担当者メール","担当者 メールアドレス","担当メール","担当者email",
+    "owner email","オーナー メール","ユーザー メール","営業担当メール","担当者e-mail","担当e-mail"
+  ];
   const kEmail  = firstMatchKey(r, C_EMAIL);
   if (kEmail) {
     const e = String(r[kEmail]||"").toLowerCase().trim();
     if (e) return e;
   }
+  // DXPort の自由記述欄候補
   const K_DX = [
-    "承認条件 回答23","承認条件 回答２３","DXPortの","DX PORTの","DXPortの担当者","獲得者","DX Portの","DXportの"
+    "承認条件 回答23","承認条件 回答２３","DXPortの","DX PORTの",
+    "DXPortの担当者","獲得者","DX Portの","DXportの","dxportの","dx portの",
+    "自由記述","備考（dxport）","dxport 備考"
   ];
   const kDx = firstMatchKey(r, K_DX);
   if (kDx) {
@@ -571,19 +584,28 @@ function resolveEmailFromRow(r:any): string|undefined {
   return undefined;
 }
 
+// CSV 正規化：日本語ヘッダ & type 無しでも判定。アポ系行は無視（Webhook 任せ）
 function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
-  const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","brand","maker"];
-  const C_AMOUNT = ["金額","売上","受注金額","金額(円)","amount","price","契約金額","成約金額"];
-  const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号"];
-  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at"];
-  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果"];
-  const C_TYPE   = ["type","種別","イベント種別"];
+  const C_MAKER  = [
+    "メーカー","メーカー名","メーカー名（取引先）","ブランド","brand","maker","取引先名","会社名","メーカー（社名）"
+  ];
+  const C_AMOUNT = [
+    "金額","売上","受注金額","受注金額（税込）","受注金額（税抜）",
+    "売上金額","売上金額（税込）","売上金額（税抜）",
+    "金額(円)","amount","price","契約金額","成約金額","合計金額","売上合計"
+  ];
+  const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号","伝票番号","管理番号"];
+  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at","発生日","受注日","計上日"];
+  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果","最終結果","判定","合否","承認ステータス"];
+  const C_TYPE   = ["type","種別","イベント種別","カテゴリ","区分","種類"];
+  const C_APPT   = ["アポ","アポイント","appointment","appointment_scheduled","アポ数","新規アポ"]; // 無視対象
 
   const out: Array<{type:"approval"|"sales"|"maker"; email?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string}> = [];
 
   for (const r of recs) {
+    // 1) 標準形式
     if (r.type || r.email || r.amount || r.maker) {
       const t = String(r.type||"").trim().toLowerCase();
       if (["approval","sales","maker"].includes(t)) {
@@ -598,9 +620,12 @@ function normalizeCsv(text: string){
         });
         continue;
       }
+      // アポっぽい type は CSV では無視
+      if (C_APPT.some(k => t.includes(k))) continue;
     }
 
-    const email  = resolveEmailFromRow(r);
+    // 2) 自由形式
+    const email   = resolveEmailFromRow(r);
     const kMaker  = firstMatchKey(r, C_MAKER);
     const kAmt    = firstMatchKey(r, C_AMOUNT);
     const kId     = firstMatchKey(r, C_ID);
@@ -608,15 +633,19 @@ function normalizeCsv(text: string){
     const kApf    = firstMatchKey(r, C_APPROV);
     const kType   = firstMatchKey(r, C_TYPE);
 
-    const maker = kMaker ? String(r[kMaker]||"").trim() : undefined;
+    const maker = kMaker ? String(r[kMaker]||"").toString().trim() : undefined;
     const amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
-    const rid = kId ? String(r[kId]||"").trim() : undefined;
-    const date = kDate ? String(r[kDate]||"").trim() : undefined;
+    const rid = kId ? String(r[kId]||"").toString().trim() : undefined;
+    const date = kDate ? String(r[kDate]||"").toString().trim() : undefined;
 
     let explicitType: "approval"|"sales"|"maker"|undefined;
     if (kType) {
-      const t = String(r[kType]||"").trim().toLowerCase();
-      if (["approval","sales","maker"].includes(t)) explicitType = t as any;
+      const t = String(r[kType]||"").toLowerCase().trim();
+      if (["approval","sales","maker"].includes(t)) {
+        explicitType = t as any;
+      } else if (C_APPT.some(k => t.includes(k))) {
+        continue; // アポは無視
+      }
     }
 
     const approved = kApf ? truthyJP(r[kApf]) : false;
@@ -629,11 +658,12 @@ function normalizeCsv(text: string){
       out.push({ type:"approval", email, maker, id: rid, date, notes:"from CSV(auto)" });
       continue;
     }
-    if (explicitType === "maker" || maker) {
+    if (explicitType === "maker" || (!!maker && !amount && !approved)) {
       out.push({ type:"maker",   email, maker, id: rid, date, notes:"from CSV(auto)" });
       out.push({ type:"approval",email, maker, id: rid, date, notes:"from CSV(auto,maker-as-approval)" });
       continue;
     }
+    // それ以外（アポ/空行想定）はスキップ
   }
   return out;
 }
@@ -645,6 +675,14 @@ function requireBearerCsv(req: Request, res: Response): boolean {
   if (CSV_UPLOAD_TOKENS.includes(token)) return true;
   res.status(401).json({ok:false,error:"auth"}); return false;
 }
+
+// 診断用（任意）：CSVヘッダ確認
+app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (req, res) => {
+  const text = String((req as any).body||"");
+  const rows:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
+  const heads = rows.length ? Object.keys(rows[0]) : [];
+  res.json({ ok:true, rows: rows.length, headers: heads, sample: rows.slice(0,3) });
+});
 
 app.post("/admin/csv", express.text({ type:"text/csv", limit:"20mb" }));
 app.post("/admin/csv", async (req: Request, res: Response)=>{
