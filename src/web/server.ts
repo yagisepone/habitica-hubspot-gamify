@@ -543,8 +543,10 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
     if (m) return m;
   }
   for (const key of keys) {
-    const k = lc(key);
-    if (candidates.some(c => k.includes(lc(c)))) return key;
+    thek: {
+      const k = lc(key);
+      if (candidates.some(c => k.includes(lc(c)))) return key;
+    }
   }
   return undefined;
 }
