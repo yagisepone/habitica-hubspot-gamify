@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-24 final
+// server.ts  — 2025-09-24 final (full, no omissions)
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -195,15 +195,18 @@ import {
   addSales,
   addMakerAward,
   addAppointment,
-  addBadge,
 } from "../connectors/habitica.js";
 
 /* =============== Habitica 429対策（直列キュー） =============== */
 const HABITICA_MIN_INTERVAL_MS = Number(process.env.HABITICA_MIN_INTERVAL_MS || 300);
 function sleep(ms:number){ return new Promise(r=>setTimeout(r,ms)); }
-let _habQ: Promise<unknown> = Promise.resolve();
+let _habQ: Promise<any> = Promise.resolve();
 function habEnqueue<T>(fn:()=>Promise<T>): Promise<T> {
-  _habQ = _habQ.then(async ()=>{ await sleep(HABITICA_MIN_INTERVAL_MS); return fn(); });
+  const next = async () => {
+    await sleep(HABITICA_MIN_INTERVAL_MS);
+    return fn();
+  };
+  _habQ = _habQ.then(next, next);
   return _habQ as Promise<T>;
 }
 async function habSafe<T>(fn:()=>Promise<T>): Promise<T|undefined> {
@@ -848,7 +851,6 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
       return rows.length? rows.join("\n"): "（該当なし）";
     }
 
-    // 今回アップロード分の「日付」列が付いていないことも想定：sales.jsonl等のdayは保存済みだが、ここは“今回の集計”なので perPersonだけで表示
     const lines:string[] = [];
     lines.push(`📦 CSV取込サマリー`);
     lines.push(`📅 本日 ${today}`);
