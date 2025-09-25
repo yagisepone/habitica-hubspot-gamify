@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-25 final (full, no omissions)
+// server.ts  — 2025-09-25 internal-only dashboard (full, no omissions)
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -228,6 +228,30 @@ const getHabitica = (email?: string)=> email? HAB_MAP[email.toLowerCase()]: unde
 const MAIL2NAME: Record<string,string> = {};
 for (const [jp, m] of Object.entries(NAME2MAIL)) { MAIL2NAME[m] = jp; }
 
+/* --- 社内アポインター判定（メール or 氏名でホワイトリスト） --- */
+// ※ VSCode の型赤線を回避するため、配列→mapの順で明示し Set<string> に投入
+const INTERNAL_EMAILS: Set<string> = new Set(
+  (
+    [
+      ...Object.keys(HAB_MAP as Record<string, unknown>),
+      ...Object.keys(NAME2MAIL as Record<string, string>).map(
+        (k) => (NAME2MAIL as Record<string, string>)[k]
+      ),
+    ] as string[]
+  ).map((e) => String(e).toLowerCase())
+);
+
+const INTERNAL_NAMES: Set<string> = new Set(
+  Object.keys(NAME2MAIL as Record<string, string>).map((n) => normSpace(n))
+);
+
+// イベントの actor/email/name から「社内か？」を判定
+function isInternalActor(a: any): boolean {
+  const em = String(a?.actor?.email || a?.email || "").toLowerCase().trim();
+  const nm = normSpace(a?.actor?.name || (em && MAIL2NAME[em]) || "");
+  return (!!em && INTERNAL_EMAILS.has(em)) || (!!nm && INTERNAL_NAMES.has(nm));
+}
+
 /* =============== 重複抑止 =============== */
 const seen = new Map<string, number>();
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24*60*60);
@@ -236,7 +260,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 /* =============== Health/Support =============== */
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-25-final", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-25-internal", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -568,7 +592,7 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
   return undefined;
 }
 
-// ======== ★ ここから CSV要件の最重要部（DXPort名＆承認日時ベース） ========
+// ======== CSV要件の最重要部（DXPort名＆承認日時ベース） ========
 
 // DXPort の自由記述から氏名を抜く（唯一の定義）
 function extractDxPortNameFromText(s?: string): string|undefined {
@@ -899,13 +923,15 @@ app.get("/admin/dashboard", (_req,res)=>{
 
   function isMonth(d:string){ return String(d||"").slice(0,7) === monthKey; }
 
+  // ★ 社内アポインターのみ集計（メール/氏名ホワイトリスト）
   function aggByDay(day:string){
     const by:Record<string, any> = {};
     const nm = (a:any)=> displayName(a);
-    for(const x of calls.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].calls+=1; by[k].min+=Math.round((x.ms||0)/60000); }
-    for(const x of appts.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].appts+=1; }
-    for(const x of apprs.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].apprs+=1; }
-    for(const x of sales.filter(v=>v.day===day)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].sales+=Number(x.amount||0); }
+
+    for(const x of calls.filter(v=>v.day===day && isInternalActor(v))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].calls+=1; by[k].min+=Math.round((x.ms||0)/60000); }
+    for(const x of appts.filter(v=>v.day===day && isInternalActor(v))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].appts+=1; }
+    for(const x of apprs.filter(v=>v.day===day && isInternalActor(v))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].apprs+=1; }
+    for(const x of sales.filter(v=>v.day===day && isInternalActor(v))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].sales+=Number(x.amount||0); }
     for(const k of Object.keys(by)){ const v=by[k]; v.rate = v.appts>0? Math.round((v.apprs/v.appts)*100):0; }
     return Object.values(by).sort((a:any,b:any)=>a.name.localeCompare(b.name));
   }
@@ -913,25 +939,28 @@ app.get("/admin/dashboard", (_req,res)=>{
   function aggByMonth(){
     const by:Record<string, any> = {};
     const nm = (a:any)=> displayName(a);
-    for(const x of calls.filter(v=>isMonth(v.day))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].calls+=1; by[k].min+=Math.round((x.ms||0)/60000); }
-    for(const x of appts.filter(v=>isMonth(v.day))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].appts+=1; }
-    for(const x of apprs.filter(v=>isMonth(v.day))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].apprs+=1; }
-    for(const x of sales.filter(v=>isMonth(v.day))){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].sales+=Number(x.amount||0); }
+    const inMonthAndInternal = (v:any)=> isMonth(v.day) && isInternalActor(v);
+
+    for(const x of calls.filter(inMonthAndInternal)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].calls+=1; by[k].min+=Math.round((x.ms||0)/60000); }
+    for(const x of appts.filter(inMonthAndInternal)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].appts+=1; }
+    for(const x of apprs.filter(inMonthAndInternal)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].apprs+=1; }
+    for(const x of sales.filter(inMonthAndInternal)){ const k=nm(x); by[k]??={name:k,calls:0,min:0,appts:0,apprs:0,sales:0}; by[k].sales+=Number(x.amount||0); }
     for(const k of Object.keys(by)){ const v=by[k]; v.rate = v.appts>0? Math.round((v.apprs/v.appts)*100):0; }
     return Object.values(by).sort((a:any,b:any)=>a.name.localeCompare(b.name));
   }
 
   function aggMakersByDay(day:string){
     const by:Record<string,{maker:string;count:number;sales:number}> = {};
-    for(const x of apprs.filter(v=>v.day===day)){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].count+=1; }
-    for(const x of sales.filter(v=>v.day===day)){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].sales+=Number(x.amount||0); }
+    for(const x of apprs.filter(v=>v.day===day && isInternalActor(v))){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].count+=1; }
+    for(const x of sales.filter(v=>v.day===day && isInternalActor(v))){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].sales+=Number(x.amount||0); }
     return Object.values(by).sort((a,b)=> b.count-a.count || b.sales-a.sales || a.maker.localeCompare(b.maker));
   }
 
   function aggMakersByMonth(){
     const by:Record<string,{maker:string;count:number;sales:number}> = {};
-    for(const x of apprs.filter(v=>isMonth(v.day))){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].count+=1; }
-    for(const x of sales.filter(v=>isMonth(v.day))){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].sales+=Number(x.amount||0); }
+    const inMonthAndInternal = (v:any)=> isMonth(v.day) && isInternalActor(v);
+    for(const x of apprs.filter(inMonthAndInternal)){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].count+=1; }
+    for(const x of sales.filter(inMonthAndInternal)){ const m=(x.maker||"").trim(); if(!m) continue; by[m]??={maker:m,count:0,sales:0}; by[m].sales+=Number(x.amount||0); }
     return Object.values(by).sort((a,b)=> b.count-a.count || b.sales-a.sales || a.maker.localeCompare(b.maker));
   }
 
