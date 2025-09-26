@@ -68,6 +68,45 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 
+/* ▼▼ 追加：CSVの承認日時をJSTで堅牢にパースし、"YYYY-MM-DD" を返す補助 ▼▼ */
+// CSVの「承認日時」をできるだけ多くの表記で受け入れてJST Dateにする
+function parseCsvDateJST(raw: any): Date | undefined {
+  const s0 = String(raw ?? "").trim();
+  if (!s0) return undefined;
+
+  // 全角 -> 半角に近い正規化（年月日→"/"、スペース統一）
+  const s = s0
+    .replace(/[年月.]/g, "/")
+    .replace(/日/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const isoish = s.replace(/\//g, "-"); // 2025-06-09 14:16
+  const candidates = [
+    s,
+    s.split(" ")[0],
+    isoish,
+    isoish.replace(" ", "T"),
+  ];
+
+  for (const c of candidates) {
+    const d = new Date(c);
+    if (!isNaN(d.getTime())) {
+      // DateはUTC基準になりやすいので +9h してJST寄せ
+      const jstMs = d.getTime() + 9 * 60 * 60 * 1000;
+      return new Date(jstMs);
+    }
+  }
+  return undefined;
+}
+function toJstDayString(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+/* ▲▲ 追加ここまで ▲▲ */
+
 /* HubSpot v3 の sourceId から userId を抜く（例: "userId:81798571" -> "81798571"） */
 function parseHubSpotSourceUserId(raw: any): string | undefined {
   const s = String(raw?.sourceId || raw?.source_id || "");
@@ -680,7 +719,7 @@ function normalizeCsv(text: string){
   const C_APPR_DT = ["承認日時","承認日"]; // day に使う
   const C_STATUS  = ["商談ステータス","ステータス","最終結果"]; // 必ず「承認」のみ通す
 
-  type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string};
+  type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; date?:string; day?:string; notes?:string};
   const out: Out[] = [];
 
   for (const r of recs) {
@@ -699,10 +738,12 @@ function normalizeCsv(text: string){
       if (!ok) continue;
     }
 
-    // 3) 承認日時（なければskip）
+    // 3) 承認日時（必須）→ JSTで厳密パースして day を得る
     const kApprDt = firstMatchKey(r, C_APPR_DT);
-    const date = kApprDt ? String(r[kApprDt]||"").trim() : "";
-    if (!date) continue; // 必須
+    const dateRaw = kApprDt ? String(r[kApprDt]||"").trim() : "";
+    const approvedAt = parseCsvDateJST(dateRaw);
+    if (!approvedAt) continue; // パース不可はスキップ
+    const approvedDay = toJstDayString(approvedAt);
 
     // 4) その他
     const kMaker  = firstMatchKey(r, C_MAKER);
@@ -722,12 +763,12 @@ function normalizeCsv(text: string){
 
     const rid = kId ? String(r[kId]||"").toString().trim() : undefined;
 
-    // 5) 必ず approval を1件計上
-    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date, notes:"from CSV(approved)" });
+    // 5) 必ず approval を1件計上（day を明示）
+    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date: dateRaw, day: approvedDay, notes:"from CSV(approved)" });
 
     // 6) 金額があるなら sales も計上
     if (amount && amount>0) {
-      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date, notes:"from CSV(approved+amount)" });
+      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date: dateRaw, day: approvedDay, notes:"from CSV(approved+amount)" });
     }
   }
   return out;
@@ -778,11 +819,11 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     const amount = r.amount != null ? Number(r.amount) : undefined;
     const maker = r.maker ? String(r.maker).trim() : undefined;
     const id = String(r.id || `${r.type}:${actorName}:${maker||"-"}`).trim();
-    const date = r.date ? String(r.date) : undefined;
+    const day = r.day as string; // ★ 正規化で必ず設定済み
 
     if (r.type==="approval") {
       nA++;
-      appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker });
+      appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker });
       if (!DRY_RUN) {
         const cred = getHabitica(email);
         if (cred) await habSafe(()=>addApproval(cred,1,"CSV").then(()=>undefined as any));
@@ -792,7 +833,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
     if (r.type==="sales") {
       nS++; sum+=(amount||0);
-      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker, amount });
+      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker, amount });
 
       aggPerson(actorName).salesSum += (amount||0);
       aggPerson(actorName).salesCount += 1;
@@ -807,7 +848,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
     if (r.type==="maker") {
       nM++;
-      appendJsonl("data/events/maker.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker });
+      appendJsonl("data/events/maker.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker });
       if (!DRY_RUN) {
         const cred = getHabitica(email);
         if (cred) await habSafe(()=>addMakerAward(cred,1).then(()=>undefined as any));
