@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-25 strict-approval (full, no omissions)
+// server.ts  — 2025-09-26 spec-v1.4 aligned (full, no omissions)
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -228,18 +228,6 @@ const getHabitica = (email?: string)=> email? HAB_MAP[email.toLowerCase()]: unde
 const MAIL2NAME: Record<string,string> = {};
 for (const [jp, m] of Object.entries(NAME2MAIL)) { MAIL2NAME[m] = jp; }
 
-/* --- 社内アポインターのホワイトリスト（メール＆氏名） --- */
-const INTERNAL_EMAILS = new Set<string>([
-  ...Object.keys(HAB_MAP).map(e=>e.toLowerCase()),
-  ...Object.values(NAME2MAIL).map(e=>e.toLowerCase()),
-]);
-const INTERNAL_NAMES = new Set<string>(Object.keys(NAME2MAIL).map(normSpace));
-function isInternalActor(actor:{name?:string; email?:string}): boolean {
-  const em = String(actor?.email||"").toLowerCase().trim();
-  const nm = normSpace(actor?.name || (em? MAIL2NAME[em]: "") || "");
-  return (!!em && INTERNAL_EMAILS.has(em)) || (!!nm && INTERNAL_NAMES.has(nm));
-}
-
 /* =============== 重複抑止 =============== */
 const seen = new Map<string, number>();
 const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24*60*60);
@@ -248,7 +236,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 /* =============== Health/Support =============== */
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-25-strict-approval", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-26-spec-v1.4", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -510,7 +498,6 @@ async function awardXpForCallDuration(ev: CallDurEv){
     const cred = getHabitica(who.email);
     if (!cred || DRY_RUN) {
       log(`[call] per-call base +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
-      console.log(`(+call) +${CALL_XP_PER_CALL}XP`);
     } else {
       await habSafe(async ()=>{
         const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
@@ -532,7 +519,6 @@ async function awardXpForCallDuration(ev: CallDurEv){
   const cred = getHabitica(who.email);
   if (!cred || DRY_RUN) {
     log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`);
-    console.log(`(5分加点) +${xpExtra}XP`);
     return;
   }
   await habSafe(async ()=>{
@@ -551,7 +537,7 @@ async function handleCallDurationEvent(ev: CallDurEv){
 }
 
 /* =============== CSV（承認・売上・メーカー賞 取り込み） =============== */
-// 真偽（承認済み等）のゆるい判定（※従来互換で残すが今回の厳密分岐では未使用）
+// 真偽（承認済み等）のゆるい判定を拡張
 function truthyJP(v: any) {
   const s = String(v ?? "").trim().toLowerCase();
   return [
@@ -607,7 +593,7 @@ function resolveActorFromRow(r:any): {name?:string; email?:string} {
   if (kDx) {
     const nameJp = extractDxPortNameFromText(String(r[kDx]||""));
     if (nameJp) {
-      const email = NAME2MAIL[nameJp]; // 無ければ undefined（=Habitica付与はスキップ、集計は名前で実施）
+      const email = NAME2MAIL[nameJp];
       return { name: nameJp, email };
     }
   }
@@ -666,55 +652,55 @@ async function readCsvTextFromReq(req: Request): Promise<string> {
   });
 }
 
-/* ==== ここから：CSV「厳密」正規化（社内のみ & 商談ステータス=承認 & 承認日時ベース） ==== */
-// 承認ステータス列候補 & 承認日時は“承認日時”を必須採用
-const C_STATUS = ["商談ステータス","承認ステータス","結果","最終結果","判定","ステータス"];
-const C_APPROVAL_AT_STRICT = ["承認日時"]; // 厳密指定：ここだけ使う
-
-// 値が“承認”かどうか（4種想定：承認/却下/承認待ち/要対応）
-function isStatusApproved(val:any): boolean {
-  const s = normSpace(String(val||"")).toLowerCase();
-  if (!s) return false;
-  const clean = s.replace(/\s+/g,"");
-  return clean === "承認" || clean === "approved";
-}
-
-// CSV 正規化：承認「のみ」／承認日時「必須」／社内アポインター「のみ」
-function normalizeCsvStrict(text: string){
+// CSV 正規化：アポ行は無視（Webhook 任せ）
+// 承認/売上/メーカーのみ返す。actorは DXPort 名が基本。REQUIRE_DXPORT_NAME=true ならDXPort名なしの行は捨てる。
+function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
   const C_MAKER  = ["メーカー","メーカー名","メーカー名（取引先）","ブランド","brand","maker","取引先名","会社名","メーカー（社名）"];
   const C_AMOUNT = ["金額","売上","受注金額","受注金額（税込）","受注金額（税抜）","売上金額","売上金額（税込）","売上金額（税抜）","金額(円)","amount","price","契約金額","成約金額","合計金額","売上合計","報酬","追加報酬"];
   const C_ID     = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号","伝票番号","管理番号"];
+  const C_DATE   = ["date","日付","作成日","成約日","承認日","登録日","received at","created at","発生日","受注日","計上日","承認日時","商談終了日時"];
+  const C_APPROV = ["承認","承認済み","approval","approved","ステータス","結果","最終結果","判定","合否","承認ステータス","商談ステータス","承認日時","承認日"];
+  const C_TYPE   = ["type","種別","イベント種別","カテゴリ","区分","種類"];
+  const C_APPT   = ["アポ","アポイント","appointment","appointment_scheduled","アポ数","新規アポ"]; // 無視対象
 
   type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string};
   const out: Out[] = [];
 
   for (const r of recs) {
-    // 1) 社内アポインター解決（DX PORT欄 > メール）＆フィルタ
     const actor = resolveActorFromRow(r);
-    if (REQUIRE_DXPORT_NAME && !actor.name) continue;
-    if (!actor.name && !actor.email) continue;
-    if (!isInternalActor(actor)) continue; // 社内のみ
-
-    // 2) ステータス=承認 の行だけ通す
-    const kStatus = firstMatchKey(r, C_STATUS);
-    if (!kStatus || !isStatusApproved(r[kStatus])) {
+    if (REQUIRE_DXPORT_NAME && !actor.name) {
       continue;
     }
 
-    // 3) 承認日時が必須（ここから day を作る）。未記入はスキップ（←“今日”丸めを禁止）
-    const kApprAt = firstMatchKey(r, C_APPROVAL_AT_STRICT);
-    if (!kApprAt) continue;
-    const apprAtRaw = String(r[kApprAt] ?? "").trim();
-    if (!apprAtRaw) continue;
-    const dayIso = isoDay(apprAtRaw); // Asia/Tokyo で日付化
+    if (r.type || r.email || r.amount || r.maker) {
+      const t = String(r.type||"").trim().toLowerCase();
+      if (["approval","sales","maker"].includes(t)) {
+        out.push({
+          type: t as any,
+          email: actor.email || (r.email? String(r.email).toLowerCase(): undefined),
+          name: actor.name,
+          amount: numOrUndefined(r.amount),
+          maker: r.maker? String(r.maker).trim(): undefined,
+          id: r.id? String(r.id).trim(): undefined,
+          date: r.date? String(r.date).trim(): undefined,
+          notes: r.notes? String(r.notes): undefined,
+        });
+        continue;
+      }
+      if (C_APPT.some(k => t.includes(k))) continue;
+    }
 
-    // 4) 付帯情報
     const kMaker  = firstMatchKey(r, C_MAKER);
+    const kAmt    = firstMatchKey(r, C_AMOUNT);
+    const kId     = firstMatchKey(r, C_ID);
+    const kDate   = firstMatchKey(r, C_DATE);
+    const kApf    = firstMatchKey(r, C_APPROV);
+    const kType   = firstMatchKey(r, C_TYPE);
+
     const maker = kMaker ? String(r[kMaker]||"").toString().trim() : undefined;
 
-    const kAmt    = firstMatchKey(r, C_AMOUNT);
     let amount = kAmt ? numOrUndefined(r[kAmt]) : undefined;
     if (kAmt && /報酬/.test(kAmt)) {
       const addKey = firstMatchKey(r, ["追加報酬"]);
@@ -724,24 +710,56 @@ function normalizeCsvStrict(text: string){
       }
     }
 
-    const kId     = firstMatchKey(r, C_ID);
-    const rid     = kId ? String(r[kId]||"").toString().trim() : undefined;
+    const rid = kId ? String(r[kId]||"").toString().trim() : undefined;
+    const date = kDate ? String(r[kDate]||"").toString().trim() : undefined;
 
-    // 5) 承認イベント（必ず出す）
-    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date: dayIso, notes:"from CSV(strict)" });
-
-    // 6) 金額があるなら売上イベント（承認日に計上）
-    if (amount && amount>0) {
-      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date: dayIso, notes:"from CSV(strict)" });
+    let explicitType: "approval"|"sales"|"maker"|undefined;
+    if (kType) {
+      const t = String(r[kType]||"").toLowerCase().trim();
+      if (["approval","sales","maker"].includes(t)) {
+        explicitType = t as any;
+      } else if (C_APPT.some(k => t.includes(k))) {
+        continue;
+      }
     }
 
-    // （メーカーのみで金額がない、のようなケースは「承認日に approval として出る」ので maker単独追加は不要）
-  }
+    let approved = false;
+    if (kApf) {
+      const header = kApf.toString();
+      const val = r[kApf];
+      if (/承認日/.test(header) || /承認日時/.test(header)) {
+        approved = String(val ?? "").trim().length > 0;
+      } else {
+        approved = truthyJP(val);
+      }
+    }
 
+    if (explicitType === "sales" || (explicitType===undefined && amount && amount>0)) {
+      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date, notes:"from CSV(auto)" });
+      continue;
+    }
+    if (explicitType === "approval" || approved) {
+      out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date, notes:"from CSV(auto)" });
+      continue;
+    }
+    if (explicitType === "maker" || (!!maker && !amount && !approved)) {
+      out.push({ type:"maker",   email:actor.email, name:actor.name, maker, id: rid, date, notes:"from CSV(auto)" });
+      out.push({ type:"approval",email:actor.email, name:actor.name, maker, id: rid, date, notes:"from CSV(auto,maker-as-approval)" });
+      continue;
+    }
+  }
   return out;
 }
 
-/* ---- 従来の検出APIはそのまま（ヘッダ確認用） ---- */
+function requireBearerCsv(req: Request, res: Response): boolean {
+  const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
+  if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length===0) { res.status(500).json({ok:false,error:"missing tokens"}); return false; }
+  if (token===AUTH_TOKEN) return true;
+  if (CSV_UPLOAD_TOKENS.includes(token)) return true;
+  res.status(401).json({ok:false,error:"auth"}); return false;
+}
+
+// 診断用（任意）：CSVヘッダ確認
 app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (req, res) => {
   const text = String((req as any).body||"");
   const rows:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
@@ -751,7 +769,7 @@ app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (
 
 // text/csv は既存通り受け付け
 app.post("/admin/csv", express.text({ type:"text/csv", limit:"20mb" }));
-// どの Content-Type でも CSV を受け取り可能に（←このハンドラで厳密版を適用）
+// どの Content-Type でも CSV を受け取り可能に
 app.post("/admin/csv", async (req: Request, res: Response)=>{
   if(!requireBearerCsv(req,res)) return;
 
@@ -760,12 +778,15 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     return res.json({ ok:true, mode: "noop", received: 0, accepted: { approval: 0, sales: 0, maker: 0 }, totalSales: 0, duplicates: 0, errors: 0, hint: "empty-or-unparsed-csv" });
   }
 
-  // ★ 厳密版に切替（社内のみ / ステータス=承認 / 承認日時ベース）
-  const normalized = normalizeCsvStrict(text);
+  const normalized = normalizeCsv(text);
 
   let nA=0, nS=0, nM=0, sum=0;
   type PersonAgg = {name:string; salesSum:number; salesCount:number; makers:Record<string,number>};
   const perPerson: Record<string, PersonAgg> = {};
+
+  // この取込で新規に追加した「承認」だけを一旦メモ（メーカー賞の“当日最多”判定用）
+  type NewApproval = { day: string; maker?: string; actorEmail?: string; actorName: string };
+  const newApprovals: NewApproval[] = [];
 
   function aggPerson(name: string){
     const n = name || "担当者";
@@ -779,42 +800,91 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     const amount = r.amount != null ? Number(r.amount) : undefined;
     const maker = r.maker ? String(r.maker).trim() : undefined;
     const id = String(r.id || `${r.type}:${actorName}:${maker||"-"}`).trim();
-    const dateIso = r.date ? String(r.date) : undefined; // ここは承認日時→isoDay済み
+    const date = r.date ? String(r.date) : undefined;
+    const day = isoDay(date);
 
     if (r.type==="approval") {
       nA++;
-      appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day:dateIso, email, actor:{name:actorName, email}, id, maker });
+      appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker });
+      newApprovals.push({ day, maker, actorEmail: email, actorName });
+      // ▼ Habitica 付与：仕様 v1.4 → 承認 +30XP（バッジ名あり）。非待機で発火。
       if (!DRY_RUN) {
         const cred = getHabitica(email);
-        if (cred) await habSafe(()=>addApproval(cred,1,"CSV").then(()=>undefined as any));
+        if (cred) { void habSafe(()=>addApproval(cred, 30, "✅ 承認").then(()=>undefined as any)); }
       }
       if (CW_PER_ROW) { try { await sendChatworkMessage(cwApprovalText(actorName, maker)); } catch {} }
     }
 
     if (r.type==="sales") {
       nS++; sum+=(amount||0);
-      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day:dateIso, email, actor:{name:actorName, email}, id, maker, amount });
+      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker, amount });
 
       aggPerson(actorName).salesSum += (amount||0);
       aggPerson(actorName).salesCount += 1;
       if (maker)  aggPerson(actorName).makers[maker] = (aggPerson(actorName).makers[maker]||0)+(amount||0);
 
+      // ▼ Habitica 付与：仕様 v1.4 → 10万円ごと +50XP。xp>0 のときのみ付与。非待機。
       if (!DRY_RUN) {
         const cred = getHabitica(email);
-        if (cred && amount) await habSafe(()=>addSales(cred, amount, "CSV").then(()=>undefined as any));
+        const amt = amount || 0;
+        const xp = Math.floor(amt / 100000) * 50;
+        if (cred && xp > 0) { void habSafe(()=>addSales(cred, xp, "💴 売上(10万ごと)").then(()=>undefined as any)); }
       }
       if (CW_PER_ROW) { try { await sendChatworkMessage(cwSalesText(actorName, amount, maker)); } catch {} }
     }
 
     if (r.type==="maker") {
       nM++;
-      appendJsonl("data/events/maker.jsonl",{ at:new Date().toISOString(), day:dateIso, email, actor:{name:actorName, email}, id, maker });
-      if (!DRY_RUN) {
-        const cred = getHabitica(email);
-        if (cred) await habSafe(()=>addMakerAward(cred,1).then(()=>undefined as any));
-      }
+      appendJsonl("data/events/maker.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker });
+      // メーカー賞は“最多メーカー1回のみ”へ変更したため、ここでは Habitica 付与は行わない
       if (CW_PER_ROW) { try { await sendChatworkMessage(cwMakerAchievementText(actorName, maker)); } catch {} }
     }
+  }
+
+  // =====⚙ 仕様 v1.4：メーカー賞（当日“最多メーカー”を1回だけ授与）=====
+  try {
+    // 当日キー（JST）
+    const today = isoDay();
+    // 承認の保存済データ（このCSVの追記分も含む）から “本日” のメーカー別件数を集計
+    const apprs = readJsonlAll("data/events/approvals.jsonl").filter(x => x?.day === today);
+    const countByMaker: Record<string, number> = {};
+    for (const a of apprs) {
+      const m = String(a?.maker || "").trim();
+      if (!m) continue;
+      countByMaker[m] = (countByMaker[m] || 0) + 1;
+    }
+    // 最多メーカーを1つ選ぶ（件数降順→名前昇順）
+    const topMaker = Object.entries(countByMaker)
+      .sort((a,b)=> b[1]-a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+
+    if (topMaker) {
+      // そのメーカーの中で “本日” 承認を最も多く取っている担当者を1名選出
+      const countByActor: Record<string, {email?:string; name:string; count:number}> = {};
+      for (const a of apprs) {
+        const m = String(a?.maker || "").trim();
+        if (m !== topMaker) continue;
+        const em: string|undefined = a?.email || a?.actor?.email;
+        const nm: string = (a?.actor?.name) || (em? (MAIL2NAME[em] || em.split("@")[0]) : "担当者");
+        const key = (em || nm);
+        if (!countByActor[key]) countByActor[key] = { email: em, name: nm, count: 0 };
+        countByActor[key].count += 1;
+      }
+      const topActor = Object.values(countByActor).sort((a,b)=> b.count - a.count || a.name.localeCompare(b.name))[0];
+
+      if (topActor && topActor.email) {
+        const cred = getHabitica(topActor.email);
+        if (cred && !DRY_RUN) {
+          // “1回だけ”授与：同日に何度CSV入れても、その都度付け直さない簡易ガード（当日 + actor + maker で seen）
+          const awardKey = `maker-award:${today}:${topActor.email}:${topMaker}`;
+          if (!hasSeen(awardKey)) {
+            markSeen(awardKey);
+            void habSafe(()=>addMakerAward(cred, 1).then(()=>undefined as any));
+          }
+        }
+      }
+    }
+  } catch (e:any) {
+    console.error("[maker-award] failed:", e?.message || e);
   }
 
   // ===== Chatwork: サマリ 1通だけ（本日 / 今月） =====
@@ -850,14 +920,6 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
   res.json({ ok:true, mode:"upsert", received: normalized.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales: sum, duplicates: 0, errors: 0 });
 });
-
-function requireBearerCsv(req: Request, res: Response): boolean {
-  const token = (req.header("authorization")||"").replace(/^Bearer\s+/i,"");
-  if (!AUTH_TOKEN && CSV_UPLOAD_TOKENS.length===0) { res.status(500).json({ok:false,error:"missing tokens"}); return false; }
-  if (token===AUTH_TOKEN) return true;
-  if (CSV_UPLOAD_TOKENS.includes(token)) return true;
-  res.status(401).json({ok:false,error:"auth"}); return false;
-}
 
 /* =============== ダッシュボード（本日 / 月次 / 前日） =============== */
 function displayName(a:any){
