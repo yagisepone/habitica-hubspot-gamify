@@ -1,4 +1,5 @@
-// server.ts  — 2025-09-29 final (full, no omissions, approval-date based daily/monthly summary + daily Maker Award auto-grant)
+// server.ts  — 2025-09-29 final (fixed minimal)
+// approval-date based daily/monthly summary + daily Maker Award auto-grant
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -38,11 +39,11 @@ function readJsonlAll(fp: string): any[] {
 function writeJson(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); }
 function readJson<T=any>(fp: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(fp,"utf8")); } catch { return fallback; } }
 function isoDay(d?: any) {
-  const t = d ? new Date(d) : new Date();
+  const t = d instanceof Date ? d : (d ? new Date(d) : new Date());
   return t.toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit"}).replace(/\//g,"-");
 }
 function isoMonth(d?: any) {
-  const t = d ? new Date(d) : new Date();
+  const t = d instanceof Date ? d : (d ? new Date(d) : new Date());
   return t.toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit"}).replace(/\//g,"-");
 }
 function fmtJST(ms?: any) {
@@ -577,12 +578,26 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
   return undefined;
 }
 
+// 承認日時のゆるいパース（YYYY/MM/DD[ HH:mm[:ss]] と - の両対応）
+function parseApprovalAt(s?: string): Date | null {
+  if (!s) return null;
+  const t = String(s).trim().replace(/-/g, "/");
+  const m = t.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (m) {
+    const [_, y, mo, d, h = "0", mi = "0", se = "0"] = m;
+    const dLocal = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(se));
+    return isNaN(dLocal.getTime()) ? null : dLocal;
+  }
+  const d2 = new Date(t);
+  return isNaN(d2.getTime()) ? null : d2;
+}
+
 // DXPort の自由記述から氏名を抜く（唯一の定義）
 function extractDxPortNameFromText(s?: string): string|undefined {
   const t = normSpace(s);
   if (!t) return undefined;
-  // 例: "DX PORTの 山田太郎", "DxPortの田中", "DXPORTの: 佐藤"
-  const m = t.match(/D\s*X\s*P?\s*O?\s*R?\s*T?\s*の\s*([^\s].*)$/i);
+  // 例: "DX PORTの 山田太郎", "DxPortの田中", "DXPORTの: 佐藤", "DXportの東里奈"
+  const m = t.match(/D\s*X\s*(?:P\s*O\s*R\s*T)?\s*の\s*([^\s].*)$/i);
   if (m && m[1]) return normSpace(m[1]);
   return undefined;
 }
@@ -622,7 +637,7 @@ async function readCsvTextFromReq(req: Request): Promise<string> {
 
   if (ct.includes("multipart/form-data")) {
     return await new Promise<string>((resolve, reject) => {
-      const bb = Busboy({ headers: req.headers });
+      const bb = Busboy({ headers: req.headers as any });
       const chunks: Buffer[] = [];
       let gotFile = false;
 
@@ -680,7 +695,7 @@ function normalizeCsv(text: string){
   const C_APPR_DT = ["承認日時","承認日"]; // day に使う
   const C_STATUS  = ["商談ステータス","ステータス","最終結果"]; // 必ず「承認」のみ通す
 
-  type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string};
+  type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; date?:Date; notes?:string};
   const out: Out[] = [];
 
   for (const r of recs) {
@@ -700,8 +715,9 @@ function normalizeCsv(text: string){
 
     // 3) 承認日時（なければskip）
     const kApprDt = firstMatchKey(r, C_APPR_DT);
-    const date = kApprDt ? String(r[kApprDt]||"").trim() : "";
-    if (!date) continue; // 必須
+    const dateStr = kApprDt ? String(r[kApprDt]||"").trim() : "";
+    const apprAt = parseApprovalAt(dateStr);
+    if (!apprAt) continue; // 必須
 
     // 4) その他
     const kMaker  = firstMatchKey(r, C_MAKER);
@@ -722,11 +738,11 @@ function normalizeCsv(text: string){
     const rid = kId ? String(r[kId]||"").toString().trim() : undefined;
 
     // 5) 必ず approval を1件計上
-    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date, notes:"from CSV(approved)" });
+    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date: apprAt, notes:"from CSV(approved)" });
 
     // 6) 金額があるなら sales も計上
     if (amount && amount>0) {
-      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date, notes:"from CSV(approved+amount)" });
+      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date: apprAt, notes:"from CSV(approved+amount)" });
     }
   }
   return out;
@@ -770,7 +786,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     const amount = r.amount != null ? Number(r.amount) : undefined;
     const maker = r.maker ? String(r.maker).trim() : undefined;
     const id = String(r.id || `${r.type}:${actorName}:${maker||"-"}`).trim();
-    const date = r.date ? String(r.date) : undefined;
+    const date = r.date;
 
     if (r.type==="approval") {
       nA++;
@@ -803,7 +819,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     }
   }
 
-  // ===== メーカー賞（本日分）自動付与：承認ベースで「個々の担当の中で“最も多いメーカーの件数”」の最大値を持つ担当者に授与（同率可） =====
+  // ===== メーカー賞（本日分）自動付与 =====
   try {
     const today = isoDay();
     const apprsToday = readJsonlAll("data/events/approvals.jsonl").filter(x => String(x.day||"") === today);
