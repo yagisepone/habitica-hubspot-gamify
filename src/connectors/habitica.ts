@@ -55,7 +55,7 @@ export async function completeTask(taskId: string, cred?: HabiticaCred) {
   return json.data;
 }
 
-/** 任意の“バッジ”（実態は記念ToDo）を演出付与 */
+/** “バッジ”（実態は記念ToDo）を演出付与 */
 export async function addBadge(cred: HabiticaCred, label: string, note?: string) {
   const todo = await createTodo(`🏅 ${label}`, note ?? "badge", undefined, cred);
   const id = (todo as any)?.id;
@@ -93,21 +93,39 @@ export async function addApproval(
   amount: number,
   note?: string
 ) {
-  const title = `✅ 承認 +30XP`;
-  const notes = `rule=approval+30\n${note ?? "CSV"}`;
+  // 仕様：承認は固定 +30XP
+  const xp = 30;
+  const title = `✅ 承認 +${xp}XP`;
+  const notes = `rule=approval+${xp}\n${note ?? "CSV"}`;
   const todo = await createTodo(title, notes, undefined, cred);
   const id = (todo as any)?.id;
   if (id) await completeTask(id, cred);
 }
 
-/** 互換：売上イベント（CSV取り込み向け） */
+/** 互換：売上イベント（CSV取り込み向け）
+ *  仕様：10万円(既定)ごとに +50XP(既定)
+ *   - SALES_XP_STEP_YEN：1ステップの金額（既定 100000）
+ *   - SALES_XP_PER_STEP：ステップごとのXP（既定 50）
+ */
 export async function addSales(
   cred: HabiticaCred,
   amount: number,
   note?: string
 ) {
-  const title = `💰 売上 +50XP（¥${Number(amount || 0).toLocaleString()}）`;
-  const notes = `rule=sales+50\n${note ?? "CSV"}`;
+  const stepYen   = Number(process.env.SALES_XP_STEP_YEN || 100000); // 10万円
+  const xpPerStep = Number(process.env.SALES_XP_PER_STEP || 50);     // 50XP/10万円
+  const amt       = Math.max(0, Number(amount || 0));
+  const steps     = Math.floor(amt / stepYen);
+  const xp        = steps * xpPerStep;
+
+  // 0円〜未満はXP付与しない（ToDoも作らない）
+  if (xp <= 0) {
+    console.log(`[habitica] addSales: amount=${amt} < step(${stepYen}); XP=0 → skip award`);
+    return { skipped: true, reason: "below_step" };
+  }
+
+  const title = `💰 売上 +${xp}XP（¥${amt.toLocaleString()}）`;
+  const notes = `rule=sales+${xp} (${xpPerStep}xp/${stepYen}yen)\n${note ?? "CSV"}`;
   const todo = await createTodo(title, notes, undefined, cred);
   const id = (todo as any)?.id;
   if (id) await completeTask(id, cred);
