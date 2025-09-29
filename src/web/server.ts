@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final (full, no omissions; day=CSV created time)
+// server.ts  — 2025-09-29 final (full, no omissions, approval-date based daily/monthly summary)
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -21,7 +21,7 @@ app.use(
 app.use((req, res, next) => {
   if (req.path.startsWith("/admin/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Authorization, X-CSV-Created-At, X-CSV-Filename");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Authorization");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     if (req.method === "OPTIONS") return res.status(204).end();
   }
@@ -35,7 +35,7 @@ function appendJsonl(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.app
 function readJsonlAll(fp: string): any[] {
   try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); } catch { return []; }
 }
-function writeJson(_fp: string, _obj: any) { /* reserved (not used) */ }
+function writeJson(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); }
 function readJson<T=any>(fp: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(fp,"utf8")); } catch { return fallback; } }
 function isoDay(d?: any) {
   const t = d ? new Date(d) : new Date();
@@ -68,7 +68,7 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 
-/* HubSpot v3 の sourceId から userId を抜く */
+/* HubSpot v3 の sourceId から userId を抜く（例: "userId:81798571" -> "81798571"） */
 function parseHubSpotSourceUserId(raw: any): string | undefined {
   const s = String(raw?.sourceId || raw?.source_id || "");
   const m = s.match(/userId:(\d+)/i);
@@ -186,7 +186,7 @@ import {
   cwApprovalText,
   cwSalesText,
   cwMakerAchievementText,
-  cwCsvSummaryText, // 既存 import （未使用でもそのまま）
+  cwCsvSummaryText,
 } from "../connectors/chatwork.js";
 import {
   createTodo,
@@ -245,7 +245,7 @@ function markSeen(id?: any){ if(id==null) return; seen.set(String(id), Date.now(
 
 /* =============== Health/Support =============== */
 app.get("/healthz", (_req,res)=>{
-  res.json({ ok:true, version:"2025-09-29-csv-created-day", tz:process.env.TZ||"Asia/Tokyo",
+  res.json({ ok:true, version:"2025-09-29-spec-v1.4", tz:process.env.TZ||"Asia/Tokyo",
     now:new Date().toISOString(), baseUrl:PUBLIC_BASE_URL||null, dryRun:DRY_RUN,
     habiticaUserCount:Object.keys(HAB_MAP).length, nameMapCount:Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES, totalize: CALL_TOTALIZE_5MIN
@@ -407,7 +407,7 @@ function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string
     raw?.owner?.email || raw?.properties?.owner_email || raw?.properties?.hubspot_owner_email ||
     raw?.userEmail;
 
-  // 2) HubSpotの user/owner のID候補 + sourceId(userId:xxxx)
+  // 2) HubSpotの user/owner のID候補を総当り + sourceId(userId:xxxx)
   const ownerId =
     raw?.properties?.hubspot_owner_id ??
     raw?.hubspot_owner_id ??
@@ -548,7 +548,7 @@ async function handleCallDurationEvent(ev: CallDurEv){
 }
 
 /* =============== CSV（承認・売上・メーカー賞 取り込み） =============== */
-// 真偽（承認済み等）のゆるい判定を拡張（※現在は未使用だが残置）
+// 真偽（承認済み等）のゆるい判定を拡張
 function truthyJP(v: any) {
   const s = String(v ?? "").trim().toLowerCase();
   return [
@@ -577,7 +577,7 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
   return undefined;
 }
 
-// DXPort の自由記述から氏名を抜く
+// DXPort の自由記述から氏名を抜く（唯一の定義）
 function extractDxPortNameFromText(s?: string): string|undefined {
   const t = normSpace(s);
   if (!t) return undefined;
@@ -604,7 +604,7 @@ function resolveActorFromRow(r:any): {name?:string; email?:string} {
   if (kDx) {
     const nameJp = extractDxPortNameFromText(String(r[kDx]||""));
     if (nameJp) {
-      const email = NAME2MAIL[nameJp]; // 無ければ undefined（集計は名前で実施）
+      const email = NAME2MAIL[nameJp]; // 無ければ undefined（=Habitica付与はスキップ、集計は名前で実施）
       return { name: nameJp, email };
     }
   }
@@ -616,60 +616,23 @@ function resolveActorFromRow(r:any): {name?:string; email?:string} {
   return {};
 }
 
-/* ====== 追加：CSVの作成日時（ファイル名・ヘッダ・クエリ）から day を決定 ====== */
-function parseFilenameTimestampToMs(fn?: string): number | undefined {
-  if (!fn) return undefined;
-  // 例: appointments_xxx_20250902122855.csv -> 2025-09-02 12:28:55 JST
-  const m = fn.match(/(\d{8})(\d{6})/); // yyyymmdd hhmmss
-  if (!m) return undefined;
-  const y = Number(m[1].slice(0,4));
-  const mo = Number(m[1].slice(4,6)) - 1;
-  const d = Number(m[1].slice(6,8));
-  const hh = Number(m[2].slice(0,2));
-  const mm = Number(m[2].slice(2,4));
-  const ss = Number(m[2].slice(4,6));
-  // JST として扱う
-  const dt = new Date(Date.UTC(y, mo, d, hh, mm, ss));
-  // JST(UTC+9) へ補正
-  return dt.getTime() - 9*60*60*1000; // UTC で保存されるため -9h でJST相当の local ms
-}
-function parseCreatedAtHeaderToMs(req: Request): number | undefined {
-  const h = req.get("x-csv-created-at") || (req.query.created_at as string) || "";
-  if (!h) return undefined;
-  const t = Date.parse(h);
-  return Number.isFinite(t) ? t : undefined;
-}
-function decideCsvCreatedDay(req: Request, filename?: string): string {
-  const ms =
-    parseCreatedAtHeaderToMs(req) ??
-    parseFilenameTimestampToMs(filename) ??
-    Date.now();
-  return isoDay(ms);
-}
-
-/* ★ CSV本文 + メタ情報を取得（text/csv / multipart/form-data / raw 全対応） */
-async function readCsvFromReq(req: Request): Promise<{ text: string; filename?: string }> {
+// ★ CSV本文を Content-Type に依存せず取得（text/csv / multipart/form-data / raw）
+async function readCsvTextFromReq(req: Request): Promise<string> {
   const ct = String(req.headers["content-type"] || "");
 
   if (ct.includes("multipart/form-data")) {
-    return await new Promise<{text:string; filename?:string}>((resolve, reject) => {
+    return await new Promise<string>((resolve, reject) => {
       const bb = Busboy({ headers: req.headers });
       const chunks: Buffer[] = [];
       let gotFile = false;
-      let filename: string | undefined;
 
-      // 新しいBusboy型: (name, file, info)
-      bb.on("file", (_name: string, file: NodeJS.ReadableStream, info: any) => {
+      bb.on("file", (_name, file) => {
         gotFile = true;
-        filename = info?.filename || filename;
         file.on("data", (d: Buffer) => chunks.push(Buffer.from(d)));
       });
       bb.on("field", (name: string, val: string) => {
         if (!gotFile && (name.toLowerCase() === "csv" || name.toLowerCase() === "text")) {
           chunks.push(Buffer.from(val, "utf8"));
-        }
-        if (name.toLowerCase() === "filename" && !filename) {
-          filename = val;
         }
       });
       bb.once("error", reject);
@@ -677,16 +640,16 @@ async function readCsvFromReq(req: Request): Promise<{ text: string; filename?: 
         const buf = Buffer.concat(chunks);
         let txt = buf.toString("utf8");
         if (txt.charCodeAt(0) === 0xfeff) txt = txt.slice(1);
-        resolve({ text: txt, filename });
+        resolve(txt);
       });
       (req as any).pipe(bb);
     });
   }
 
   const b: any = (req as any).body;
-  if (typeof b === "string" && b.trim().length > 0) return { text: b };
+  if (typeof b === "string" && b.trim().length > 0) return b;
 
-  return await new Promise<{text:string; filename?:string}>((resolve) => {
+  return await new Promise<string>((resolve) => {
     const chunks: Buffer[] = [];
     (req as any)
       .on("data", (d: Buffer) => chunks.push(Buffer.from(d)))
@@ -694,28 +657,30 @@ async function readCsvFromReq(req: Request): Promise<{ text: string; filename?: 
         const buf = Buffer.concat(chunks);
         let txt = buf.toString("utf8");
         if (txt.charCodeAt(0) === 0xfeff) txt = txt.slice(1);
-        resolve({ text: txt });
+        resolve(txt);
       })
-      .on("error", () => resolve({ text: "" }));
+      .on("error", () => resolve(""));
   });
 }
 
 /* ------------------------------------------------------------
-   CSV 正規化（仕様のまま／ただし day は CSV 作成日時を使用）
-   ・「承認条件 回答23」等から社内アポインター判定（INTERNAL_*）
+   CSV 正規化（仕様どおりの厳格版）
+   ・「承認条件 回答23」にある「DX PORTの◯◯」の◯◯が社内アポインター（INTERNAL_*）のみ採用
    ・「商談ステータス」が「承認」の行だけ採用
-   ・保存する day は引数 defaultDay（= CSV作成日時の“日”）
-   ・売上は金額があれば sales、必ず approval を1件カウント
+   ・「承認日時」をdayキーに使用（当日／当月の集計に反映）
+   ・売上は金額があればsales、常にapprovalを1件カウント
 ------------------------------------------------------------ */
-function normalizeCsv(text: string, defaultDay: string){
+function normalizeCsv(text: string){
   const recs:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
 
+  // キー候補
   const C_MAKER   = ["メーカー","メーカー名","メーカー名（取引先）","ブランド","brand","maker","取引先名","会社名","メーカー（社名）"];
   const C_AMOUNT  = ["金額","売上","受注金額","受注金額（税込）","受注金額（税抜）","売上金額","売上金額（税込）","売上金額（税抜）","金額(円)","amount","price","契約金額","成約金額","合計金額","売上合計","報酬","追加報酬"];
   const C_ID      = ["id","ID","案件ID","取引ID","レコードID","社内ID","番号","伝票番号","管理番号"];
-  const C_STATUS  = ["商談ステータス","ステータス","最終結果"]; // 「承認」のみ
+  const C_APPR_DT = ["承認日時","承認日"]; // day に使う
+  const C_STATUS  = ["商談ステータス","ステータス","最終結果"]; // 必ず「承認」のみ通す
 
-  type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; dateDay:string; notes?:string};
+  type Out = {type:"approval"|"sales"|"maker"; email?:string; name?:string; amount?:number; maker?:string; id?:string; date?:string; notes?:string};
   const out: Out[] = [];
 
   for (const r of recs) {
@@ -733,7 +698,12 @@ function normalizeCsv(text: string, defaultDay: string){
       if (!ok) continue;
     }
 
-    // 3) 付帯情報
+    // 3) 承認日時（なければskip）
+    const kApprDt = firstMatchKey(r, C_APPR_DT);
+    const date = kApprDt ? String(r[kApprDt]||"").trim() : "";
+    if (!date) continue; // 必須
+
+    // 4) その他
     const kMaker  = firstMatchKey(r, C_MAKER);
     const kAmt    = firstMatchKey(r, C_AMOUNT);
     const kId     = firstMatchKey(r, C_ID);
@@ -751,12 +721,12 @@ function normalizeCsv(text: string, defaultDay: string){
 
     const rid = kId ? String(r[kId]||"").toString().trim() : undefined;
 
-    // 4) 必ず approval を1件計上（day は CSV作成日の defaultDay）
-    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, dateDay: defaultDay, notes:"from CSV(approved)" });
+    // 5) 必ず approval を1件計上
+    out.push({ type:"approval", email:actor.email, name:actor.name, maker, id: rid, date, notes:"from CSV(approved)" });
 
-    // 5) 金額があるなら sales も計上
+    // 6) 金額があるなら sales も計上
     if (amount && amount>0) {
-      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, dateDay: defaultDay, notes:"from CSV(approved+amount)" });
+      out.push({ type:"sales", email:actor.email, name:actor.name, amount, maker, id: rid, date, notes:"from CSV(approved+amount)" });
     }
   }
   return out;
@@ -780,39 +750,31 @@ app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (
 
 // text/csv は既存通り受け付け
 app.post("/admin/csv", express.text({ type:"text/csv", limit:"20mb" }));
-// どの Content-Type でも CSV を受け取り可能に（※day=CSV作成日）
+// どの Content-Type でも CSV を受け取り可能に
 app.post("/admin/csv", async (req: Request, res: Response)=>{
   if(!requireBearerCsv(req,res)) return;
 
-  const { text, filename } = await readCsvFromReq(req);
+  const text = await readCsvTextFromReq(req);
   if (!text || !text.trim()) {
     return res.json({ ok:true, mode: "noop", received: 0, accepted: { approval: 0, sales: 0, maker: 0 }, totalSales: 0, duplicates: 0, errors: 0, hint: "empty-or-unparsed-csv" });
   }
 
-  const createdDay = decideCsvCreatedDay(req, filename);
-  const normalized = normalizeCsv(text, createdDay);
+  const normalized = normalizeCsv(text);
 
   let nA=0, nS=0, nM=0, sum=0;
-  type PersonAgg = {name:string; salesSum:number; salesCount:number; makers:Record<string,number>};
-  const perPerson: Record<string, PersonAgg> = {};
 
-  function aggPerson(name: string){
-    const n = name || "担当者";
-    if (!perPerson[n]) perPerson[n] = { name:n, salesSum:0, salesCount:0, makers:{} };
-    return perPerson[n];
-  }
-
+  // 保存 & Habitica & （必要なら）行ごとのChatworkは従来どおり
   for (const r of normalized) {
     const actorName = r.name || (r.email ? (MAIL2NAME[r.email] || r.email.split("@")[0]) : "担当者");
     const email = r.email ? String(r.email).toLowerCase() : undefined;
     const amount = r.amount != null ? Number(r.amount) : undefined;
     const maker = r.maker ? String(r.maker).trim() : undefined;
     const id = String(r.id || `${r.type}:${actorName}:${maker||"-"}`).trim();
-    const day = r.dateDay; // ★ CSV作成日ベース
+    const date = r.date ? String(r.date) : undefined;
 
     if (r.type==="approval") {
       nA++;
-      appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker });
+      appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker });
       if (!DRY_RUN) {
         const cred = getHabitica(email);
         if (cred) await habSafe(()=>addApproval(cred,1,"CSV").then(()=>undefined as any));
@@ -822,12 +784,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
     if (r.type==="sales") {
       nS++; sum+=(amount||0);
-      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker, amount });
-
-      aggPerson(actorName).salesSum += (amount||0);
-      aggPerson(actorName).salesCount += 1;
-      if (maker)  aggPerson(actorName).makers[maker] = (aggPerson(actorName).makers[maker]||0)+(amount||0);
-
+      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker, amount });
       if (!DRY_RUN) {
         const cred = getHabitica(email);
         if (cred && amount) await habSafe(()=>addSales(cred, amount, "CSV").then(()=>undefined as any));
@@ -837,7 +794,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
     if (r.type==="maker") {
       nM++;
-      appendJsonl("data/events/maker.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker });
+      appendJsonl("data/events/maker.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker });
       if (!DRY_RUN) {
         const cred = getHabitica(email);
         if (cred) await habSafe(()=>addMakerAward(cred,1).then(()=>undefined as any));
@@ -846,38 +803,72 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     }
   }
 
-  // ===== Chatwork: サマリ 1通だけ（表記は従来どおり、集計は今回CSVベース） =====
+  // ===== Chatwork: サマリ 1通だけ（承認日時ベースの 本日/当月 を “保存済みイベント” から集計） =====
   try {
-    const today = createdDay; // ★ 本日の基準は CSV作成日
-    const thisMonth = isoMonth(today);
-    const people = Object.values(perPerson).sort((a,b)=> b.salesSum - a.salesSum || a.name.localeCompare(b.name));
+    const today = isoDay();
+    const monthKey = isoMonth();
 
-    function topLines(filter:(p:PersonAgg)=>boolean){
-      const rows = people.filter(filter).slice(0,20).map(p=>{
-        const makerBits = Object.entries(p.makers).map(([m,amt])=>`${m}: ¥${(amt as number).toLocaleString()}`).join(", ");
-        return `・${p.name}: ¥${p.salesSum.toLocaleString()}（${p.salesCount}件） ${makerBits?`/ ${makerBits}`:""}`;
+    const apprsAll = readJsonlAll("data/events/approvals.jsonl");
+    const salesAll = readJsonlAll("data/events/sales.jsonl");
+
+    const apprsToday = apprsAll.filter(x => String(x.day||"") === today);
+    const salesToday = salesAll.filter(x => String(x.day||"") === today);
+
+    const apprsMonth = apprsAll.filter(x => String(x.day||"").slice(0,7) === monthKey);
+    const salesMonth = salesAll.filter(x => String(x.day||"").slice(0,7) === monthKey);
+
+    const sumAmt = (arr:any[]) => arr.reduce((a,b)=> a + Number(b.amount||0), 0);
+
+    const nameOf = (a:any) => {
+      const em = a?.actor?.email || a?.email;
+      return (em && MAIL2NAME[em]) || a?.actor?.name || (em?.split?.("@")[0]) || "担当者";
+    };
+
+    function aggPeople(apprs:any[], sales:any[]){
+      const map: Record<string,{name:string; apprs:number; salesSum:number; salesCount:number; makers:Record<string,number>}> = {};
+      for(const a of apprs){
+        const k = nameOf(a);
+        map[k] ??= { name:k, apprs:0, salesSum:0, salesCount:0, makers:{} };
+        map[k].apprs += 1;
+      }
+      for(const s of sales){
+        const k = nameOf(s);
+        map[k] ??= { name:k, apprs:0, salesSum:0, salesCount:0, makers:{} };
+        const amt = Number(s.amount||0);
+        map[k].salesSum += amt;
+        map[k].salesCount += 1;
+        const m = (s.maker||"").trim();
+        if (m) map[k].makers[m] = (map[k].makers[m]||0) + amt;
+      }
+      return Object.values(map).sort((a,b)=> b.salesSum - a.salesSum || b.apprs - a.apprs || a.name.localeCompare(b.name));
+    }
+
+    function topLines(peeps: ReturnType<typeof aggPeople>){
+      const rows = peeps.slice(0,20).map(p=>{
+        const makers = Object.entries(p.makers).map(([m,amt])=>`${m}: ¥${Number(amt).toLocaleString()}`).join(", ");
+        return `・${p.name}: 承認${p.apprs}件 / ¥${p.salesSum.toLocaleString()}（${p.salesCount}件）${makers?` / ${makers}`:""}`;
       });
-      return rows.length? rows.join("\n"): "（該当なし）";
+      return rows.length? rows.join("\n") : "（該当なし）";
     }
 
     const lines:string[] = [];
-    lines.push(`📦 CSV取込サマリー（承認日時→CSV作成日ベース）`);
+    lines.push(`📦 CSV取込サマリー（承認日時ベース）`);
     lines.push(`📅 本日 ${today}`);
-    lines.push(`  承認: ${nA}件　💴 売上: ¥${sum.toLocaleString()}（${normalized.filter(x=>x.type==="sales").length}件）`);
-    lines.push(`  🧑 売上（人別 Top）`);
-    lines.push(topLines(()=>true));
+    lines.push(`  承認: ${apprsToday.length}件　💴 売上: ¥${sumAmt(salesToday).toLocaleString()}（${salesToday.length}件）`);
+    lines.push(`  🧑 売上/承認（人別 Top）`);
+    lines.push(topLines(aggPeople(apprsToday, salesToday)));
     lines.push(``);
-    lines.push(`🗓 月次 ${thisMonth}`);
-    lines.push(`  ※本CSVの合計（保存済イベントの月次集計はダッシュボードで確認）`);
-    lines.push(`  🧑 売上（人別 Top）`);
-    lines.push(topLines(()=>true));
+    lines.push(`🗓 月次 ${monthKey}`);
+    lines.push(`  承認: ${apprsMonth.length}件　💴 売上: ¥${sumAmt(salesMonth).toLocaleString()}（${salesMonth.length}件）`);
+    lines.push(`  🧑 売上/承認（人別 Top）`);
+    lines.push(topLines(aggPeople(apprsMonth, salesMonth)));
 
     await sendChatworkMessage(lines.join("\n"));
   } catch(e:any) {
     console.error("[csv summary] chatwork failed:", e?.message||e);
   }
 
-  res.json({ ok:true, mode:"upsert", received: normalized.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales: sum, duplicates: 0, errors: 0, createdDay, filename: filename||null });
+  res.json({ ok:true, mode:"upsert", received: normalized.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales: sum, duplicates: 0, errors: 0 });
 });
 
 /* =============== ダッシュボード（本日 / 月次 / 前日） =============== */
