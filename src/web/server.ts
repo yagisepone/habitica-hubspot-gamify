@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final (full, no omissions, approval-date based daily/monthly summary)
+// server.ts  — 2025-09-29 final (full, no omissions, approval-date based daily/monthly summary + daily Maker Award auto-grant)
 import express, { Request, Response } from "express";
 import crypto from "crypto";
 import Busboy from "busboy";
@@ -801,6 +801,64 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
       }
       if (CW_PER_ROW) { try { await sendChatworkMessage(cwMakerAchievementText(actorName, maker)); } catch {} }
     }
+  }
+
+  // ===== メーカー賞（本日分）自動付与：承認ベースで「個々の担当の中で“最も多いメーカーの件数”」の最大値を持つ担当者に授与（同率可） =====
+  try {
+    const today = isoDay();
+    const apprsToday = readJsonlAll("data/events/approvals.jsonl").filter(x => String(x.day||"") === today);
+
+    // actorKey（email優先、なければ表示名）ごとのメーカー件数
+    type Entry = { name:string; email?:string; makerCounts: Record<string, number> };
+    const byActor: Record<string, Entry> = {};
+    const actorKey = (a:any) => (String(a?.actor?.email || a?.email || "") || displayName(a)).toLowerCase();
+
+    for (const a of apprsToday) {
+      const key = actorKey(a);
+      const email = String(a?.actor?.email || a?.email || "").toLowerCase() || undefined;
+      const name = displayName(a);
+      const maker = String(a?.maker || "").trim();
+      if (!maker) continue;
+      if (!byActor[key]) byActor[key] = { name, email, makerCounts:{} };
+      byActor[key].makerCounts[maker] = (byActor[key].makerCounts[maker] || 0) + 1;
+    }
+
+    let best = 0;
+    const winners: Entry[] = [];
+    for (const e of Object.values(byActor)) {
+      const top = Math.max(0, ...Object.values(e.makerCounts));
+      if (top > 0) {
+        if (top > best) { best = top; winners.length = 0; winners.push(e); }
+        else if (top === best) { winners.push(e); }
+      }
+    }
+
+    if (best > 0 && winners.length > 0) {
+      const awardedLog = readJsonlAll("data/events/maker_awards.jsonl");
+      const already = new Set(
+        awardedLog.filter((x:any)=> String(x.day||"")===today)
+                  .map((x:any)=> String(x.email || x?.actor?.email || "").toLowerCase())
+      );
+
+      for (const w of winners) {
+        const em = (w.email||"").toLowerCase();
+        if (!em) continue;               // Habitica付与にはemail必須
+        if (already.has(em)) continue;   // 当日分の重複授与を抑止
+        const cred = getHabitica(em);
+        if (!DRY_RUN && cred) {
+          await habSafe(()=>addMakerAward(cred,1).then(()=>undefined as any));
+        }
+        appendJsonl("data/events/maker_awards.jsonl", {
+          at: new Date().toISOString(),
+          day: today,
+          email: em,
+          actor: { name: w.name, email: em },
+          topCount: best
+        });
+      }
+    }
+  } catch(e:any) {
+    console.error("[maker-award] failed:", e?.message||e);
   }
 
   // ===== Chatwork: サマリ 1通だけ（承認日時ベースの 本日/当月 を “保存済みイベント” から集計） =====
