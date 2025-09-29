@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final (fixed minimal - 「名乗り」優先対応)
+// server.ts  — 2025-09-29 final (fixed minimal, +名乗り対応のみ, unused cleanup)
 // approval-date based daily/monthly summary + daily Maker Award auto-grant
 import express, { Request, Response } from "express";
 import crypto from "crypto";
@@ -36,8 +36,6 @@ function appendJsonl(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.app
 function readJsonlAll(fp: string): any[] {
   try { return fs.readFileSync(fp, "utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s)); } catch { return []; }
 }
-function writeJson(fp: string, obj: any) { ensureDir(path.dirname(fp)); fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); }
-function readJson<T=any>(fp: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(fp,"utf8")); } catch { return fallback; } }
 function isoDay(d?: any) {
   const t = d instanceof Date ? d : (d ? new Date(d) : new Date());
   return t.toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit"}).replace(/\//g,"-");
@@ -177,7 +175,7 @@ const APPOINTMENT_VALUES = String(process.env.APPOINTMENT_VALUES || "appointment
 // Chatwork: CSV明細1件ごとの通知はオフ（サマリ1通のみ）
 const CW_PER_ROW = false;
 
-// CSV取込：担当者名（「名乗り」またはDXPort欄）が無い行はスキップ（社外混入防止）
+// CSV取込：DXPort名が無い行はスキップ（社外混入防止）
 const REQUIRE_DXPORT_NAME = true;
 
 /* =============== 外部コネクタ =============== */
@@ -186,8 +184,7 @@ import {
   cwApptText,
   cwApprovalText,
   cwSalesText,
-  cwMakerAchievementText,
-  cwCsvSummaryText,
+  cwMakerAchievementText
 } from "../connectors/chatwork.js";
 import {
   createTodo,
@@ -432,132 +429,54 @@ function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string
   return { name: display, email: finalEmail };
 }
 
-async function handleNormalizedEvent(ev: Normalized){
-  const id = ev.eventId ?? ev.callId;
-  if (hasSeen(id)) return; markSeen(id);
-
-  const rawOutcome = String(ev.outcome || "").trim();
-  const outcomeLc = rawOutcome.toLowerCase();
-  const isAppt = !!rawOutcome && APPOINTMENT_VALUES.includes(outcomeLc);
-
-  if (isAppt) {
-    log(`[appt] matched outcome="${rawOutcome}" via APPOINTMENT_VALUES=${JSON.stringify(APPOINTMENT_VALUES)}`);
-    await awardXpForAppointment(ev);
-    await notifyChatworkAppointment(ev);
-  } else {
-    log(`non-appointment outcome=${rawOutcome||"(empty)"}`);
-  }
-}
-
-/* =============== Habitica付与（アポ） & Chatwork通知 =============== */
-async function awardXpForAppointment(ev: Normalized){
-  const who = resolveActor({source:ev.source as any, raw:ev.raw});
-  const cred = getHabitica(who.email);
-  const when = fmtJST(ev.occurredAt);
-
-  appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
-
-  if (!cred || DRY_RUN) {
-    log(`[XP] appointment +${APPOINTMENT_XP}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name} @${when}`);
-    return;
-  }
-  await habSafe(async ()=> {
-    await addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
-    return undefined as any;
-  });
-}
-
-async function notifyChatworkAppointment(ev: Normalized){
-  try {
-    const who = resolveActor({source:ev.source as any, raw:ev.raw});
-    await sendChatworkMessage(cwApptText(who.name));
-  } catch {}
-}
-
-/* =============== 通話（+1XP ＆ 5分ごとXP） =============== */
-type CallDurEv = { source:"v3"|"workflow"|"zoom"; eventId?:any; callId?:any; durationMs:number; occurredAt?:any; raw?:any; };
-
-function inferDurationMs(v:any){
-  const n = Number(v);
-  if(!Number.isFinite(n) || n<=0) return 0;
-  if (n <= MAX_CALL_MS && n % 1000 === 0) return Math.min(n, MAX_CALL_MS);
-  if (n <= 10800) return Math.min(n * 1000, MAX_CALL_MS);
-  return Math.min(n, MAX_CALL_MS);
-}
-
-function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
-
-async function awardXpForCallDuration(ev: CallDurEv){
-  if (ev.source !== "zoom") {
-    console.log(`[call] skip non-zoom source=${ev.source} durMs=${ev.durationMs}`);
-    return;
-  }
-
-  let durMs = Math.floor(Number(ev.durationMs||0));
-  if (!Number.isFinite(durMs) || durMs < 0) durMs = 0;
-  if (durMs > MAX_CALL_MS) durMs = MAX_CALL_MS;
-
-  const when = fmtJST(ev.occurredAt);
-  const who = resolveActor({source:ev.source as any, raw:ev.raw});
-
-  console.log(`[call] calc who=${who.email||who.name} durMs=${durMs} unit=${Number(process.env.CALL_XP_UNIT_MS ?? 300000)} per5=${Number(process.env.CALL_XP_PER_5MIN ?? 2)}`);
-
-  appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:durMs, actor:who});
-
-  if (CALL_XP_PER_CALL > 0) {
-    const cred = getHabitica(who.email);
-    if (!cred || DRY_RUN) {
-      log(`[call] per-call base +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
-      console.log(`(+call) +${CALL_XP_PER_CALL}XP`);
-    } else {
-      await habSafe(async ()=>{
-        const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
-        const notes = `rule=per-call+${CALL_XP_PER_CALL}`;
-        const todo = await createTodo(title, notes, undefined, cred);
-        const id = (todo as any)?.id; if (id) await completeTask(id, cred);
-        return undefined as any;
-      });
+/* ここから下のCSV担当者判定のみ変更（名乗り対応を追加。その他は不変） */
+// CSVの1行から actor を決定（名乗り > DXPort > メール）
+function resolveActorFromRow(r:any): {name?:string; email?:string} {
+  // ★ 最優先: 「名乗り」列（そのまま氏名として採用）
+  const K_NANORI = [
+    "名乗り","名乗り（DXPort）","名乗り（dxport）","名乗り（ＤＸＰｏｒｔ）"
+  ];
+  const kNanori = firstMatchKey(r, K_NANORI);
+  if (kNanori) {
+    const raw = String(r[kNanori] || "");
+    // 万一「DXPortの〜」と書かれていても抽出、無ければそのまま
+    const nameJp = extractDxPortNameFromText(raw) || normSpace(raw);
+    if (nameJp) {
+      const email = NAME2MAIL[nameJp];
+      return { name: nameJp, email };
     }
   }
 
-  if (durMs >= MAX_CALL_MS) {
-    console.log("[call] guard: durMs hit MAX_CALL_MS; suppress 5min extra, keep +1XP only");
-    return;
+  // つぎ: DXPortの〜 などの自由記述から抽出
+  const K_DX = [
+    "承認条件 回答23","承認条件 回答２３","DXPortの","DX PORTの",
+    "DXPortの担当者","獲得者","DX Portの","DXportの","dxportの","dx portの",
+    "自由記述","備考（dxport）","dxport 備考"
+  ];
+  const C_EMAIL = [
+    "email","mail",
+    "担当者メール","担当者 メール","担当者 メールアドレス","担当メール","担当者email",
+    "owner email","オーナー メール","ユーザー メール","営業担当メール","担当者e-mail","担当e-mail","担当者メールアドレス","担当者のメール"
+  ];
+
+  const kDx = firstMatchKey(r, K_DX);
+  if (kDx) {
+    const nameJp = extractDxPortNameFromText(String(r[kDx]||""));
+    if (nameJp) {
+      const email = NAME2MAIL[nameJp];
+      return { name: nameJp, email };
+    }
   }
-
-  const xpExtra = computePerCallExtra(durMs);
-  if (xpExtra<=0) return;
-  const cred = getHabitica(who.email);
-  if (!cred || DRY_RUN) {
-    log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`);
-    console.log(`(5分加点) +${xpExtra}XP`);
-    return;
+  const kEmail  = firstMatchKey(r, C_EMAIL);
+  if (kEmail) {
+    const e = String(r[kEmail]||"").toLowerCase().trim();
+    if (e) return { name: MAIL2NAME[e] || e.split("@")[0], email: e };
   }
-  await habSafe(async ()=>{
-    const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
-    const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${durMs}/${CALL_XP_UNIT_MS})`;
-    const todo = await createTodo(title, notes, undefined, cred);
-    const id=(todo as any)?.id; if(id) await completeTask(id, cred);
-    return undefined as any;
-  });
+  return {};
 }
 
-async function handleCallDurationEvent(ev: CallDurEv){
-  const id = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
-  if (hasSeen(id)) return; markSeen(id);
-  await awardXpForCallDuration(ev);
-}
+/* ===== 以降は変更なし ===== */
 
-/* =============== CSV（承認・売上・メーカー賞 取り込み） =============== */
-// 真偽（承認済み等）のゆるい判定を拡張
-function truthyJP(v: any) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return [
-    "1","true","yes","y","on",
-    "済","完","完了","ok","◯","〇","○",
-    "承認","承認済","承認済み","approved","accept","accepted","合格","done"
-  ].some(t => s.includes(t));
-}
 function numOrUndefined(v:any){
   if (v==null) return undefined;
   const n = Number(String(v).replace(/[^\d.-]/g,""));
@@ -592,7 +511,7 @@ function parseApprovalAt(s?: string): Date | null {
   return isNaN(d2.getTime()) ? null : d2;
 }
 
-// DXPort の自由記述から氏名を抜く
+// DXPort の自由記述から氏名を抜く（唯一の定義）
 function extractDxPortNameFromText(s?: string): string|undefined {
   const t = normSpace(s);
   if (!t) return undefined;
@@ -600,51 +519,6 @@ function extractDxPortNameFromText(s?: string): string|undefined {
   const m = t.match(/D\s*X\s*(?:P\s*O\s*R\s*T)?\s*の\s*([^\s].*)$/i);
   if (m && m[1]) return normSpace(m[1]);
   return undefined;
-}
-
-// CSVの1行から actor を決定（「名乗り」>DXPort>メール）
-function resolveActorFromRow(r:any): {name?:string; email?:string} {
-  const K_NINORI = ["名乗り"]; // 最優先
-  const K_DX = [
-    "承認条件 回答23","承認条件 回答２３","DXPortの","DX PORTの",
-    "DXPortの担当者","獲得者","DX Portの","DXportの","dxportの","dx portの",
-    "自由記述","備考（dxport）","dxport 備考"
-  ];
-  const C_EMAIL = [
-    "email","mail",
-    "担当者メール","担当者 メール","担当者 メールアドレス","担当メール","担当者email",
-    "owner email","オーナー メール","ユーザー メール","営業担当メール","担当者e-mail","担当e-mail","担当者メールアドレス","担当者のメール"
-  ];
-
-  // 1) 「名乗り」欄（値そのもの、もしくは “DXPortの◯◯” 形式の中身）
-  const kNi = firstMatchKey(r, K_NINORI);
-  if (kNi) {
-    const raw = String(r[kNi]||"");
-    const nameJp = extractDxPortNameFromText(raw) || normSpace(raw);
-    if (nameJp) {
-      const email = NAME2MAIL[nameJp];
-      return { name: nameJp, email };
-    }
-  }
-
-  // 2) DXPort記述欄（従来の抽出）
-  const kDx = firstMatchKey(r, K_DX);
-  if (kDx) {
-    const nameJp = extractDxPortNameFromText(String(r[kDx]||""));
-    if (nameJp) {
-      const email = NAME2MAIL[nameJp];
-      return { name: nameJp, email };
-    }
-  }
-
-  // 3) 明示メール
-  const kEmail  = firstMatchKey(r, C_EMAIL);
-  if (kEmail) {
-    const e = String(r[kEmail]||"").toLowerCase().trim();
-    if (e) return { name: MAIL2NAME[e] || e.split("@")[0], email: e };
-  }
-
-  return {};
 }
 
 // ★ CSV本文を Content-Type に依存せず取得（text/csv / multipart/form-data / raw）
@@ -696,7 +570,7 @@ async function readCsvTextFromReq(req: Request): Promise<string> {
 
 /* ------------------------------------------------------------
    CSV 正規化（仕様どおりの厳格版）
-   ・担当者は「名乗り」欄、ついでに「承認条件 回答23」（=DXPort自由記述）から抽出
+   ・『名乗り』列の氏名、または「承認条件 回答23」等にある「DX PORTの◯◯」の◯◯が社内アポインター（INTERNAL_*）のみ採用
    ・「商談ステータス」が「承認」の行だけ採用
    ・「承認日時」をdayキーに使用（当日／当月の集計に反映）
    ・売上は金額があればsales、常にapprovalを1件カウント
@@ -715,7 +589,7 @@ function normalizeCsv(text: string){
   const out: Out[] = [];
 
   for (const r of recs) {
-    // 1) 社内アポインター判定（名乗り/DXPort いずれかから抽出した氏名 or メール）
+    // 1) 社内アポインター判定（名乗り or DX PORT名必須）
     const actor = resolveActorFromRow(r);
     if (REQUIRE_DXPORT_NAME && !actor.name) continue;
     if (!isInternal(actor.name, actor.email)) continue;
@@ -1105,6 +979,122 @@ app.post("/webhooks/habitica", async (req: Request, res: Response) => {
     res.status(500).json({ ok: false });
   }
 });
+
+/* =============== 通話（+1XP ＆ 5分ごとXP） =============== */
+type CallDurEv = { source:"v3"|"workflow"|"zoom"; eventId?:any; callId?:any; durationMs:number; occurredAt?:any; raw?:any; };
+
+function inferDurationMs(v:any){
+  const n = Number(v);
+  if(!Number.isFinite(n) || n<=0) return 0;
+  if (n <= MAX_CALL_MS && n % 1000 === 0) return Math.min(n, MAX_CALL_MS);
+  if (n <= 10800) return Math.min(n * 1000, MAX_CALL_MS);
+  return Math.min(n, MAX_CALL_MS);
+}
+
+function computePerCallExtra(ms:number){ return ms>0? Math.floor(ms/CALL_XP_UNIT_MS)*CALL_XP_PER_5MIN:0; }
+
+async function awardXpForCallDuration(ev: CallDurEv){
+  if (ev.source !== "zoom") {
+    console.log(`[call] skip non-zoom source=${ev.source} durMs=${ev.durationMs}`);
+    return;
+  }
+
+  let durMs = Math.floor(Number(ev.durationMs||0));
+  if (!Number.isFinite(durMs) || durMs < 0) durMs = 0;
+  if (durMs > MAX_CALL_MS) durMs = MAX_CALL_MS;
+
+  const when = fmtJST(ev.occurredAt);
+  const who = resolveActor({source:ev.source as any, raw:ev.raw});
+
+  console.log(`[call] calc who=${who.email||who.name} durMs=${durMs} unit=${Number(process.env.CALL_XP_UNIT_MS ?? 300000)} per5=${Number(process.env.CALL_XP_PER_5MIN ?? 2)}`);
+
+  appendJsonl("data/events/calls.jsonl",{at:new Date().toISOString(), day:isoDay(ev.occurredAt), callId:ev.callId, ms:durMs, actor:who});
+
+  if (CALL_XP_PER_CALL > 0) {
+    const cred = getHabitica(who.email);
+    if (!cred || DRY_RUN) {
+      log(`[call] per-call base +${CALL_XP_PER_CALL}XP (DRY_RUN or no-cred) by=${who.name} @${when}`);
+      console.log(`(+call) +${CALL_XP_PER_CALL}XP`);
+    } else {
+      await habSafe(async ()=>{
+        const title = `📞 架電（${who.name}） +${CALL_XP_PER_CALL}XP`;
+        const notes = `rule=per-call+${CALL_XP_PER_CALL}`;
+        const todo = await createTodo(title, notes, undefined, cred);
+        const id = (todo as any)?.id; if (id) await completeTask(id, cred);
+        return undefined as any;
+      });
+    }
+  }
+
+  if (durMs >= MAX_CALL_MS) {
+    console.log("[call] guard: durMs hit MAX_CALL_MS; suppress 5min extra, keep +1XP only");
+    return;
+  }
+
+  const xpExtra = computePerCallExtra(durMs);
+  if (xpExtra<=0) return;
+  const cred = getHabitica(who.email);
+  if (!cred || DRY_RUN) {
+    log(`[call] per-call extra (5min) xp=${xpExtra} (DRY_RUN or no-cred) by=${who.name} @${when}`);
+    console.log(`(5分加点) +${xpExtra}XP`);
+    return;
+  }
+  await habSafe(async ()=>{
+    const title = `📞 架電（${who.name}） +${xpExtra}XP（5分加点）`;
+    const notes = `extra: ${CALL_XP_PER_5MIN}×floor(${durMs}/${CALL_XP_UNIT_MS})`;
+    const todo = await createTodo(title, notes, undefined, cred);
+    const id=(todo as any)?.id; if(id) await completeTask(id, cred);
+    return undefined as any;
+  });
+}
+
+async function handleCallDurationEvent(ev: CallDurEv){
+  const id = ev.eventId ?? ev.callId ?? `dur:${ev.durationMs}`;
+  if (hasSeen(id)) return; markSeen(id);
+  await awardXpForCallDuration(ev);
+}
+
+async function handleNormalizedEvent(ev: Normalized){
+  const id = ev.eventId ?? ev.callId;
+  if (hasSeen(id)) return; markSeen(id);
+
+  const rawOutcome = String(ev.outcome || "").trim();
+  const outcomeLc = rawOutcome.toLowerCase();
+  const isAppt = !!rawOutcome && APPOINTMENT_VALUES.includes(outcomeLc);
+
+  if (isAppt) {
+    log(`[appt] matched outcome="${rawOutcome}" via APPOINTMENT_VALUES=${JSON.stringify(APPOINTMENT_VALUES)}`);
+    await awardXpForAppointment(ev);
+    await notifyChatworkAppointment(ev);
+  } else {
+    log(`non-appointment outcome=${rawOutcome||"(empty)"}`);
+  }
+}
+
+/* =============== Habitica付与（アポ） & Chatwork通知 =============== */
+async function awardXpForAppointment(ev: Normalized){
+  const who = resolveActor({source:ev.source as any, raw:ev.raw});
+  const cred = getHabitica(who.email);
+  const when = fmtJST(ev.occurredAt);
+
+  appendJsonl("data/events/appointments.jsonl",{at:new Date().toISOString(),day:isoDay(ev.occurredAt),callId:ev.callId,actor:who});
+
+  if (!cred || DRY_RUN) {
+    log(`[XP] appointment +${APPOINTMENT_XP}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name} @${when}`);
+    return;
+  }
+  await habSafe(async ()=> {
+    await addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
+    return undefined as any;
+  });
+}
+
+async function notifyChatworkAppointment(ev: Normalized){
+  try {
+    const who = resolveActor({source:ev.source as any, raw:ev.raw});
+    await sendChatworkMessage(cwApptText(who.name));
+  } catch {}
+}
 
 /* =============== Start =============== */
 app.listen(PORT, ()=>{
