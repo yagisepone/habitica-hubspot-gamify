@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final (fixed minimal)
+// server.ts  — 2025-09-29 final (fixed minimal - 「名乗り」優先対応)
 // approval-date based daily/monthly summary + daily Maker Award auto-grant
 import express, { Request, Response } from "express";
 import crypto from "crypto";
@@ -177,7 +177,7 @@ const APPOINTMENT_VALUES = String(process.env.APPOINTMENT_VALUES || "appointment
 // Chatwork: CSV明細1件ごとの通知はオフ（サマリ1通のみ）
 const CW_PER_ROW = false;
 
-// CSV取込：DXPort名が無い行はスキップ（社外混入防止）
+// CSV取込：担当者名（「名乗り」またはDXPort欄）が無い行はスキップ（社外混入防止）
 const REQUIRE_DXPORT_NAME = true;
 
 /* =============== 外部コネクタ =============== */
@@ -592,7 +592,7 @@ function parseApprovalAt(s?: string): Date | null {
   return isNaN(d2.getTime()) ? null : d2;
 }
 
-// DXPort の自由記述から氏名を抜く（唯一の定義）
+// DXPort の自由記述から氏名を抜く
 function extractDxPortNameFromText(s?: string): string|undefined {
   const t = normSpace(s);
   if (!t) return undefined;
@@ -602,8 +602,9 @@ function extractDxPortNameFromText(s?: string): string|undefined {
   return undefined;
 }
 
-// CSVの1行から actor を決定（DXPort>メール）
+// CSVの1行から actor を決定（「名乗り」>DXPort>メール）
 function resolveActorFromRow(r:any): {name?:string; email?:string} {
+  const K_NINORI = ["名乗り"]; // 最優先
   const K_DX = [
     "承認条件 回答23","承認条件 回答２３","DXPortの","DX PORTの",
     "DXPortの担当者","獲得者","DX Portの","DXportの","dxportの","dx portの",
@@ -615,19 +616,34 @@ function resolveActorFromRow(r:any): {name?:string; email?:string} {
     "owner email","オーナー メール","ユーザー メール","営業担当メール","担当者e-mail","担当e-mail","担当者メールアドレス","担当者のメール"
   ];
 
+  // 1) 「名乗り」欄（値そのもの、もしくは “DXPortの◯◯” 形式の中身）
+  const kNi = firstMatchKey(r, K_NINORI);
+  if (kNi) {
+    const raw = String(r[kNi]||"");
+    const nameJp = extractDxPortNameFromText(raw) || normSpace(raw);
+    if (nameJp) {
+      const email = NAME2MAIL[nameJp];
+      return { name: nameJp, email };
+    }
+  }
+
+  // 2) DXPort記述欄（従来の抽出）
   const kDx = firstMatchKey(r, K_DX);
   if (kDx) {
     const nameJp = extractDxPortNameFromText(String(r[kDx]||""));
     if (nameJp) {
-      const email = NAME2MAIL[nameJp]; // 無ければ undefined（=Habitica付与はスキップ、集計は名前で実施）
+      const email = NAME2MAIL[nameJp];
       return { name: nameJp, email };
     }
   }
+
+  // 3) 明示メール
   const kEmail  = firstMatchKey(r, C_EMAIL);
   if (kEmail) {
     const e = String(r[kEmail]||"").toLowerCase().trim();
     if (e) return { name: MAIL2NAME[e] || e.split("@")[0], email: e };
   }
+
   return {};
 }
 
@@ -680,7 +696,7 @@ async function readCsvTextFromReq(req: Request): Promise<string> {
 
 /* ------------------------------------------------------------
    CSV 正規化（仕様どおりの厳格版）
-   ・「承認条件 回答23」にある「DX PORTの◯◯」の◯◯が社内アポインター（INTERNAL_*）のみ採用
+   ・担当者は「名乗り」欄、ついでに「承認条件 回答23」（=DXPort自由記述）から抽出
    ・「商談ステータス」が「承認」の行だけ採用
    ・「承認日時」をdayキーに使用（当日／当月の集計に反映）
    ・売上は金額があればsales、常にapprovalを1件カウント
@@ -699,7 +715,7 @@ function normalizeCsv(text: string){
   const out: Out[] = [];
 
   for (const r of recs) {
-    // 1) 社内アポインター判定（DX PORT名必須）
+    // 1) 社内アポインター判定（名乗り/DXPort いずれかから抽出した氏名 or メール）
     const actor = resolveActorFromRow(r);
     if (REQUIRE_DXPORT_NAME && !actor.name) continue;
     if (!isInternal(actor.name, actor.email)) continue;
