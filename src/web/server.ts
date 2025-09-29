@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final (fixed minimal, +名乗り対応のみ, unused cleanup)
+// server.ts  — 2025-09-29 final+monthly-cumulative (名乗り対応済/他機能維持)
 // approval-date based daily/monthly summary + daily Maker Award auto-grant
 import express, { Request, Response } from "express";
 import crypto from "crypto";
@@ -177,6 +177,10 @@ const CW_PER_ROW = false;
 
 // CSV取込：DXPort名が無い行はスキップ（社外混入防止）
 const REQUIRE_DXPORT_NAME = true;
+
+/* ===== 売上XPルール（累積用でも共有） ===== */
+const SALES_XP_STEP_YEN = Number(process.env.SALES_XP_STEP_YEN || 100000); // 10万円
+const SALES_XP_PER_STEP = Number(process.env.SALES_XP_PER_STEP || 50);     // 50XP/10万円
 
 /* =============== 外部コネクタ =============== */
 import {
@@ -646,6 +650,96 @@ function requireBearerCsv(req: Request, res: Response): boolean {
   res.status(401).json({ok:false,error:"auth"}); return false;
 }
 
+/* ====== 月次累積：メーカー別 売上XP 付与（二重防止つき） ================== */
+type SalesKey = { month: string; email: string; maker: string };
+type SalesTouched = SalesKey & { }; // 将来拡張用
+
+function keyOf(k: SalesKey){ return `${k.month}|${k.email}|${k.maker}`; }
+
+function monthFromDay(day?: string){ return String(day||"").slice(0,7); }
+
+/** レジャー：各 (month,email,maker) の「授与済みステップ数」を取得 */
+function readSalesStepsLedger(): Map<string, number> {
+  const pathLedger = "data/awards/sales_month_steps.jsonl";
+  const rows = readJsonlAll(pathLedger);
+  const m = new Map<string, number>();
+  for (const r of rows) {
+    const kk = keyOf({ month: String(r.month||""), email: String(r.email||"").toLowerCase(), maker: String(r.maker||"") });
+    const steps = Number(r.steps||0);
+    if (kk && Number.isFinite(steps)) m.set(kk, steps); // 最後の値を採用（append-only）
+  }
+  return m;
+}
+
+/** レジャー追記（append-only） */
+function writeSalesStepsLedger(entry: { month:string; email:string; maker:string; steps:number; totalAmount:number; newSteps:number }) {
+  appendJsonl("data/awards/sales_month_steps.jsonl", {
+    at: new Date().toISOString(),
+    month: entry.month,
+    email: entry.email,
+    maker: entry.maker,
+    steps: entry.steps,           // 累積で何ステップ授与済みか
+    newSteps: entry.newSteps,     // 今回追加分
+    totalAmount: entry.totalAmount
+  });
+}
+
+/** 当該 (month,email,maker) の累積売上合計（金額）を sales.jsonl から再集計 */
+function sumMonthlySalesAmount(month: string, email: string, maker: string): number {
+  const salesAll = readJsonlAll("data/events/sales.jsonl");
+  let sum = 0;
+  for (const s of salesAll) {
+    const d = String(s.day||"");
+    if (!d || d.slice(0,7)!==month) continue;
+    const em = String(s?.actor?.email || s?.email || "").toLowerCase();
+    const mk = String(s?.maker||"");
+    if (em===email && mk===maker) sum += Number(s.amount||0);
+  }
+  return sum;
+}
+
+/** バッチ終了後にまとめて「累積で閾値を超えた分」だけXPを付与 */
+async function awardMonthlyCumulativeFor(touched: SalesTouched[]){
+  if (!touched.length) return;
+
+  // 重複除去
+  const uniqKeys = Array.from(new Set(touched.map(keyOf))).map(s=>{
+    const [month,email,maker] = s.split("|");
+    return { month, email, maker } as SalesKey;
+  });
+
+  const ledger = readSalesStepsLedger();
+
+  for (const k of uniqKeys) {
+    if (!k.email) continue; // email不明は付与不能
+    const cred = getHabitica(k.email);
+    if (!cred && !DRY_RUN) continue; // 実付与ができないならスキップ（DRY_RUNは通す）
+
+    const totalAmt = sumMonthlySalesAmount(k.month, k.email, k.maker);
+    if (totalAmt <= 0) continue;
+
+    const stepsNow = Math.floor(totalAmt / SALES_XP_STEP_YEN);
+    const prev = ledger.get(keyOf(k)) || 0;
+    const delta = stepsNow - prev;
+    if (delta <= 0) continue; // 追加なし
+
+    // 追加分だけまとめてXP付与（addSalesは金額からXP計算するので stepYen*delta を渡す）
+    const addAmount = SALES_XP_STEP_YEN * delta;
+
+    if (!DRY_RUN && cred) {
+      await habSafe(async ()=>{
+        await addSales(cred, addAmount, `CSV monthly cumulative ${k.maker} ${k.month} (+${delta} step)`);
+        return undefined as any;
+      });
+    } else {
+      log(`[sales-cum] DRY_RUN or no-cred: email=${k.email} maker=${k.maker} month=${k.month} total=¥${totalAmt.toLocaleString()} stepsNow=${stepsNow} +${delta}`);
+    }
+
+    // レジャー更新（今回の授与後の累計ステップ数を記録）
+    writeSalesStepsLedger({ month: k.month, email: k.email, maker: k.maker, steps: stepsNow, totalAmount: totalAmt, newSteps: delta });
+  }
+}
+
 // 診断用（任意）：CSVヘッダ確認
 app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (req, res) => {
   const text = String((req as any).body||"");
@@ -669,6 +763,9 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
   let nA=0, nS=0, nM=0, sum=0;
 
+  // このバッチで触れた (month,email,maker) を収集 → 累積付与に使用
+  const touched: SalesTouched[] = [];
+
   // 保存 & Habitica & （必要なら）行ごとのChatworkは従来どおり
   for (const r of normalized) {
     const actorName = r.name || (r.email ? (MAIL2NAME[r.email] || r.email.split("@")[0]) : "担当者");
@@ -690,10 +787,19 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
     if (r.type==="sales") {
       nS++; sum+=(amount||0);
-      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker, amount });
+      const day = isoDay(date);
+      appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker, amount });
+
+      // 累積用のキーを記録（emailが無いと付与できないため、その場合はスキップ）
+      if (email && maker) touched.push({ month: monthFromDay(day), email, maker });
+
+      // ── 二重付与ガード ──
+      // 単票が閾値未満のときのみ「行ベース即時付与」（従来動作と互換。>=閾値は累積側で一括付与）
       if (!DRY_RUN) {
         const cred = getHabitica(email);
-        if (cred && amount) await habSafe(()=>addSales(cred, amount, "CSV").then(()=>undefined as any));
+        if (cred && amount && amount > 0 && amount < SALES_XP_STEP_YEN) {
+          await habSafe(()=>addSales(cred, amount, "CSV (per-row < step)").then(()=>undefined as any));
+        }
       }
       if (CW_PER_ROW) { try { await sendChatworkMessage(cwSalesText(actorName, amount, maker)); } catch {} }
     }
@@ -707,6 +813,13 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
       }
       if (CW_PER_ROW) { try { await sendChatworkMessage(cwMakerAchievementText(actorName, maker)); } catch {} }
     }
+  }
+
+  // ===== 追加機能：メーカー別×担当者×月の「累積」XP付与 =====
+  try {
+    await awardMonthlyCumulativeFor(touched);
+  } catch(e:any) {
+    console.error("[sales-cumulative] failed:", e?.message||e);
   }
 
   // ===== メーカー賞（本日分）自動付与 =====
