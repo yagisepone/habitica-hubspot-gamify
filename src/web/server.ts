@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final+monthly-cumulative (名乗り対応済/他機能維持)
+// server.ts  — 2025-09-29 final+monthly-cumulative + company-cumulative(all-hands)
 // approval-date based daily/monthly summary + daily Maker Award auto-grant
 import express, { Request, Response } from "express";
 import crypto from "crypto";
@@ -181,6 +181,9 @@ const REQUIRE_DXPORT_NAME = true;
 /* ===== 売上XPルール（累積用でも共有） ===== */
 const SALES_XP_STEP_YEN = Number(process.env.SALES_XP_STEP_YEN || 100000); // 10万円
 const SALES_XP_PER_STEP = Number(process.env.SALES_XP_PER_STEP || 50);     // 50XP/10万円
+
+/* ===== 会社合計の全員配布（ON/OFF） ===== */
+const COMPANY_SALES_TO_ALL = String(process.env.COMPANY_SALES_TO_ALL || "0") === "1";
 
 /* =============== 外部コネクタ =============== */
 import {
@@ -740,6 +743,86 @@ async function awardMonthlyCumulativeFor(touched: SalesTouched[]){
   }
 }
 
+/* ====== 会社合計（当月） 到達ステップ → 全員配布（append-only ledger, 二重防止） ====== */
+function readCompanyStepsLedger(): Map<string, number> {
+  const rows = readJsonlAll("data/awards/company_sales_steps.jsonl");
+  const m = new Map<string, number>();
+  for (const r of rows) {
+    const mo = String(r.month||"");
+    const steps = Number(r.steps||0);
+    if (mo && Number.isFinite(steps)) m.set(mo, steps); // 月→steps
+  }
+  return m;
+}
+function writeCompanyStepsLedger(entry: { month:string; steps:number; totalAmount:number; newSteps:number }) {
+  appendJsonl("data/awards/company_sales_steps.jsonl", {
+    at: new Date().toISOString(),
+    month: entry.month,
+    steps: entry.steps,
+    newSteps: entry.newSteps,
+    totalAmount: entry.totalAmount
+  });
+}
+function sumCompanyMonthlySalesAmount(month: string): number {
+  const salesAll = readJsonlAll("data/events/sales.jsonl");
+  let sum = 0;
+  for (const s of salesAll) {
+    const d = String(s.day||"");
+    if (!d || d.slice(0,7)!==month) continue;
+    sum += Number(s.amount||0);
+  }
+  return sum;
+}
+/** このバッチで影響のある「月」のみ再集計し、Δstep>0 なら全員に配布 */
+async function awardCompanyCumulativeForMonths(months: string[]) {
+  if (!COMPANY_SALES_TO_ALL) return; // フラグOFF時は無効
+  const uniq = Array.from(new Set(months.filter(Boolean)));
+  if (!uniq.length) return;
+
+  const ledger = readCompanyStepsLedger();
+
+  for (const month of uniq) {
+    const totalAmt = sumCompanyMonthlySalesAmount(month);
+    if (totalAmt <= 0) continue;
+
+    const stepsNow = Math.floor(totalAmt / SALES_XP_STEP_YEN);
+    const prev = ledger.get(month) || 0;
+    const delta = stepsNow - prev;
+    if (delta <= 0) continue;
+
+    const addAmount = SALES_XP_STEP_YEN * delta;
+    const members = Object.entries(HAB_MAP); // [email, cred]
+    let awarded = 0;
+
+    if (!DRY_RUN) {
+      for (const [_email, cred] of members) {
+        if (!cred) continue;
+        await habSafe(async ()=>{
+          await addSales(cred, addAmount, `CSV company monthly cumulative ${month} (+${delta} step)`);
+          return undefined as any;
+        });
+        awarded++;
+      }
+    } else {
+      log(`[company-cum] DRY_RUN: month=${month} total=¥${totalAmt.toLocaleString()} stepsNow=${stepsNow} +${delta} toAll=${members.length}`);
+      awarded = members.length;
+    }
+
+    // レジャー更新
+    writeCompanyStepsLedger({ month, steps: stepsNow, totalAmount: totalAmt, newSteps: delta });
+
+    // 任意通知（常時送信）
+    try {
+      const xpEach = SALES_XP_PER_STEP * delta;
+      const msg = `🏢 会社合計売上（${month}）が +${delta}ステップ到達（累計 ¥${totalAmt.toLocaleString()}）。\n` +
+                  `👥 社員全員（${members.length}名）に +${xpEach}XP を付与しました。`;
+      await sendChatworkMessage(msg);
+    } catch (e:any) {
+      console.error("[company-cum] chatwork failed:", e?.message||e);
+    }
+  }
+}
+
 // 診断用（任意）：CSVヘッダ確認
 app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (req, res) => {
   const text = String((req as any).body||"");
@@ -765,6 +848,8 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
   // このバッチで触れた (month,email,maker) を収集 → 累積付与に使用
   const touched: SalesTouched[] = [];
+  // このバッチで触れた「月」（会社合計の再集計対象）
+  const touchedMonths = new Set<string>();
 
   // 保存 & Habitica & （必要なら）行ごとのChatworkは従来どおり
   for (const r of normalized) {
@@ -793,6 +878,9 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
       // 累積用のキーを記録（emailが無いと付与できないため、その場合はスキップ）
       if (email && maker) touched.push({ month: monthFromDay(day), email, maker });
 
+      // 会社合計の当月キーを記録
+      touchedMonths.add(monthFromDay(day));
+
       // ── 二重付与ガード ──
       // 単票が閾値未満のときのみ「行ベース即時付与」（従来動作と互換。>=閾値は累積側で一括付与）
       if (!DRY_RUN) {
@@ -820,6 +908,13 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     await awardMonthlyCumulativeFor(touched);
   } catch(e:any) {
     console.error("[sales-cumulative] failed:", e?.message||e);
+  }
+
+  // ===== 新機能：会社合計（当月）のΔステップ分を “全員” に配布 =====
+  try {
+    await awardCompanyCumulativeForMonths(Array.from(touchedMonths));
+  } catch(e:any) {
+    console.error("[company-cumulative] failed:", e?.message||e);
   }
 
   // ===== メーカー賞（本日分）自動付与 =====
