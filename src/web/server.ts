@@ -1,4 +1,4 @@
-// server.ts  — 2025-09-29 final+monthly-cumulative + company-cumulative(all-hands)
+// server.ts  — 2025-09-29 final+monthly-cumulative + company-cumulative(all-hands) + CSV UPSERT
 // approval-date based daily/monthly summary + daily Maker Award auto-grant
 import express, { Request, Response } from "express";
 import crypto from "crypto";
@@ -823,7 +823,34 @@ async function awardCompanyCumulativeForMonths(months: string[]) {
   }
 }
 
-// 診断用（任意）：CSVヘッダ確認
+/* ================= CSV UPSERT のための永続キー ================ */
+// 保存場所
+const FP_IDX_APPR = "data/index/csv_approval_keys.jsonl";
+const FP_IDX_SALES = "data/index/csv_sales_keys.jsonl";
+
+function readKeySet(fp: string): Set<string> {
+  const rows = readJsonlAll(fp);
+  const s = new Set<string>();
+  for (const r of rows) {
+    const k = String(r.k ?? r.key ?? "");
+    if (k) s.add(k);
+  }
+  return s;
+}
+function appendKey(fp: string, k: string) {
+  appendJsonl(fp, { k, at: new Date().toISOString() });
+}
+function timeKey(d?: Date){ return d ? new Date(d).toISOString() : ""; } // UTC ISO固定で安定
+function personKey(email?: string, name?: string){ return (email && email.trim()) ? `e:${email.toLowerCase()}` : `n:${normSpace(name||"")}`; }
+function keyApproval(args:{date?:Date; maker?:string; email?:string; name?:string}) {
+  return `a|${timeKey(args.date)}|${String(args.maker||"").trim()}|${personKey(args.email,args.name)}`;
+}
+function keySales(args:{date?:Date; maker?:string; email?:string; name?:string; amount?:number}) {
+  const amt = Number(args.amount||0);
+  return `s|${timeKey(args.date)}|${String(args.maker||"").trim()}|${personKey(args.email,args.name)}|${amt}`;
+}
+
+/* ===================== 診断API ===================== */
 app.post("/admin/csv/detect", express.text({ type:"text/csv", limit:"20mb" }), (req, res) => {
   const text = String((req as any).body||"");
   const rows:any[] = csvParse(text,{ columns:true, bom:true, skip_empty_lines:true, trim:true, relax_column_count:true });
@@ -844,12 +871,16 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
 
   const normalized = normalizeCsv(text);
 
-  let nA=0, nS=0, nM=0, sum=0;
+  let nA=0, nS=0, nM=0, sum=0, dup=0;
 
   // このバッチで触れた (month,email,maker) を収集 → 累積付与に使用
   const touched: SalesTouched[] = [];
   // このバッチで触れた「月」（会社合計の再集計対象）
   const touchedMonths = new Set<string>();
+
+  // ★ UPSERTインデックス（永続）を事前読込
+  const seenAppr = readKeySet(FP_IDX_APPR);
+  const seenSales = readKeySet(FP_IDX_SALES);
 
   // 保存 & Habitica & （必要なら）行ごとのChatworkは従来どおり
   for (const r of normalized) {
@@ -861,6 +892,10 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     const date = r.date;
 
     if (r.type==="approval") {
+      const k = keyApproval({date, maker, email, name:actorName});
+      if (seenAppr.has(k)) { dup++; continue; }
+      seenAppr.add(k); appendKey(FP_IDX_APPR, k);
+
       nA++;
       appendJsonl("data/events/approvals.jsonl",{ at:new Date().toISOString(), day:isoDay(date), email, actor:{name:actorName, email}, id, maker });
       if (!DRY_RUN) {
@@ -871,6 +906,10 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     }
 
     if (r.type==="sales") {
+      const k = keySales({date, maker, email, name:actorName, amount});
+      if (seenSales.has(k)) { dup++; continue; }
+      seenSales.add(k); appendKey(FP_IDX_SALES, k);
+
       nS++; sum+=(amount||0);
       const day = isoDay(date);
       appendJsonl("data/events/sales.jsonl",{ at:new Date().toISOString(), day, email, actor:{name:actorName, email}, id, maker, amount });
@@ -1040,7 +1079,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     console.error("[csv summary] chatwork failed:", e?.message||e);
   }
 
-  res.json({ ok:true, mode:"upsert", received: normalized.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales: sum, duplicates: 0, errors: 0 });
+  res.json({ ok:true, mode:"upsert", received: normalized.length, accepted:{approval:nA,sales:nS,maker:nM}, totalSales: sum, duplicates: dup, errors: 0 });
 });
 
 /* =============== ダッシュボード（本日 / 月次 / 前日） =============== */
