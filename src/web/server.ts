@@ -67,6 +67,21 @@ function requireBearer(req: Request, res: Response): boolean {
   return true;
 }
 
+/* --- JSTの年月日＆月末判定（新規：月次メーカー賞で使用） --- */
+function jstYmd(d?: any){ 
+  const t = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const parts = new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", year: "numeric", month: "numeric", day: "numeric" }).formatToParts(t);
+  const m: any = {};
+  for (const p of parts) if (p.type==="year"||p.type==="month"||p.type==="day") m[p.type] = Number(p.value);
+  return { y: m.year, mo: m.month, d: m.day };
+}
+function isMonthEndJST(d?: any){
+  const { y, mo, d: day } = jstYmd(d);
+  if (!y || !mo || !day) return false;
+  const last = new Date(y, mo, 0).getDate(); // 月末日（ローカルTZでも日数は同じ）
+  return day === last;
+}
+
 /* HubSpot v3 の sourceId から userId を抜く（例: "userId:81798571" -> "81798571"） */
 function parseHubSpotSourceUserId(raw: any): string | undefined {
   const s = String(raw?.sourceId || raw?.source_id || "");
@@ -498,8 +513,11 @@ function firstMatchKey(row: any, candidates: string[]): string|undefined {
     if (m) return m;
   }
   for (const key of keys) {
-    const k = lc(key);
-    if (candidates.some(c => k.includes(lc(c)))) return key;
+    the:
+    {
+      const k = lc(key);
+      if (candidates.some(c => k.includes(lc(c)))) { return key; }
+    }
   }
   return undefined;
 }
@@ -956,7 +974,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     console.error("[company-cumulative] failed:", e?.message||e);
   }
 
-  // ===== メーカー賞（本日分）自動付与 =====
+  // ===== メーカー賞（本日分）自動付与（既存動作） =====
   try {
     const today = isoDay();
     const apprsToday = readJsonlAll("data/events/approvals.jsonl").filter(x => String(x.day||"") === today);
@@ -1012,6 +1030,68 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
     }
   } catch(e:any) {
     console.error("[maker-award] failed:", e?.message||e);
+  }
+
+  /* ===== メーカー賞（当月分）月末自動付与（新規追加） ===== */
+  try {
+    if (isMonthEndJST()) {
+      const monthKey = isoMonth();
+      type Entry = { name:string; email?:string; makerCounts: Record<string, number> };
+      const byActor: Record<string, Entry> = {};
+
+      // 月内の承認を集計
+      const apprsAll = readJsonlAll("data/events/approvals.jsonl");
+      const apprsMonth = apprsAll.filter(x => String(x.day||"").slice(0,7) === monthKey);
+
+      const actorKey = (a:any) => (String(a?.actor?.email || a?.email || "") || displayName(a)).toLowerCase();
+      for (const a of apprsMonth) {
+        const key = actorKey(a);
+        const email = String(a?.actor?.email || a?.email || "").toLowerCase() || undefined;
+        const name = displayName(a);
+        const maker = String(a?.maker || "").trim();
+        if (!maker) continue;
+        if (!byActor[key]) byActor[key] = { name, email, makerCounts:{} };
+        byActor[key].makerCounts[maker] = (byActor[key].makerCounts[maker] || 0) + 1;
+      }
+
+      let best = 0;
+      const winners: Entry[] = [];
+      for (const e of Object.values(byActor)) {
+        const top = Math.max(0, ...Object.values(e.makerCounts));
+        if (top > 0) {
+          if (top > best) { best = top; winners.length = 0; winners.push(e); }
+          else if (top === best) { winners.push(e); }
+        }
+      }
+
+      if (best > 0 && winners.length > 0) {
+        // 月次の二重授与防止（この月ですでに受賞登録のある email を除外）
+        const monthlyLog = readJsonlAll("data/events/maker_awards_monthly.jsonl");
+        const already = new Set(
+          monthlyLog.filter((x:any)=> String(x.month||"")===monthKey)
+                    .map((x:any)=> String(x.email || x?.actor?.email || "").toLowerCase())
+        );
+
+        for (const w of winners) {
+          const em = (w.email||"").toLowerCase();
+          if (!em) continue;             // Habitica付与にはemail必須
+          if (already.has(em)) continue; // その月は既に授与済み
+          const cred = getHabitica(em);
+          if (!DRY_RUN && cred) {
+            await habSafe(()=>addMakerAward(cred,1).then(()=>undefined as any));
+          }
+          appendJsonl("data/events/maker_awards_monthly.jsonl", {
+            at: new Date().toISOString(),
+            month: monthKey,
+            email: em,
+            actor: { name: w.name, email: em },
+            topCount: best
+          });
+        }
+      }
+    }
+  } catch(e:any) {
+    console.error("[maker-award-monthly] failed:", e?.message||e);
   }
 
   // ===== Chatwork: サマリ 1通だけ（承認日時ベースの 本日/当月 を “保存済みイベント” から集計） =====
