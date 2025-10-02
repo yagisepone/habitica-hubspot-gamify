@@ -1,13 +1,25 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
-    "outDir": "dist",
+    /* Node.js 18 で .js 拡張子付き import / top-level await を許可 */
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* 既存構成を踏襲 */
     "rootDir": "src",
+    "outDir": "dist",
+
+    /* 型チェックと互換のための一般設定 */
     "strict": true,
     "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true
+    "forceConsistentCasingInFileNames": true,
+
+    /* Node.js の型を明示 */
+    "lib": ["ES2022"],
+    "types": ["node"]
   },
   "include": ["src/**/*.ts"],
   "exclude": [
