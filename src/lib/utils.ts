@@ -1,3 +1,4 @@
+// src/lib/utils.ts
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -79,22 +80,13 @@ export function parseApprovalAt(s?: string): Date | null {
 }
 
 /**
- * HubSpot の sourceId に含まれる "userId:xxxx" から xxxx を抜き出すユーティリティ。
- * 該当しなければ undefined を返す。
+ * HubSpot v3 の sourceId から userId を抜く（例: "userId:81798571" -> "81798571"）
+ * 旧 server.ts と同一仕様（数値だけを厳密に抽出）
  */
 export function parseHubSpotSourceUserId(raw: any): string | undefined {
-  try {
-    const s = String(raw?.sourceId ?? "").trim();
-    if (!s) return undefined;
-    // userId: 999999 / userId=999999 / USERID : abc-123 などを許容
-    const m = s.match(/userId\s*[:=]\s*([A-Za-z0-9_-]+)/i);
-    if (m?.[1]) return m[1];
-    // 念のため数値だけのパターンも緩く拾う
-    const m2 = s.match(/\b(\d{5,})\b/);
-    return m2?.[1] ?? undefined;
-  } catch {
-    return undefined;
-  }
+  const s = String(raw?.sourceId || raw?.source_id || "");
+  const m = s.match(/userId:(\d+)/i);
+  return m ? m[1] : undefined;
 }
 
 /**
