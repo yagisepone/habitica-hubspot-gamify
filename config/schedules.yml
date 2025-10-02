@@ -1,4 +1,0 @@
-# スケジュール設定
-timezone: "Asia/Tokyo"
-daily_time: "18:05"    # 日次集計→Habitica/Chatworkへの反映時刻
-weekly_time: "09:30"   # （任意）週次メーカー賞などの実行時刻

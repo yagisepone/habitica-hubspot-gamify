@@ -1,9 +1,0 @@
-- code: SELF
-  name: YUTO FUKUDA
-  hubspot:
-    email: "fukuda@wbisbi.co.jp"   
-  habitica:
-    user:   "${HABITICA_OWNER_ID}"
-    token:  "${HABITICA_API_TOKEN}"
-    client: "${HABITICA_X_CLIENT}"
-  chatwork_room_id: null
