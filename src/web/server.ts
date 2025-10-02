@@ -402,7 +402,7 @@ app.post("/webhooks/zoom", async (req: Request & { rawBody?: Buffer }, res: Resp
 /* =============== 正規化処理 & だれ特定 =============== */
 type Normalized = { source:"v3"|"workflow"; eventId?:any; callId?:any; outcome?:string; occurredAt?:any; raw?:any; };
 
-// ★ HubSpot担当者の解決：sourceId(userId) と hubspot_user_map を使う
+// HubSpot担当者の解決：sourceId(userId) と hubspot_user_map を使う
 function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string; email?:string}{
   const raw = ev.raw||{};
 
@@ -439,7 +439,7 @@ function resolveActor(ev:{source:"v3"|"workflow"|"zoom"; raw?:any}):{name:string
 /* ここから下のCSV担当者判定のみ変更（名乗り対応を追加。その他は不変） */
 // CSVの1行から actor を決定（名乗り > DXPort > メール）
 function resolveActorFromRow(r:any): {name?:string; email?:string} {
-  // ★ 最優先: 「名乗り」列（そのまま氏名として採用）
+  // 最優先: 「名乗り」列（そのまま氏名として採用）
   const K_NANORI = [
     "名乗り","名乗り（DXPort）","名乗り（dxport）","名乗り（ＤＸＰｏｒｔ）"
   ];
@@ -528,7 +528,7 @@ function extractDxPortNameFromText(s?: string): string|undefined {
   return undefined;
 }
 
-// ★ CSV本文を Content-Type に依存せず取得（text/csv / multipart/form-data / raw）
+// CSV本文を Content-Type に依存せず取得（text/csv / multipart/form-data / raw）
 async function readCsvTextFromReq(req: Request): Promise<string> {
   const ct = String(req.headers["content-type"] || "");
 
@@ -878,7 +878,7 @@ app.post("/admin/csv", async (req: Request, res: Response)=>{
   // このバッチで触れた「月」（会社合計の再集計対象）
   const touchedMonths = new Set<string>();
 
-  // ★ UPSERTインデックス（永続）を事前読込
+  // UPSERTインデックス（永続）を事前読込
   const seenAppr = readKeySet(FP_IDX_APPR);
   const seenSales = readKeySet(FP_IDX_SALES);
 

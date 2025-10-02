@@ -100,6 +100,10 @@ export async function addApproval(
   const todo = await createTodo(title, notes, undefined, cred);
   const id = (todo as any)?.id;
   if (id) await completeTask(id, cred);
+
+  //承認バッジ
+  const label = process.env.APPROVAL_BADGE_LABEL || "🎖 承認";
+  await addBadge(cred, label, "approval achieved");
 }
 
 /** 互換：売上イベント（CSV取り込み向け）
