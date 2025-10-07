@@ -13,9 +13,8 @@ import {
 import { log } from "./lib/utils.js";
 import { HAB_MAP, NAME2MAIL } from "./lib/maps.js";
 
-// ▼▼▼ 追加: ルールAPIを読み込む（他は触らない）
+// ルールAPIを読み込む（他は触らない）
 import { rulesGet, rulesPut, statsToday } from "./routes/rules.js";
-// ▲▲▲ 追加ここまで
 
 /* 基本設定 */
 const app = express();
@@ -28,14 +27,23 @@ app.use(
     },
   })
 );
+
+// ===== CORS（管理・テナント・健診を許可）=====
+// fetch 版でもプリフライトを通すため、PUT と /tenant/*, /healthz を追加
 app.use((req, res, next) => {
-  if (req.path.startsWith("/admin/")) {
+  if (
+    req.path.startsWith("/admin/") ||
+    req.path.startsWith("/tenant/") ||
+    req.path === "/healthz"
+  ) {
+    // 必要に応じて Origin を厳格化（* のままでもOK）
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Authorization, Content-Type, X-Authorization"
     );
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+    res.setHeader("Access-Control-Max-Age", "86400");
     if (req.method === "OPTIONS") return res.status(204).end();
   }
   next();
@@ -72,14 +80,14 @@ app.post("/webhooks/habitica", habiticaWebhook);
 /* CSV routes */
 import { csvDetect, csvUpsert } from "./features/csv_handlers.js";
 app.post("/admin/csv/detect", express.text({ type: "text/csv", limit: "20mb" }), csvDetect);
-app.post("/admin/csv", express.text({ type: "text/csv", limit: "20mb" }), csvUpsert);
+app.post("/admin/csv",        express.text({ type: "text/csv", limit: "20mb" }), csvUpsert);
 
 /* Admin UI */
 import { dashboardHandler, mappingHandler } from "./routes/admin.js";
 app.get("/admin/dashboard", dashboardHandler);
-app.get("/admin/mapping", mappingHandler);
+app.get("/admin/mapping",   mappingHandler);
 
-//  新規APIを登録（既存ルートとは独立）
+// 新規API（既存ルートとは独立）
 app.get("/tenant/:id/rules", rulesGet);
 app.put("/tenant/:id/rules", express.json({ limit: "1mb" }), rulesPut);
 app.get("/tenant/:id/stats/today", statsToday);
