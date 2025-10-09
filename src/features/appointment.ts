@@ -13,14 +13,12 @@ import { appendJsonl, fmtJST, log } from "../lib/utils.js";
 import { resolveActor } from "./resolveActor.js";
 import { getHabitica } from "../lib/maps.js";
 import { habSafe } from "../lib/habiticaQueue.js";
-import { addAppointment } from "../connectors/habitica.js"; // 汎用XPにも流用
+import { addAppointment } from "../connectors/habitica.js";
 import { sendChatworkMessage, cwApptText } from "../connectors/chatwork.js";
 import { hasSeen, markSeen } from "../lib/seen.js";
-import {
-  getObservedLabelIds,
-  getObservedLabelTitles,
-  getLabelItems,
-} from "../store/labels.js";
+
+// ★ ここを星取込みに変更（関数でも配列でも耐える）
+import * as labelsStore from "../store/labels.js";
 
 const asStr = (v: unknown) => "" + (v ?? "");
 const lc = (v: unknown) => asStr(v).toLowerCase();
@@ -40,11 +38,34 @@ export type Normalized = {
   source: "v3" | "workflow" | "zoom";
   eventId?: any;
   callId?: any;
-  outcome?: string;      // 例: "新規アポ", "ニーズ無し", "見込みA" など
+  outcome?: string;
   occurredAt?: any;
-  raw?: any;             // HubSpot生データ
-  tenant?: string;       // 未指定なら default
+  raw?: any;
+  tenant?: string;
 };
+
+// ---------- store/labels.js ラッパ ----------
+async function readLabelItems(tenant: string): Promise<any[]> {
+  try {
+    const fn = (labelsStore as any).getLabelItems;
+    const v = typeof fn === "function" ? await Promise.resolve(fn(tenant)) : (labelsStore as any).items;
+    return arr(v);
+  } catch { return []; }
+}
+async function readObservedIds(tenant: string): Promise<string[]> {
+  try {
+    const fn = (labelsStore as any).getObservedLabelIds;
+    const v = typeof fn === "function" ? await Promise.resolve(fn(tenant)) : (labelsStore as any).observedIds;
+    return arr(v).map(asStr);
+  } catch { return []; }
+}
+async function readObservedTitles(tenant: string): Promise<string[]> {
+  try {
+    const fn = (labelsStore as any).getObservedLabelTitles;
+    const v = typeof fn === "function" ? await Promise.resolve(fn(tenant)) : (labelsStore as any).observedTitles;
+    return arr(v).map(asStr);
+  } catch { return []; }
+}
 
 /** HubSpot 風の ID 候補を広く拾う */
 function pickHubSpotLikeIds(raw: any): string[] {
@@ -79,9 +100,9 @@ function pickHubSpotLikeIds(raw: any): string[] {
 /** UI保存分の items を最優先。無ければ observed の ID/タイトルで補完。 */
 async function loadUiLabels(tenant: string): Promise<LabelItem[]> {
   const [itemsRaw, idsRaw, titlesRaw] = await Promise.all([
-    getLabelItems(tenant).catch(() => null),
-    getObservedLabelIds(tenant).catch(() => null),
-    getObservedLabelTitles(tenant).catch(() => null),
+    readLabelItems(tenant),
+    readObservedIds(tenant),
+    readObservedTitles(tenant),
   ]);
 
   const items = arr(itemsRaw);
@@ -100,8 +121,8 @@ async function loadUiLabels(tenant: string): Promise<LabelItem[]> {
   const ids = arr(idsRaw).map(asStr);
   const titles = arr(titlesRaw).map(asStr);
   return [
-    ...ids.map((id) => ({ id, category: "appointment", enabled: true } as LabelItem)),
-    ...titles.map((title) => ({ title, category: "appointment", enabled: true } as LabelItem)),
+    ...ids.map((id)    => ({ id,    category: "appointment", enabled: true } as LabelItem)),
+    ...titles.map((t)  => ({ title: t, category: "appointment", enabled: true } as LabelItem)),
   ];
 }
 
@@ -109,8 +130,7 @@ function uniq(items: LabelItem[]): LabelItem[] {
   const seen = new Set<string>();
   const out: LabelItem[] = [];
   for (const it of items) {
-    const key =
-      `${lc(it.category || "label")}|${asStr(it.id || "").trim()}|${lc(asStr(it.title || ""))}`;
+    const key = `${lc(it.category || "label")}|${asStr(it.id || "").trim()}|${lc(asStr(it.title || ""))}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(it);
@@ -125,7 +145,7 @@ async function matchUiLabels(tenant: string, outcomeText: string, idCands: strin
   const matched: LabelItem[] = [];
   for (const it of items) {
     if (it.enabled === false) continue;
-    const byId = it.id && idCands.includes(asStr(it.id));
+    const byId    = it.id    && idCands.includes(asStr(it.id));
     const byTitle = it.title && outcomeLc && outcomeLc === lc(it.title);
     if (byId || byTitle) {
       matched.push({
@@ -141,10 +161,8 @@ async function matchUiLabels(tenant: string, outcomeText: string, idCands: strin
 /** ENV(APPOINTMENT_VALUES) による既定のアポ判定 */
 function matchEnvAppointment(outcomeText: string): boolean {
   const t = lc(outcomeText).trim();
-  const envValsRaw: any = APPOINTMENT_VALUES;
-  const envVals = Array.isArray(envValsRaw)
-    ? envValsRaw
-    : (typeof envValsRaw === "string" ? envValsRaw.split(",") : []);
+  const raw: any = APPOINTMENT_VALUES;
+  const envVals = Array.isArray(raw) ? raw : (typeof raw === "string" ? raw.split(",") : []);
   return !!t && envVals.map(lc).includes(t);
 }
 
@@ -166,9 +184,7 @@ export async function handleNormalizedEvent(ev: Normalized) {
 
   // ===== ラベルごとのXP付与（UIでXPが入っているものは全部付与）=====
   if (xpItems.length) {
-    for (const m of xpItems) {
-      await awardXpForLabel(ev, m);
-    }
+    for (const m of xpItems) await awardXpForLabel(ev, m);
   } else if (hasUiAppointment || envAppt) {
     // UI側でXP未設定の「アポ」または ENVアポ → 既定アポXP + Chatwork
     await awardXpForAppointment(ev);
