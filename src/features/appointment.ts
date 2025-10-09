@@ -9,37 +9,88 @@ import { appendJsonl, fmtJST, log } from "../lib/utils.js";
 import { resolveActor } from "./resolveActor.js";
 import { getHabitica } from "../lib/maps.js";
 import { habSafe } from "../lib/habiticaQueue.js";
-import { addAppointment } from "../connectors/habitica.js";
+import { addAppointment } from "../connectors/habitica.js"; // 汎用XPでも再利用
 import { sendChatworkMessage, cwApptText } from "../connectors/chatwork.js";
 import { hasSeen, markSeen } from "../lib/seen.js";
-import { getObservedLabelIds, getObservedLabelTitles } from "../store/labels.js";
+import {
+  getLabelItems,
+  getObservedLabelIds,
+  getObservedLabelTitles,
+  LabelItem,
+} from "../store/labels.js";
 
 export type Normalized = {
   source: "v3" | "workflow" | "zoom";
   eventId?: any;
   callId?: any;
-  outcome?: string;
+  outcome?: string;      // 例: "新規アポ", "ニーズ無し", "見込みA" など
   occurredAt?: any;
-  raw?: any;
-  /** テナントID（なければ default） */
-  tenant?: string;
+  raw?: any;             // HubSpot生データ
+  tenant?: string;       // 未指定なら default
 };
 
-/** outcome がアポ対象かどうかを判定（テナント設定優先、無ければENVを使用） */
-function isAppointmentOutcome(tenant: string, outcome: string): boolean {
-  const v = String(outcome || "").trim().toLowerCase();
-  if (!v) return false;
+function pickHubSpotLikeIds(raw: any): string[] {
+  const out: string[] = [];
+  const push = (v: any) => {
+    if (Array.isArray(v)) v.forEach(push);
+    else if (v !== null && v !== undefined) out.push(String(v));
+  };
+  if (!raw) return out;
+  try {
+    push((raw as any).labelId);
+    push((raw as any).labelIds);
+    push((raw as any).hs_label_id);
+    push((raw as any).hs_outcome_id);
+    push((raw as any).hs_pipeline_stage);
+    push((raw as any).hs_task_type_id);
+    if (raw.properties) {
+      const p = raw.properties;
+      push(p.labelId);
+      push(p.labelIds);
+      push(p.hs_label_id);
+      push(p.hs_outcome_id);
+      push(p.hs_pipeline_stage);
+      push(p.hs_task_type_id);
+      push(p.hs_dealstage);
+    }
+  } catch {}
+  return out.filter(Boolean).map(String);
+}
 
-  // UI（/tenant/:id/labels）で保存されたラベルID/タイトルを優先
-  const ids = (getObservedLabelIds(tenant) || []).map((s) => String(s).toLowerCase());
-  const titles = (getObservedLabelTitles(tenant) || []).map((s) => String(s).toLowerCase());
-  if (ids.length || titles.length) {
-    return ids.includes(v) || titles.includes(v);
+function uniqItems(items: LabelItem[]): LabelItem[] {
+  const seen = new Set<string>();
+  const out: LabelItem[] = [];
+  for (const it of items) {
+    const key = `${(it.category || "appointment").toLowerCase()}|${(it.id || "").trim()}|${(it.title || "").trim().toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
   }
+  return out;
+}
 
-  // フォールバック：.env の APPOINTMENT_VALUES
-  const envVals = (APPOINTMENT_VALUES || []).map((s) => String(s).toLowerCase());
-  return envVals.includes(v);
+function matchUiLabels(tenant: string, outcomeText: string, idCands: string[]) {
+  const items = getLabelItems(tenant);
+  const outcomeLc = String(outcomeText || "").trim().toLowerCase();
+  const matched: LabelItem[] = [];
+  for (const it of items) {
+    if (it.enabled === false) continue;
+    const byId = it.id && idCands.includes(String(it.id));
+    const byTitle = it.title && outcomeLc && outcomeLc === String(it.title).trim().toLowerCase();
+    if (byId || byTitle) {
+      matched.push({
+        ...it,
+        category: (it.category || "appointment").toLowerCase(),
+        xp: isFinite(Number(it.xp)) ? Math.max(0, Math.floor(Number(it.xp))) : undefined,
+      });
+    }
+  }
+  return uniqItems(matched);
+}
+
+function matchEnvAppointment(outcomeText: string): boolean {
+  const t = String(outcomeText || "").trim().toLowerCase();
+  return !!t && APPOINTMENT_VALUES.includes(t);
 }
 
 export async function handleNormalizedEvent(ev: Normalized) {
@@ -47,42 +98,77 @@ export async function handleNormalizedEvent(ev: Normalized) {
   if (hasSeen(id)) return;
   markSeen(id);
 
-  const tenant = (ev.tenant || ev.raw?.tenant || "default") as string;
-  const rawOutcome = String(ev.outcome || "").trim();
+  const tenant = String(ev.tenant || "default");
+  const outcomeText = String(ev.outcome || "");
+  const idCands = pickHubSpotLikeIds(ev.raw);
 
-  if (isAppointmentOutcome(tenant, rawOutcome)) {
-    await awardXpForAppointment(ev, tenant);
+  const matched = matchUiLabels(tenant, outcomeText, idCands);
+  const envAppt = matchEnvAppointment(outcomeText);
+
+  const hasUiAppointment = matched.some((m) => (m.category || "appointment") === "appointment");
+  const xpItems = matched.filter((m) => (m.xp ?? 0) > 0);
+
+  // ===== XP 付与（UIにXPが設定されているラベルは全て付与）=====
+  if (xpItems.length) {
+    for (const m of xpItems) {
+      await awardXpForLabel(ev, m);
+    }
+  } else if (hasUiAppointment || envAppt) {
+    // UI側でXP未設定の「アポ」または env のアポは従来の既定XPを付与
+    await awardXpForAppointment(ev);
     await notifyChatworkAppointment(ev);
+  }
+
+  // ===== 記録（ダッシュボード拡張用の生データ）=====
+  if (matched.length) {
+    await recordLabelEvents(ev, matched);
   } else {
-    log(`non-appointment outcome=${rawOutcome || "(empty)"} tenant=${tenant}`);
+    log(`non-appointment outcome=${outcomeText || "(empty)"} (no UI label match)`);
   }
 }
 
-async function awardXpForAppointment(ev: Normalized, tenant: string) {
+async function awardXpForLabel(ev: Normalized, it: LabelItem) {
   const who = resolveActor({ source: ev.source as any, raw: ev.raw });
   const cred = getHabitica(who.email);
-  const when = fmtJST(ev.occurredAt);
+  const xp = Math.max(0, Math.floor(Number(it.xp ?? 0)));
+  const badge = it.badge || it.title || (it.category || "label");
+
+  appendJsonl("data/events/labels-xp.jsonl", {
+    at: new Date().toISOString(),
+    day: fmtJST(ev.occurredAt).slice(0, 10).replace(/\./g, "-"),
+    callId: ev.callId,
+    actor: who,
+    label: { id: it.id || null, title: it.title || null, category: (it.category || "label").toLowerCase() },
+    xp,
+  });
+
+  if (!cred || DRY_RUN || xp <= 0) {
+    log(`[XP] label '${badge}' +${xp}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name}`);
+    return;
+  }
+  await habSafe(async () => {
+    await addAppointment(cred, xp, String(badge)); // addAppointment を汎用XPにも流用
+    return undefined as any;
+  });
+}
+
+async function awardXpForAppointment(ev: Normalized) {
+  const who = resolveActor({ source: ev.source as any, raw: ev.raw });
+  const cred = getHabitica(who.email);
 
   appendJsonl("data/events/appointments.jsonl", {
     at: new Date().toISOString(),
     day: fmtJST(ev.occurredAt).slice(0, 10).replace(/\./g, "-"),
     callId: ev.callId,
     actor: who,
-    tenant,
-    outcome: String(ev.outcome || ""),
   });
 
-  // いまは共通のAPPOINTMENT_XP。将来ラベル別XPにする場合はここで分岐可能。
-  const xp = APPOINTMENT_XP;
-
   if (!cred || DRY_RUN) {
-    log(
-      `[XP] appointment +${xp}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name} @${when} tenant=${tenant}`
-    );
+    log(`[XP] appointment +${APPOINTMENT_XP}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name}`);
     return;
   }
   await habSafe(async () => {
-    await addAppointment(cred, xp, APPOINTMENT_BADGE_LABEL);
+    await addAppointment(cred, APPOINTMENT_XP, APPOINTMENT_BADGE_LABEL);
     return undefined as any;
   });
 }
@@ -92,4 +178,24 @@ async function notifyChatworkAppointment(ev: Normalized) {
     const who = resolveActor({ source: ev.source as any, raw: ev.raw });
     await sendChatworkMessage(cwApptText(who.name));
   } catch {}
+}
+
+async function recordLabelEvents(ev: Normalized, matched: LabelItem[]) {
+  const who = resolveActor({ source: ev.source as any, raw: ev.raw });
+  const day = fmtJST(ev.occurredAt).slice(0, 10).replace(/\./g, "-");
+  for (const m of matched) {
+    appendJsonl("data/events/labels.jsonl", {
+      at: new Date().toISOString(),
+      day,
+      callId: ev.callId,
+      actor: who,
+      label: {
+        id: m.id || null,
+        title: m.title || null,
+        category: (m.category || "label").toLowerCase(),
+        xp: isFinite(Number(m.xp)) ? Math.max(0, Math.floor(Number(m.xp))) : 0,
+      },
+      outcomeText: ev.outcome || null,
+    });
+  }
 }
