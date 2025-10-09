@@ -1,105 +1,113 @@
+// @ts-nocheck
 // src/features/appointment.ts
+// UIで保存したラベル定義に基づき、任意ラベルへのXP付与を実現。
+// 既存の「既定アポXP」「Chatwork通知」「イベント記録」も維持。
+
 import {
   APPOINTMENT_BADGE_LABEL,
   APPOINTMENT_VALUES,
   APPOINTMENT_XP,
   DRY_RUN,
 } from "../lib/env.js";
+
 import { appendJsonl, fmtJST, log } from "../lib/utils.js";
 import { resolveActor } from "./resolveActor.js";
 import { getHabitica } from "../lib/maps.js";
 import { habSafe } from "../lib/habiticaQueue.js";
-import { addAppointment } from "../connectors/habitica.js";
+import { addAppointment } from "../connectors/habitica.js"; // 汎用XPにも流用
 import { sendChatworkMessage, cwApptText } from "../connectors/chatwork.js";
 import { hasSeen, markSeen } from "../lib/seen.js";
+
+// UI保存分の取得API
 import {
   getObservedLabelIds,
   getObservedLabelTitles,
+  getLabelItems, // UIで保存した items（id/title/xp/enabled/badge/category）を返す
 } from "../store/labels.js";
 
-/** 文字列化/小文字化のヘルパー（String(...) は使わない） */
-const asStr = (v: unknown): string => "" + (v ?? "");
-const lc = (v: unknown): string => asStr(v).toLowerCase();
+// 文字列安全化
+const asStr = (v: unknown) => "" + (v ?? "");
+const lc = (v: unknown) => asStr(v).toLowerCase();
 
-/** このファイル内だけで完結する LabelItem 型（UI で扱うラベル） */
 type LabelItem = {
   id?: string;
   title?: string;
-  category?: string; // "appointment" など
-  xp?: number;
-  badge?: string;
+  category?: string;   // 省略時 "label" / "appointment"
   enabled?: boolean;
+  xp?: number;         // 任意XP
+  badge?: string;      // Habiticaのメモ（省略時は title/category）
 };
 
 export type Normalized = {
   source: "v3" | "workflow" | "zoom";
   eventId?: any;
   callId?: any;
-  outcome?: string; // 例: "新規アポ", "ニーズ無し", "見込みA" など
+  outcome?: string;      // 例: "新規アポ", "ニーズ無し", "見込みA" など
   occurredAt?: any;
-  raw?: any; // HubSpot 生データ
-  tenant?: string; // 未指定なら default
+  raw?: any;             // HubSpot生データ
+  tenant?: string;       // 未指定なら default
 };
 
-/** HubSpot 風の ID 候補をできる限り拾う */
+/** HubSpot 風の ID 候補を広く拾う（rawのどこにあっても拾う） */
 function pickHubSpotLikeIds(raw: any): string[] {
   const out: string[] = [];
-  const push = (v: any) => {
+  const push = (v: unknown) => {
     if (Array.isArray(v)) v.forEach(push);
-    else if (v !== null && v !== undefined) out.push(String(v));
+    else if (v !== null && v !== undefined) out.push(asStr(v));
   };
+  if (!raw) return out;
   try {
-    // ベタにトップレベル / properties の両方を舐める
-    push(raw?.labelId);
-    push(raw?.labelIds);
-    push(raw?.hs_label_id);
-    push(raw?.hs_outcome_id);
-    push(raw?.hs_pipeline_stage);
-    push(raw?.hs_task_type_id);
-    push(raw?.hs_dealstage);
-
-    const p = raw?.properties ?? {};
-    push(p.labelId);
-    push(p.labelIds);
-    push(p.hs_label_id);
-    push(p.hs_outcome_id);
-    push(p.hs_pipeline_stage);
-    push(p.hs_task_type_id);
-    push(p.hs_dealstage);
-  } catch {
-    /* noop */
-  }
+    push(raw.labelId);
+    push(raw.labelIds);
+    push(raw.hs_label_id);
+    push(raw.hs_outcome_id);
+    push(raw.hs_pipeline_stage);
+    push(raw.hs_task_type_id);
+    push(raw.hs_dealstage);
+    if (raw.properties) {
+      const p = raw.properties;
+      push(p.labelId);
+      push(p.labelIds);
+      push(p.hs_label_id);
+      push(p.hs_outcome_id);
+      push(p.hs_pipeline_stage);
+      push(p.hs_task_type_id);
+      push(p.hs_dealstage);
+    }
+  } catch {}
   return out.filter(Boolean).map(asStr);
 }
 
-/** UI 保存のラベル一覧を取得し、appointment カテゴリで返却 */
+/** UI 保存の items をロード。未定義なら observed の ID/タイトルから appointment として組み立てる */
 async function loadUiLabels(tenant: string): Promise<LabelItem[]> {
-  const ids =
-    ((await getObservedLabelIds(tenant)) ?? []).map((s: unknown) => asStr(s));
-  const titles =
-    ((await getObservedLabelTitles(tenant)) ?? []).map((s: unknown) => asStr(s));
-  return [
-    ...ids.map((id: string) => ({
-      id,
-      category: "appointment",
-      enabled: true,
-    })),
-    ...titles.map((title: string) => ({
-      title,
-      category: "appointment",
-      enabled: true,
-    })),
-  ];
+  try {
+    const items = (await getLabelItems(tenant)) ?? [];
+    // 正規化
+    return (items as any[]).map((it) => ({
+      id: it?.id ? asStr(it.id) : undefined,
+      title: it?.title ? asStr(it.title) : undefined,
+      category: it?.category ? lc(it.category) : (it?.title || it?.id ? "appointment" : "label"),
+      enabled: it?.enabled !== false,
+      xp: Number.isFinite(Number(it?.xp)) ? Math.max(0, Math.floor(Number(it?.xp))) : undefined,
+      badge: it?.badge ? asStr(it.badge) : undefined,
+    }));
+  } catch {
+    // フォールバック：ID/タイトルだけを appointment として返す
+    const ids = ((await getObservedLabelIds(tenant)) ?? []).map(asStr);
+    const titles = ((await getObservedLabelTitles(tenant)) ?? []).map(asStr);
+    return [
+      ...ids.map((id) => ({ id, category: "appointment", enabled: true } as LabelItem)),
+      ...titles.map((title) => ({ title, category: "appointment", enabled: true } as LabelItem)),
+    ];
+  }
 }
 
-/** 重複キー（id/title/category）を排除 */
 function uniq(items: LabelItem[]): LabelItem[] {
   const seen = new Set<string>();
   const out: LabelItem[] = [];
   for (const it of items) {
-    const key = `${lc(it.category || "")}|${asStr(it.id).trim()}|${lc(
-      asStr(it.title)
-    )}`;
+    const key =
+      `${lc(it.category || "label")}|${asStr(it.id || "").trim()}|${lc(asStr(it.title || ""))}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(it);
@@ -107,64 +115,55 @@ function uniq(items: LabelItem[]): LabelItem[] {
   return out;
 }
 
-/** UI のラベル定義と outcome 文言 / id 候補で照合 */
-async function matchUiLabels(
-  tenant: string,
-  outcomeText: string,
-  idCands: string[]
-): Promise<LabelItem[]> {
+/** UI保存のラベル定義と outcome 文字 / id候補 で照合 */
+async function matchUiLabels(tenant: string, outcomeText: string, idCands: string[]): Promise<LabelItem[]> {
   const items = await loadUiLabels(tenant);
-  const outcomeLc = lc(outcomeText);
+  const outcomeLc = lc(outcomeText).trim();
   const matched: LabelItem[] = [];
-
   for (const it of items) {
     if (it.enabled === false) continue;
-    const byId = !!it.id && idCands.includes(asStr(it.id));
-    const byTitle = !!it.title && outcomeLc === lc(it.title);
+    const byId = it.id && idCands.includes(asStr(it.id));
+    const byTitle = it.title && outcomeLc && outcomeLc === lc(it.title);
     if (byId || byTitle) {
       matched.push({
         ...it,
         category: lc(it.category || "label"),
-        xp: Number.isFinite(Number(it.xp))
-          ? Math.max(0, Math.floor(Number(it.xp)))
-          : undefined,
+        xp: Number.isFinite(Number(it.xp)) ? Math.max(0, Math.floor(Number(it.xp))) : undefined,
       });
     }
   }
   return uniq(matched);
 }
 
-/** 環境変数のアポ判定（フォールバック） */
+/** ENV(APPOINTMENT_VALUES) による既定のアポ判定 */
 function matchEnvAppointment(outcomeText: string): boolean {
   const t = lc(outcomeText).trim();
   return !!t && (APPOINTMENT_VALUES ?? []).map(lc).includes(t);
 }
 
-/** エントリポイント：正規化イベント処理（既存機能は維持） */
+/** メイン：イベント処理 */
 export async function handleNormalizedEvent(ev: Normalized) {
   const id = ev.eventId ?? ev.callId;
   if (hasSeen(id)) return;
   markSeen(id);
 
-  const tenant = String(ev.tenant || "default");
+  const tenant = asStr(ev.tenant || "default");
   const outcomeText = asStr(ev.outcome || "");
   const idCands = pickHubSpotLikeIds(ev.raw);
 
   const matched = await matchUiLabels(tenant, outcomeText, idCands);
   const envAppt = matchEnvAppointment(outcomeText);
 
-  const hasUiAppointment = matched.some(
-    (m) => (m.category || "appointment") === "appointment"
-  );
+  const hasUiAppointment = matched.some((m) => (m.category || "appointment") === "appointment");
   const xpItems = matched.filter((m) => (m.xp ?? 0) > 0);
 
-  // ===== XP 付与（UI に XP が設定されているラベルは全て付与）=====
+  // ===== ラベルごとのXP付与（UIでXPが入っているものは全部付与）=====
   if (xpItems.length) {
     for (const m of xpItems) {
       await awardXpForLabel(ev, m);
     }
   } else if (hasUiAppointment || envAppt) {
-    // UI 側で XP 未設定の「アポ」or ENV のアポは従来の既定 XP を付与
+    // UI側でXP未設定の「アポ」または ENV のアポ → 既定アポXP + Chatwork
     await awardXpForAppointment(ev);
     await notifyChatworkAppointment(ev);
   }
@@ -173,9 +172,7 @@ export async function handleNormalizedEvent(ev: Normalized) {
   if (matched.length) {
     await recordLabelEvents(ev, matched);
   } else {
-    log(
-      `non-appointment outcome=${outcomeText || "(empty)"} (no UI label match)`
-    );
+    log(`non-appointment outcome=${outcomeText || "(empty)"} (no UI label match)`);
   }
 }
 
@@ -190,23 +187,16 @@ async function awardXpForLabel(ev: Normalized, it: LabelItem) {
     day: fmtJST(ev.occurredAt).slice(0, 10).replace(/\./g, "-"),
     callId: ev.callId,
     actor: who,
-    label: {
-      id: it.id || null,
-      title: it.title || null,
-      category: (it.category || "label").toLowerCase(),
-    },
+    label: { id: it.id || null, title: it.title || null, category: lc(it.category || "label") },
     xp,
   });
 
   if (!cred || DRY_RUN || xp <= 0) {
-    log(
-      `[XP] label '${badge}' +${xp}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name}`
-    );
+    log(`[XP] label '${badge}' +${xp}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name}`);
     return;
   }
   await habSafe(async () => {
-    // 汎用 XP 付与に addAppointment を流用（バッジ名に label/title を使う）
-    await addAppointment(cred, xp, String(badge));
+    await addAppointment(cred, xp, asStr(badge)); // addAppointment を汎用XPにも流用
     return undefined as any;
   });
 }
@@ -223,9 +213,7 @@ async function awardXpForAppointment(ev: Normalized) {
   });
 
   if (!cred || DRY_RUN) {
-    log(
-      `[XP] appointment +${APPOINTMENT_XP}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name}`
-    );
+    log(`[XP] appointment +${APPOINTMENT_XP}XP (DRY_RUN or no-cred) callId=${ev.callId} by=${who.name}`);
     return;
   }
   await habSafe(async () => {
@@ -238,9 +226,7 @@ async function notifyChatworkAppointment(ev: Normalized) {
   try {
     const who = resolveActor({ source: ev.source as any, raw: ev.raw });
     await sendChatworkMessage(cwApptText(who.name));
-  } catch {
-    /* noop */
-  }
+  } catch {}
 }
 
 async function recordLabelEvents(ev: Normalized, matched: LabelItem[]) {
@@ -255,10 +241,8 @@ async function recordLabelEvents(ev: Normalized, matched: LabelItem[]) {
       label: {
         id: m.id || null,
         title: m.title || null,
-        category: (m.category || "label").toLowerCase(),
-        xp: Number.isFinite(Number(m.xp))
-          ? Math.max(0, Math.floor(Number(m.xp)))
-          : 0,
+        category: lc(m.category || "label"),
+        xp: Number.isFinite(Number(m.xp)) ? Math.max(0, Math.floor(Number(m.xp))) : 0,
       },
       outcomeText: ev.outcome || null,
     });

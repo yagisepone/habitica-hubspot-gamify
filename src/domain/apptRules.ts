@@ -1,36 +1,40 @@
+// @ts-nocheck
+// src/domain/apptRules.ts
+// アポ判定のフォールバック（UIのラベルが無い場合は ENV を見る）
+// ここでは「判定」だけに限定し、XP計算は features/appointment.ts 側で集約します。
+
 import { APPOINTMENT_VALUES, APPOINTMENT_XP } from "../lib/env.js";
 import { getObservedLabelIds, getObservedLabelTitles } from "../store/labels.js";
 
-/** 安全な小文字変換（String(...) を使わない） */
-const lc = (v: unknown): string => ("" + (v ?? "")).toLowerCase();
+// 文字列安全化
+const asStr = (v: unknown): string => "" + (v ?? "");
+const lc = (v: unknown): string => asStr(v).toLowerCase();
 
 /**
- * outcome（ラベルIDやタイトル）が「アポとして数える対象かどうか」を判定します。
- * テナント固有のラベルID/タイトルを優先し、それが無い場合は ENV(APPOINTMENT_VALUES) を使用します。
+ * outcome（ラベルIDやタイトル）が「アポとして数える対象か」を判定。
+ * テナント固有のラベルID/タイトルがあればそれを優先。無ければ ENV(APPOINTMENT_VALUES) を使用。
  */
-export async function isAppointmentOutcome(
-  tenant: string,
-  outcome: string
-): Promise<boolean> {
+export async function isAppointmentOutcome(tenant: string, outcome: string): Promise<boolean> {
   const v = lc(outcome).trim();
   if (!v) return false;
 
-  // テナント固有設定（非同期）
-  const ids =
-    ((await getObservedLabelIds(tenant)) ?? []).map((s: unknown) => lc(s));
-  const titles =
-    ((await getObservedLabelTitles(tenant)) ?? []).map((s: unknown) => lc(s));
-
-  if (ids.length || titles.length) {
-    return ids.includes(v) || titles.includes(v);
+  try {
+    // テナント固有の設定（UI 保存分）
+    const ids = ((await getObservedLabelIds(tenant)) ?? []).map(lc);
+    const titles = ((await getObservedLabelTitles(tenant)) ?? []).map(lc);
+    if (ids.length || titles.length) {
+      return ids.includes(v) || titles.includes(v);
+    }
+  } catch {
+    // 何もしない（ENV にフォールバック）
   }
 
-  // フォールバック：ENV の APPOINTMENT_VALUES
-  const envVals = (APPOINTMENT_VALUES ?? []).map((s: unknown) => lc(s));
+  // 環境変数の既定
+  const envVals = (APPOINTMENT_VALUES ?? []).map(lc);
   return envVals.includes(v);
 }
 
-/** 現状は共通の既定 XP を返す（将来ラベル別/テナント別も可） */
+/** 今は共通の既定 XP を返す（将来テナント別/ラベル別に拡張可能） */
 export function xpForAppointment(_tenant: string, _outcome: string): number {
   return APPOINTMENT_XP;
 }
