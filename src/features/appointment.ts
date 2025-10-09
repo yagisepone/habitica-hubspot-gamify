@@ -1,7 +1,7 @@
 // @ts-nocheck
 // src/features/appointment.ts
-// UIで保存したラベル定義に基づき、任意ラベルへのXP付与を実現。
-// 既存の「既定アポXP」「Chatwork通知」「イベント記録」も維持。
+// UI保存のラベル定義に基づき、任意ラベルへのXP付与を実現。
+// 「既定アポXP」「Chatwork通知」「イベント記録」も維持。
 
 import {
   APPOINTMENT_BADGE_LABEL,
@@ -9,7 +9,6 @@ import {
   APPOINTMENT_XP,
   DRY_RUN,
 } from "../lib/env.js";
-
 import { appendJsonl, fmtJST, log } from "../lib/utils.js";
 import { resolveActor } from "./resolveActor.js";
 import { getHabitica } from "../lib/maps.js";
@@ -17,25 +16,24 @@ import { habSafe } from "../lib/habiticaQueue.js";
 import { addAppointment } from "../connectors/habitica.js"; // 汎用XPにも流用
 import { sendChatworkMessage, cwApptText } from "../connectors/chatwork.js";
 import { hasSeen, markSeen } from "../lib/seen.js";
-
-// UI保存分の取得API
 import {
   getObservedLabelIds,
   getObservedLabelTitles,
-  getLabelItems, // UIで保存した items（id/title/xp/enabled/badge/category）を返す
+  getLabelItems,
 } from "../store/labels.js";
 
-// 文字列安全化
 const asStr = (v: unknown) => "" + (v ?? "");
 const lc = (v: unknown) => asStr(v).toLowerCase();
+const arr = (v: any): any[] =>
+  Array.isArray(v) ? v : (v && Array.isArray(v.items) ? v.items : []);
 
 type LabelItem = {
   id?: string;
   title?: string;
-  category?: string;   // 省略時 "label" / "appointment"
+  category?: string;   // "appointment" / "label"
   enabled?: boolean;
-  xp?: number;         // 任意XP
-  badge?: string;      // Habiticaのメモ（省略時は title/category）
+  xp?: number;
+  badge?: string;
 };
 
 export type Normalized = {
@@ -48,7 +46,7 @@ export type Normalized = {
   tenant?: string;       // 未指定なら default
 };
 
-/** HubSpot 風の ID 候補を広く拾う（rawのどこにあっても拾う） */
+/** HubSpot 風の ID 候補を広く拾う */
 function pickHubSpotLikeIds(raw: any): string[] {
   const out: string[] = [];
   const push = (v: unknown) => {
@@ -78,12 +76,17 @@ function pickHubSpotLikeIds(raw: any): string[] {
   return out.filter(Boolean).map(asStr);
 }
 
-/** UI 保存の items をロード。未定義なら observed の ID/タイトルから appointment として組み立てる */
+/** UI保存分の items を最優先。無ければ observed の ID/タイトルで補完。 */
 async function loadUiLabels(tenant: string): Promise<LabelItem[]> {
-  try {
-    const items = (await getLabelItems(tenant)) ?? [];
-    // 正規化
-    return (items as any[]).map((it) => ({
+  const [itemsRaw, idsRaw, titlesRaw] = await Promise.all([
+    getLabelItems(tenant).catch(() => null),
+    getObservedLabelIds(tenant).catch(() => null),
+    getObservedLabelTitles(tenant).catch(() => null),
+  ]);
+
+  const items = arr(itemsRaw);
+  if (items.length) {
+    return items.map((it: any) => ({
       id: it?.id ? asStr(it.id) : undefined,
       title: it?.title ? asStr(it.title) : undefined,
       category: it?.category ? lc(it.category) : (it?.title || it?.id ? "appointment" : "label"),
@@ -91,15 +94,15 @@ async function loadUiLabels(tenant: string): Promise<LabelItem[]> {
       xp: Number.isFinite(Number(it?.xp)) ? Math.max(0, Math.floor(Number(it?.xp))) : undefined,
       badge: it?.badge ? asStr(it.badge) : undefined,
     }));
-  } catch {
-    // フォールバック：ID/タイトルだけを appointment として返す
-    const ids = ((await getObservedLabelIds(tenant)) ?? []).map(asStr);
-    const titles = ((await getObservedLabelTitles(tenant)) ?? []).map(asStr);
-    return [
-      ...ids.map((id) => ({ id, category: "appointment", enabled: true } as LabelItem)),
-      ...titles.map((title) => ({ title, category: "appointment", enabled: true } as LabelItem)),
-    ];
   }
+
+  // フォールバック：observed の ID/タイトル
+  const ids = arr(idsRaw).map(asStr);
+  const titles = arr(titlesRaw).map(asStr);
+  return [
+    ...ids.map((id) => ({ id, category: "appointment", enabled: true } as LabelItem)),
+    ...titles.map((title) => ({ title, category: "appointment", enabled: true } as LabelItem)),
+  ];
 }
 
 function uniq(items: LabelItem[]): LabelItem[] {
@@ -115,7 +118,7 @@ function uniq(items: LabelItem[]): LabelItem[] {
   return out;
 }
 
-/** UI保存のラベル定義と outcome 文字 / id候補 で照合 */
+/** UI保存ラベル定義と outcome 文字 / id候補 で照合 */
 async function matchUiLabels(tenant: string, outcomeText: string, idCands: string[]): Promise<LabelItem[]> {
   const items = await loadUiLabels(tenant);
   const outcomeLc = lc(outcomeText).trim();
@@ -138,7 +141,11 @@ async function matchUiLabels(tenant: string, outcomeText: string, idCands: strin
 /** ENV(APPOINTMENT_VALUES) による既定のアポ判定 */
 function matchEnvAppointment(outcomeText: string): boolean {
   const t = lc(outcomeText).trim();
-  return !!t && (APPOINTMENT_VALUES ?? []).map(lc).includes(t);
+  const envValsRaw: any = APPOINTMENT_VALUES;
+  const envVals = Array.isArray(envValsRaw)
+    ? envValsRaw
+    : (typeof envValsRaw === "string" ? envValsRaw.split(",") : []);
+  return !!t && envVals.map(lc).includes(t);
 }
 
 /** メイン：イベント処理 */
@@ -163,7 +170,7 @@ export async function handleNormalizedEvent(ev: Normalized) {
       await awardXpForLabel(ev, m);
     }
   } else if (hasUiAppointment || envAppt) {
-    // UI側でXP未設定の「アポ」または ENV のアポ → 既定アポXP + Chatwork
+    // UI側でXP未設定の「アポ」または ENVアポ → 既定アポXP + Chatwork
     await awardXpForAppointment(ev);
     await notifyChatworkAppointment(ev);
   }
