@@ -5,9 +5,10 @@
   "description": "HubSpot × Habitica gamification webhook server",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && rm -rf dist/public-admin && mkdir -p dist/public-admin && cp -r src/public-admin/* dist/public-admin/",
     "start": "node dist/server.js",
-    "dev": "ts-node src/server.ts",
+    "dev": "node --loader ts-node/esm src/server.ts",
+
     "test": "jest",
     "test:watch": "jest --watch"
   },
