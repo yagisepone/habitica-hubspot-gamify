@@ -14,11 +14,9 @@ import { habSafe } from "../lib/habiticaQueue.js";
 import { addAppointment } from "../connectors/habitica.js";
 import { sendChatworkMessage, cwApptText } from "../connectors/chatwork.js";
 import { hasSeen, markSeen } from "../lib/seen.js";
-import {
-  getObservedLabelIds,
-  getObservedLabelTitles,
-  getLabelItems,
-} from "../store/labels.js";
+
+// ★ ここを * として読み込み、存在チェックしてから呼ぶようにする
+import * as lbl from "../store/labels.js";
 
 const asStr = (v: unknown) => "" + (v ?? "");
 const lc = (v: unknown) => asStr(v).toLowerCase();
@@ -44,8 +42,6 @@ export type Normalized = {
   raw?: any;       // HubSpot生データ
   tenant?: string; // 未指定なら default
 };
-
-/* ========= 補助関数 ========= */
 
 /** HubSpot っぽい ID 候補を広く拾う */
 function pickHubSpotLikeIds(raw: any): string[] {
@@ -79,10 +75,19 @@ function pickHubSpotLikeIds(raw: any): string[] {
 
 /** UI保存の items を最優先で取得。無ければ observed の ID/タイトルで補完。 */
 async function loadUiLabels(tenant: string): Promise<LabelItem[]> {
-  const [itemsRaw, idsRaw, titlesRaw] = await Promise.all([
-    getLabelItems(tenant).catch(() => null),
-    getObservedLabelIds(tenant).catch(() => null),
-    getObservedLabelTitles(tenant).catch(() => null),
+  // --- getLabelItems は“あるかもしれない”関数。存在チェックしてから呼ぶ ---
+  let itemsRaw: any = null;
+  try {
+    const getItemsFn: any = (lbl as any).getLabelItems;
+    if (typeof getItemsFn === "function") {
+      itemsRaw = await getItemsFn(tenant).catch(() => null);
+    }
+  } catch {}
+
+  // observed 系は通常どおり（存在しない環境でも optional call に）
+  const [idsRaw, titlesRaw] = await Promise.all([
+    (lbl as any).getObservedLabelIds?.(tenant).catch(() => null) ?? null,
+    (lbl as any).getObservedLabelTitles?.(tenant).catch(() => null) ?? null,
   ]);
 
   const items = arr(itemsRaw);
@@ -222,7 +227,7 @@ async function awardXpForLabel(ev: Normalized, it: LabelItem) {
     return;
   }
   await habSafe(async () => {
-    await addAppointment(cred, xp, asStr(badge)); // addAppointment を汎用XPにも流用
+    await addAppointment(cred, xp, asStr(badge));
     return undefined as any;
   });
 }
