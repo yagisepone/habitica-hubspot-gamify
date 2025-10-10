@@ -6,37 +6,39 @@
   <title>Sales Gamify Console</title>
 </head>
 <body>
+
 <script>
-/* ===== 事前セット：GM_addStyle polyfill & マジックリンク保存 (#tenant/#token/#base) ===== */
+/* ------------------------------
+   0) 事前セット: GM_addStyle / マジックリンク
+   ------------------------------ */
 (function(){
-  // GM_addStyle polyfill（TamperMonkey無しでも同じ動作）
+  // Tampermonkey なしでも同じAPI名でCSSを注入できるように
   window.GM_addStyle = window.GM_addStyle || function(css){
-    try{ const s=document.createElement('style'); s.textContent=css; document.head.appendChild(s); }catch(_){}
+    try { const s=document.createElement('style'); s.textContent=css; document.head.appendChild(s); } catch(_){}
   };
-  // URLハッシュ → localStorage("sgc.profile.v3") 保存
-  try{
+
+  // #tenant=...&token=...&base=... を localStorage に保存
+  try {
     const q = new URLSearchParams(location.hash.slice(1));
     const tenant = q.get('tenant') || 'default';
     const token  = q.get('token')  || '';
     const base   = (q.get('base') ?? '').trim();
     const baseUrl = base === '' ? location.origin : base;
-    const profile = { tenant, baseUrl, token };
-    localStorage.setItem("sgc.profile.v3", JSON.stringify(profile));
-  }catch(_){}
+    localStorage.setItem("sgc.profile.v3", JSON.stringify({ tenant, baseUrl, token }));
+  } catch(_){}
 })();
 </script>
 
-<!-- ここから下は TamperMonkey 本体のコードを “そのまま” 掲載 -->
 <script>
-// ==UserScript==
-// @name         Sales Gamify Console (v2.3 UI: ルール自由編集・CSV取込・安定化)
-// @namespace    https://habitica.com/
-// @version      2.3.0
-// @description  Habitica上に営業ゲーミフィケーション設定UIを追加。スコア/アポ/ラベル/CSV/ダッシュボードを編集。読み込み完了と同時に表示ボタンを出すよう安定化。
-// @match        https://habitica.com/*
-// @run-at       document-end
-// @grant        GM_addStyle
-// ==/UserScript==
+/* ==UserScript==
+ * @name         Sales Gamify Console (v2.3 UI: ルール自由編集・CSV取込・安定化)
+ * @namespace    https://habitica.com/
+ * @version      2.3.0
+ * @description  Habitica上に営業ゲーミフィケーション設定UIを追加。スコア/アポ/ラベル/CSV/ダッシュボードを編集。読み込み完了と同時に表示ボタンを出すよう安定化。
+ * @match        https://habitica.com/*
+ * @run-at       document-end
+ * @grant        GM_addStyle
+ * ==/UserScript== */
 
 (() => {
   /* ====== 基本ユーティリティ ====== */
@@ -50,16 +52,16 @@
   const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
   const load=(k,def={})=>{ try{ return JSON.parse(localStorage.getItem(k)||"")||def; }catch{ return def; } };
   const save=(k,v)=> localStorage.setItem(k, JSON.stringify(v||{}));
-  const toast=(msg,bad=false)=>{ const el=h(`<div class="sgc-toast" style="background:${bad?"#c0392b":"#222"}">${msg}</div>`); document.body.appendChild(el); setTimeout(()=>el.remove(),2400); };
+  const toast=(msg,bad=false)=>{ const el=h(`<div class="sgc-toast" style="background:${bad?"#c0392b":"#222"}">${msg}</div>`); document.body.appendChild(el); setTimeout(()=>el.remove(),3000); };
   const loadProfile=()=>load(LS_KEY,{ tenant:"default", baseUrl:"", token:"" });
   const saveProfile=(p)=>save(LS_KEY,p);
 
   const headers=(p)=>{ const hd={"Accept":"application/json"}; if(p?.token){ hd.Authorization=`Bearer ${p.token}`; } return hd; };
-  const apiGET=async(url,p)=>{ const r=await fetch(url,{headers:headers(p)}); if(!r.ok) throw new Error(`${r.status}`); return r.json(); };
-  const apiPUT=async(url,body,p)=>{ const r=await fetch(url,{method:"PUT",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)}); if(!r.ok) throw new Error(`${r.status}`); try{return await r.json();}catch{return {ok:true}} };
-  const apiPOSTForm=async(url,form,p)=>{ const r=await fetch(url,{method:"POST",headers:headers(p),body:form}); if(!r.ok) throw new Error(`${r.status}`); try{return await r.json();}catch{return {ok:true}} };
+  const apiGET=async(url,p)=>{ const r=await fetch(url,{headers:headers(p)}); if(!r.ok) throw new Error(String(r.status)); return r.json(); };
+  const apiPUT=async(url,body,p)=>{ const r=await fetch(url,{method:"PUT",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)}); if(!r.ok) throw new Error(String(r.status)); try{return await r.json();}catch{return {ok:true}} };
+  const apiPOSTForm=async(url,form,p)=>{ const r=await fetch(url,{method:"POST",headers:headers(p),body:form}); if(!r.ok) throw new Error(String(r.status)); try{return await r.json();}catch{return {ok:true}} };
 
-  /* ====== スタイル ====== */
+  /* ====== スタイル（オリジナル + 使い勝手改良） ====== */
   GM_addStyle(`
     #sgc-fab{position:fixed; top:110px; right:18px; z-index:2147483646;
       background:#6c5ce7; color:#fff; border-radius:14px; padding:10px 14px;
@@ -67,7 +69,7 @@
     #sgc-fab:hover{filter:brightness(1.06)}
     #sgc-modal-mask{position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:2147483645; display:none}
     #sgc-modal{position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
-      z-index:2147483646; width:min(1080px,94vw); max-height:86vh; background:#fff; border-radius:14px;
+      z-index:2147483646; width:min(1160px,96vw); max-height:88vh; background:#fff; border-radius:14px;
       overflow:hidden; box-shadow:0 24px 48px rgba(0,0,0,.25); display:none;
       font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans JP",sans-serif}
     .sgc-hd{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:#f7f7fb;border-bottom:1px solid #ececf5;gap:12px}
@@ -76,7 +78,7 @@
     .sgc-tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid #f1f1f6;flex-wrap:wrap}
     .sgc-tab{padding:6px 10px;border-radius:8px;font-weight:700;color:#555;cursor:pointer}
     .sgc-tab.active{background:#6c5ce7;color:#fff}
-    .sgc-body{padding:14px;max-height:calc(86vh - 134px);overflow:auto}
+    .sgc-body{padding:14px;max-height:calc(88vh - 134px);overflow:auto}
     .sgc-row{display:grid;grid-template-columns:220px 1fr;gap:12px;align-items:center;padding:8px 0}
     .sgc-row input,.sgc-row select,.sgc-row textarea{border:1px solid #dfe3f0;border-radius:8px;padding:9px 10px;width:100%;font-size:14px;background:#fff}
     .sgc-help{font-size:12px;color:#777}
@@ -85,15 +87,22 @@
     .sgc-btn{background:#e9e9f4;border:none;padding:9px 14px;border-radius:10px;font-weight:800;cursor:pointer}
     .sgc-btn.primary{background:#6c5ce7;color:#fff}
     .sgc-badge{background:#f0efff;color:#5c54d6;border-radius:999px;padding:3px 8px;font-size:12px}
-    .sgc-toast{position:fixed;right:16px;bottom:16px;background:#222;color:#fff;padding:10px 14px;border-radius:12px;z-index:2147483647;opacity:.92}
+    .sgc-toast{position:fixed;right:16px;bottom:16px;background:#222;color:#fff;padding:10px 14px;border-radius:12px;z-index:2147483647;opacity:.95}
     .sgc-list{display:flex;flex-direction:column;gap:8px}
-    .sgc-card{border:1px solid #e8e8f5;border-radius:12px;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .sgc-card{border:1px solid #e8e8f5;border-radius:12px;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
     .sgc-card .full{grid-column:1 / -1}
     .sgc-card .muted{color:#777;font-size:12px}
     .sgc-del{background:#fff;border:1px solid #e1e1ef}
     .sgc-bare{border:1px dashed #ddd;border-radius:10px;padding:10px}
     .sgc-row-compact{display:flex;gap:8px;align-items:center}
-    @media(max-width:768px){ .sgc-row{grid-template-columns:1fr} .sgc-card{grid-template-columns:1fr} }
+    /* HubSpot行をワイドに：3カラム(ラベルID/タイトル/削除) */
+    .sgc-card-hub{grid-template-columns:1.4fr 2fr 120px}
+    .sgc-card-hub input{width:100%}
+    @media(max-width:768px){
+      .sgc-row{grid-template-columns:1fr}
+      .sgc-card{grid-template-columns:1fr}
+      .sgc-card-hub{grid-template-columns:1fr}
+    }
   `);
 
   /* ====== 固定ボタン ====== */
@@ -119,11 +128,11 @@
           <div class="sgc-kv"><div class="sgc-title">Sales Gamify Console</div><span class="sgc-badge">UI全XP編集+CSV</span></div>
           <div class="sgc-kv">
             <label style="font-size:12px;color:#666">Tenant:</label>
-            <input id="sgc-tenant" style="width:160px" placeholder="default">
+            <input id="sgc-tenant" style="width:180px" placeholder="default">
             <label style="font-size:12px;color:#666">BaseURL:</label>
-            <input id="sgc-base" style="width:260px" placeholder="https://sales-gamify.onrender.com">
+            <input id="sgc-base" style="width:300px" placeholder="https://sales-gamify.onrender.com">
             <label style="font-size:12px;color:#666">Token:</label>
-            <input id="sgc-token" style="width:220px" placeholder="(Bearer可)">
+            <input id="sgc-token" style="width:240px" placeholder="(Bearer不要)">
             <button id="sgc-ping" class="sgc-btn">Ping</button>
             <button id="sgc-save-top" class="sgc-btn primary">保存</button>
             <button id="sgc-close" class="sgc-btn">閉じる</button>
@@ -225,7 +234,15 @@
       await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/labels`, { items: labelsCache||[] }, profile);
       toast("保存しました");
       await loadAll();
-    }catch(e){ console.error(e); toast("保存に失敗: "+String(e), true); }
+    }catch(e){
+      console.error(e);
+      const msg = String(e||"");
+      if (msg.includes("401")) {
+        toast("保存に失敗: 401 Unauthorized（テナント名とトークンの組み合わせが Render の SGC_TOKENS と一致していません）", true);
+      } else {
+        toast("保存に失敗: "+msg, true);
+      }
+    }
   }
 
   /* ====== タブ描画 ====== */
@@ -296,7 +313,7 @@
           <input id="sgc-ap-xp" type="number" min="0" step="1" value="${apXP}" style="width:120px"> <span>XP</span>
           <span style="width:10px"></span>
           <span>バッジ名</span>
-          <input id="sgc-ap-badge" type="text" value="${apBadge}" placeholder="例: 🏅新規アポ獲得" style="width:260px">
+          <input id="sgc-ap-badge" type="text" value="${apBadge}" placeholder="例: 🏅新規アポ獲得" style="width:300px">
         </div>
         <div class="sgc-help">「新規アポ」の既定値（カスタムOutcomeに同名があればそちらが優先）。</div>
       </div>
@@ -330,7 +347,7 @@
           <div class="full" style="display:flex;gap:10px;align-items:center">
             <label style="display:flex;gap:6px;align-items:center"><input class="sgc-en" type="checkbox" ${enabled?"checked":""}> 有効にする</label>
             <span>XP</span><input class="sgc-xp" type="number" min="0" step="1" value="${xp}" style="max-width:120px">
-            <span>バッジ</span><input class="sgc-badge" type="text" value="${badge}" placeholder="例: 🏷︎見込みA 成果" style="max-width:260px">
+            <span>バッジ</span><input class="sgc-badge" type="text" value="${badge}" placeholder="例: 🏷︎見込みA 成果" style="max-width:300px">
           </div>
         </div>
       `);
@@ -398,10 +415,10 @@
 
     function renderHubRow(item){
       const row=h(`
-        <div class="sgc-card">
+        <div class="sgc-card sgc-card-hub">
           <div><label class="muted">HubSpot ラベルID</label><input class="sgc-h-id" value="${item.id||""}" placeholder="例: ac590467-..."></div>
           <div><label class="muted">ラベル名/タイトル</label><input class="sgc-h-title" value="${item.title||""}" placeholder="例: ニーズ無し / 見込みA"></div>
-          <div class="full" style="display:flex;justify-content:flex-end">
+          <div style="display:flex;justify-content:flex-end;align-items:flex-end">
             <button class="sgc-btn sgc-del">削除</button>
           </div>
         </div>
@@ -441,7 +458,7 @@
       <div class="sgc-row"><label>承認（Approval）時のXP</label>
         <div class="sgc-row-compact">
           <input id="sgc-approve-xp" type="number" min="0" step="1" value="${Number(ap.xp)||0}" style="width:120px"> <span>XP</span>
-          <span>バッジ</span><input id="sgc-approve-badge" type="text" value="${String(ap.badge||"承認")}" style="width:200px">
+          <span>バッジ</span><input id="sgc-approve-badge" type="text" value="${String(ap.badge||"承認")}" style="width:240px">
           <label style="display:flex;gap:6px;align-items:center"><input id="sgc-approve-en" type="checkbox" ${ap.enabled!==false?"checked":""}> 有効</label>
         </div>
       </div>
@@ -459,9 +476,9 @@
     function pushMsRow(v){ msList.appendChild(renderMsRow(v)); }
     function renderMsRow(v){
       const row=h(`<div class="sgc-row-compact">
-        <span>金額（到達毎）</span><input class="sgc-ms-amt" type="number" min="0" value="${Number(v?.amount)||100000}" style="width:140px">
+        <span>金額（到達毎）</span><input class="sgc-ms-amt" type="number" min="0" value="${Number(v?.amount)||100000}" style="width:160px">
         <span>XP</span><input class="sgc-ms-xp" type="number" min="0" value="${Number(v?.xp)||50}" style="width:120px">
-        <span>バッジ</span><input class="sgc-ms-badge" type="text" value="${String(v?.badge||"売上"+(Number(v?.amount)||100000).toLocaleString()+"達成")}" style="width:240px">
+        <span>バッジ</span><input class="sgc-ms-badge" type="text" value="${String(v?.badge||"売上"+(Number(v?.amount)||100000).toLocaleString()+"達成")}" style="width:280px">
         <button class="sgc-btn sgc-del">削除</button>
       </div>`);
       row.querySelector(".sgc-del").addEventListener("click",()=>row.remove());
@@ -541,16 +558,18 @@
   function start(){ ensureFab(); }
   if(document.readyState==="complete"){ start(); }
   else window.addEventListener("load", start, {once:true});
+
 })();
 </script>
 
-<!-- 読み込み後、自動でモーダルを開く（オーバーレイ即表示） -->
 <script>
+// この単体ページを開いたら自動でモーダルを表示
 (function openWhenReady(){
   const el = document.getElementById('sgc-fab');
   if (el) { el.click(); return; }
   setTimeout(openWhenReady, 100);
 })();
 </script>
+
 </body>
 </html>
