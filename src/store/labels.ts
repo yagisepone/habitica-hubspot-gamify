@@ -1,100 +1,89 @@
 // src/store/labels.ts
-import { promises as fs } from "fs";
 import path from "path";
-import { APPOINTMENT_VALUES } from "../lib/env.js";
+import { promises as fs } from "fs";
 
-export type LabelItem = {
-  id: string;           // HubSpot ラベルID（必須）
-  title: string;        // 表示名（必須）
-  enabled?: boolean;    // 監視を有効化するか
-  xp?: number;          // このアウトカムで付与するXP（任意）
-  badge?: string;       // Habiticaに付けるバッジ名（任意）
-};
-
-type LabelDoc = { items: LabelItem[]; updatedAt: string };
-
-const MEM = new Map<string, LabelDoc>(); // tenant -> doc
-
-function fileOf(tenant: string) {
-  return path.join("data", "tenants", tenant, "labels.json");
-}
-
-async function ensureDirFor(file: string) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-}
-
-async function readJSON<T>(file: string): Promise<T | null> {
-  try {
-    const s = await fs.readFile(file, "utf8");
-    return JSON.parse(s) as T;
-  } catch {
-    return null;
-  }
-}
-
-async function writeJSON(file: string, obj: any) {
-  await ensureDirFor(file);
-  await fs.writeFile(file, JSON.stringify(obj, null, 2), "utf8");
-}
-
-function fallbackFromEnv(): LabelDoc {
-  // 既定：env.APPOINTMENT_VALUES を有効化し、タイトルは同名
-  const items = (APPOINTMENT_VALUES || []).map((k) => ({
-    id: k,
-    title: k,
-    enabled: true,
-    xp: undefined,
-    badge: undefined,
-  }));
-  return { items, updatedAt: new Date().toISOString() };
-}
-
-export async function loadLabels(tenant: string): Promise<LabelDoc> {
-  if (MEM.has(tenant)) return MEM.get(tenant)!;
-  const file = fileOf(tenant);
-  const j = await readJSON<LabelDoc>(file);
-  const doc = j ?? fallbackFromEnv();
-  MEM.set(tenant, doc);
-  return doc;
-}
-
-export async function saveLabels(tenant: string, items: LabelItem[]) {
-  const cleaned = (items || [])
-    .filter((x) => x && String(x.id || "").trim() && String(x.title || "").trim())
-    .map((x) => ({
-      id: String(x.id).trim(),
-      title: String(x.title).trim(),
-      enabled: !!x.enabled,
-      xp: Number.isFinite(Number(x.xp)) ? Number(x.xp) : undefined,
-      badge: x.badge ? String(x.badge) : undefined,
-    }));
-  const doc: LabelDoc = { items: cleaned, updatedAt: new Date().toISOString() };
-  MEM.set(tenant, doc);
-  await writeJSON(fileOf(tenant), doc);
-  return doc;
-}
-
-/** 観測用: 有効なID一覧 */
-export async function getObservedLabelIds(tenant: string): Promise<string[]> {
-  const { items } = await loadLabels(tenant);
-  return items.filter((x) => x.enabled).map((x) => x.id);
-}
-
-/** 表示用: ID -> タイトル の対応表 */
-export async function getObservedLabelTitles(tenant: string): Promise<Record<string, string>> {
-  const { items } = await loadLabels(tenant);
-  const m: Record<string, string> = {};
-  for (const it of items) m[it.id] = it.title;
-  return m;
-}
-
-/** XP/バッジ取得: 該当IDの設定があれば返す */
-export async function lookupXpConfig(tenant: string, id: string): Promise<{
+type LabelItem = {
+  id?: string;
+  title?: string;
+  category?: string; // "appointment" | "label"
+  enabled?: boolean;
   xp?: number;
   badge?: string;
-} | undefined> {
-  const { items } = await loadLabels(tenant);
-  const hit = items.find((x) => x.id === id && x.enabled);
-  if (!hit) return undefined;
-  return { xp: hit.xp, badge: hit.badge };
+};
+
+type LabelsFile = { items?: LabelItem[] };
+
+const LABELS_DIR = path.resolve("data/labels");
+
+async function ensureDir() {
+  await fs.mkdir(LABELS_DIR, { recursive: true }).catch(() => {});
+}
+const safeTenant = (t: string | undefined) =>
+  String(t || "default").trim() || "default";
+
+export async function readLabels(tenant: string): Promise<LabelsFile> {
+  await ensureDir();
+  const file = path.resolve(LABELS_DIR, `${safeTenant(tenant)}.json`);
+  try {
+    const txt = await fs.readFile(file, "utf8");
+    const j = JSON.parse(txt || "{}");
+    if (Array.isArray(j.items)) return { items: j.items };
+  } catch {}
+  return { items: [] };
+}
+
+export async function writeLabels(
+  tenant: string,
+  body: LabelsFile
+): Promise<LabelsFile> {
+  await ensureDir();
+  const file = path.resolve(LABELS_DIR, `${safeTenant(tenant)}.json`);
+  const items = Array.isArray(body?.items) ? body.items : [];
+  const norm = items.map((it) => ({
+    id: it?.id ? String(it.id) : undefined,
+    title: it?.title ? String(it.title) : undefined,
+    category: it?.category ? String(it.category) : undefined,
+    enabled: it?.enabled !== false,
+    xp:
+      Number.isFinite(Number(it?.xp)) && Number(it?.xp) >= 0
+        ? Math.floor(Number(it?.xp))
+        : undefined,
+    badge: it?.badge ? String(it.badge) : undefined,
+  }));
+  const out: LabelsFile = { items: norm };
+  await fs.writeFile(file, JSON.stringify(out, null, 2));
+  return out;
+}
+
+/** UI/appointment.ts から使う：items配列のみ取得 */
+export async function getLabelItems(tenant: string): Promise<LabelItem[]> {
+  const data = await readLabels(tenant);
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+/** 既存の「観測」系（ダッシュボード等が期待しているなら残す） */
+const OBS_DIR = path.resolve("data/observed");
+export async function getObservedLabelIds(tenant: string): Promise<string[]> {
+  await fs.mkdir(OBS_DIR, { recursive: true }).catch(() => {});
+  try {
+    const p = path.resolve(OBS_DIR, `${safeTenant(tenant)}-ids.json`);
+    const txt = await fs.readFile(p, "utf8");
+    const j = JSON.parse(txt || "[]");
+    return Array.isArray(j) ? j.map((x: any) => String(x)) : [];
+  } catch {
+    return [];
+  }
+}
+export async function getObservedLabelTitles(
+  tenant: string
+): Promise<string[]> {
+  await fs.mkdir(OBS_DIR, { recursive: true }).catch(() => {});
+  try {
+    const p = path.resolve(OBS_DIR, `${safeTenant(tenant)}-titles.json`);
+    const txt = await fs.readFile(p, "utf8");
+    const j = JSON.parse(txt || "[]");
+    return Array.isArray(j) ? j.map((x: any) => String(x)) : [];
+  } catch {
+    return [];
+  }
 }
