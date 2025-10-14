@@ -123,6 +123,28 @@
       .sgc-card-shop{grid-template-columns:1fr}
       .sgc-card-purchase{grid-template-columns:1fr}
     }
+    :root{
+      --sgc-font:16px; --sgc-line:1.6; --sgc-pad:12px; --sgc-input:44px;
+    }
+    #sgc-modal{ font-size:var(--sgc-font); line-height:var(--sgc-line); }
+    .sgc-row{ gap:16px; padding:10px 0; }
+    .sgc-row input,.sgc-row select,.sgc-row textarea{
+      height:var(--sgc-input); padding:10px 12px; font-size:15px;
+    }
+    .sgc-btn{ padding:10px 16px; font-size:14px; }
+    .sgc-tab{ padding:8px 12px; font-size:14px; }
+    .sgc-card{ gap:12px; }
+    .sgc-help{ font-size:13px; }
+    @media(min-width:1200px){
+      #sgc-modal{ width:1200px; }
+      .sgc-row{ grid-template-columns:260px 1fr; }
+    }
+    /* HubSpot連携の行入力幅を拡張 */
+    #sgc-hub-list .sgc-card input{ width:100%; }
+    /* フォーカスリング */
+    .sgc-row input:focus,.sgc-row select:focus,.sgc-row textarea:focus{
+      outline:2px solid #6c5ce7; outline-offset:1px;
+    }
   `);
 
   /* ====== 固定ボタン ====== */
@@ -581,18 +603,59 @@
     return d.toLocaleString("ja-JP",{ hour12:false });
   }
 
+  function normalizeOpsLog(raw){
+    if(!raw || typeof raw !== "object") return raw;
+    const clone = { ...raw };
+    const ts = clone.ts || clone.createdAt || clone.at || clone.date || null;
+    const deltaRaw = clone.deltaXp ?? clone.delta ?? clone.amount ?? null;
+    const deltaNum = Number(deltaRaw);
+    const sourceRaw = clone.source || clone.type || (clone.badgeOnBuy ? "shop" : "");
+    const source = sourceRaw ? String(sourceRaw) : "";
+    const type = clone.type || (source === "shop" ? "purchase" : "adjust");
+    const badgeRaw = clone.badge ?? clone.badgeOnBuy;
+    const noteRaw = clone.note ?? clone.reason;
+    return {
+      ...clone,
+      ts,
+      createdAt: ts,
+      deltaXp: Number.isFinite(deltaNum) ? deltaNum : undefined,
+      type,
+      source: source || type,
+      badge: badgeRaw != null && badgeRaw !== "" ? String(badgeRaw) : undefined,
+      note: noteRaw != null && noteRaw !== "" ? String(noteRaw) : undefined,
+    };
+  }
+
   async function fetchAdjustments(limit=50, userIdFilter=""){
     ensureProfileFromInputs();
     if(!profile.baseUrl){ adjustmentsCache=[]; return adjustmentsCache; }
     const params = new URLSearchParams();
+    params.set("tenant", tenant());
     params.set("limit", String(clamp(limit, 1, 200)));
     if(userIdFilter) params.set("userId", userIdFilter);
-    const url = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/adjustments?${params.toString()}`;
+    const url = `${baseURL()}/ops/logs?${params.toString()}`;
     try{
       const res = await apiGET(url, profile);
-      adjustmentsCache = Array.isArray(res?.items) ? res.items : [];
+      const items = Array.isArray(res?.items) ? res.items : [];
+      adjustmentsCache = items.map(normalizeOpsLog);
       return adjustmentsCache;
     }catch(e){
+      const code = e && typeof e === "object" && "message" in e ? String(e.message) : String(e ?? "");
+      if(code === "404" || code === "405"){
+        try{
+          const legacyParams = new URLSearchParams();
+          legacyParams.set("limit", String(clamp(limit, 1, 200)));
+          if(userIdFilter) legacyParams.set("userId", userIdFilter);
+          const legacyUrl = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/adjustments?${legacyParams.toString()}`;
+          const res = await apiGET(legacyUrl, profile);
+          const items = Array.isArray(res?.items) ? res.items : [];
+          adjustmentsCache = items.map(normalizeOpsLog);
+          return adjustmentsCache;
+        }catch(err){
+          console.error("fetchAdjustments (legacy)", err);
+          throw err;
+        }
+      }
       console.error("fetchAdjustments", e);
       throw e;
     }
@@ -601,12 +664,26 @@
   async function fetchShopItems(){
     ensureProfileFromInputs();
     if(!profile.baseUrl){ shopItemsCache=[]; return shopItemsCache; }
-    const url = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/shop/items`;
+    const params = new URLSearchParams();
+    params.set("tenant", tenant());
+    const url = `${baseURL()}/ops/catalog?${params.toString()}`;
     try{
       const res = await apiGET(url, profile);
       shopItemsCache = Array.isArray(res?.items) ? res.items : [];
       return shopItemsCache;
     }catch(e){
+      const code = e && typeof e === "object" && "message" in e ? String(e.message) : String(e ?? "");
+      if(code === "404" || code === "405"){
+        try{
+          const legacyUrl = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/shop/items`;
+          const res = await apiGET(legacyUrl, profile);
+          shopItemsCache = Array.isArray(res?.items) ? res.items : [];
+          return shopItemsCache;
+        }catch(err){
+          console.error("fetchShopItems (legacy)", err);
+          throw err;
+        }
+      }
       console.error("fetchShopItems", e);
       throw e;
     }
@@ -737,6 +814,14 @@
     `);
     bodyArea.appendChild(form);
 
+    const quick=h(`
+      <div class="sgc-kv" style="margin-top:6px; gap:8px;">
+        <button id="sgc-quick-misscall" type="button" class="sgc-btn">ミス架電 -1</button>
+        <button id="sgc-quick-demo5" type="button" class="sgc-btn">デモ +5</button>
+      </div>
+    `);
+    bodyArea.appendChild(quick);
+
     const filterRow=h(`
       <div class="sgc-compact sgc-filter">
         <label style="font-size:13px;color:#555">履歴フィルタ（userId）</label>
@@ -786,12 +871,12 @@
       adjustmentsCache.forEach(item=>{
         const tr=document.createElement("tr");
         const cells=[
-          formatDateTime(item?.createdAt),
+          formatDateTime(item?.createdAt || item?.ts),
           item?.userName ? `${item.userName} (${item.userId||""})` : item?.userId || "",
           typeof item?.deltaXp==="number" ? `${item.deltaXp>=0?"+":""}${item.deltaXp}` : "",
           item?.badge || "",
           item?.note || "",
-          item?.source || "",
+          item?.source || item?.type || "",
         ];
         cells.forEach((txt,idx)=>{
           const td=document.createElement("td");
@@ -835,15 +920,27 @@
         form.querySelector("#sgc-adj-delta").focus();
         return;
       }
+      const delta = Math.trunc(deltaRaw);
       const payload={
+        tenant: tenant(),
         userId,
         userName: userName || undefined,
-        deltaXp: Math.trunc(deltaRaw),
+        delta,
+        deltaXp: delta,
         badge: badge || undefined,
         note: note || undefined,
       };
       try{
-        await apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/adjustments`, payload, profile);
+        try{
+          await apiPOST(`${baseURL()}/ops/adjust`, payload, profile);
+        }catch(err){
+          const code = err && typeof err === "object" && "message" in err ? String(err.message) : String(err ?? "");
+          if(code === "404" || code === "405"){
+            await apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/adjustments`, payload, profile);
+          }else{
+            throw err;
+          }
+        }
         toast("手動XPを登録しました");
         form.querySelector("#sgc-adj-note").value="";
         await reload(currentFilter);
@@ -870,6 +967,21 @@
         e.preventDefault();
         reload(e.target.value);
       }
+    });
+
+    quick.querySelector("#sgc-quick-misscall")?.addEventListener("click",(event)=>{
+      event.preventDefault();
+      const amo = form.querySelector("#sgc-adj-delta");
+      const note = form.querySelector("#sgc-adj-note");
+      if(amo) amo.value = "-1";
+      if(note) note.value = "ミス架電";
+    });
+    quick.querySelector("#sgc-quick-demo5")?.addEventListener("click",(event)=>{
+      event.preventDefault();
+      const amo = form.querySelector("#sgc-adj-delta");
+      const note = form.querySelector("#sgc-adj-note");
+      if(amo) amo.value = "5";
+      if(note) note.value = "デモ付与";
     });
 
     reload("");
@@ -1068,7 +1180,16 @@
         items.push(item);
       }
       try{
-        await apiPUT(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/shop/items`, { items }, profile);
+        try{
+          await apiPUT(`${baseURL()}/ops/catalog`, { tenant: tenant(), items }, profile);
+        }catch(err){
+          const code = err && typeof err === "object" && "message" in err ? String(err.message) : String(err ?? "");
+          if(code === "404" || code === "405"){
+            await apiPUT(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/shop/items`, { items }, profile);
+          }else{
+            throw err;
+          }
+        }
         toast("ショップの品目を保存しました");
         await reloadShop();
       }catch(e){
@@ -1112,12 +1233,27 @@
         qty: Math.trunc(qtyVal),
       };
       try{
-        const res=await apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/shop/purchase`, payload, profile);
+        let res;
+        try{
+          res = await apiPOST(`${baseURL()}/ops/purchase`, { tenant: tenant(), ...payload }, profile);
+        }catch(err){
+          const code = err && typeof err === "object" && "message" in err ? String(err.message) : String(err ?? "");
+          if(code === "404" || code === "405"){
+            res = await apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/shop/purchase`, payload, profile);
+          }else{
+            throw err;
+          }
+        }
         const newStock = res?.newStock;
         const stockLabel = newStock === null || newStock === undefined ? "在庫: ∞" : `在庫: ${newStock}`;
         toast(`購入を登録しました (${stockLabel})`);
         adjustmentsCache = [];
         await reloadShop(itemId);
+        try{
+          await fetchAdjustments(50);
+        }catch(err){
+          console.warn("shop.purchase reload adjustments failed", err);
+        }
       }catch(e){
         console.error("shop.purchase", e);
         const msg=String(e||"");

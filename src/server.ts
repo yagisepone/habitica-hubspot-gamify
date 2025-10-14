@@ -34,7 +34,7 @@ import { dashboardHandler, mappingHandler } from "./routes/admin.js";
 
 // 観測ラベル（既存）
 import { labelsGet, labelsPut } from "./routes/labels.js";
-import { opsRouter } from "./routes/ops.js";
+import { opsApiRouter, opsRouter } from "./routes/ops.js";
 
 /* =========================
    認可（トークン）ミドルウェア
@@ -128,6 +128,7 @@ app.get("/admin/mapping", mappingHandler);
 
 /* Operations API（新規） */
 app.use("/tenant", opsRouter);
+app.use("/ops", opsApiRouter);
 
 /* ルール（UI保存）— GETは誰でも、PUTは編集トークン必須 */
 app.get("/tenant/:id/rules", rulesGet);

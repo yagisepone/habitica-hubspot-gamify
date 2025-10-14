@@ -1,4 +1,4 @@
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import path from "path";
 import { randomUUID } from "crypto";
 
@@ -12,9 +12,10 @@ import {
   readLastN,
   writeJson,
 } from "../store/ops.js";
-import type { AuditEvent, ShopItem, XpAdjustment } from "../types/ops.js";
+import type { AuditEvent, OpsLogEntry, ShopItem, XpAdjustment } from "../types/ops.js";
 
 export const opsRouter = express.Router();
+export const opsApiRouter = express.Router();
 const jsonParser = express.json({ limit: "1mb" });
 
 const MAX_LIMIT = 500;
@@ -44,7 +45,7 @@ function normalizeShopItems(items: any[]): ShopItem[] {
   if (!Array.isArray(items)) return [];
   const norm: ShopItem[] = [];
   for (const raw of items) {
-    const title = String(raw?.title ?? "").trim();
+    const title = String(raw?.title ?? raw?.name ?? "").trim();
     const price = Number(raw?.priceXp);
     if (!title) {
       throw new Error("title-required");
@@ -79,6 +80,7 @@ function normalizeShopItems(items: any[]): ShopItem[] {
 function enrichItemsForResponse(items: ShopItem[]): ShopItem[] {
   return items.map((item) => ({
     ...item,
+    name: item.title,
     enabled: item.enabled !== false,
     stock:
       item.stock === null || item.stock === undefined ? item.stock : Math.max(0, item.stock),
@@ -99,17 +101,192 @@ function tenantId(req: Request): string {
   return tenantFrom(req as AnyReq);
 }
 
+function ensureTenantFromBody(req: Request, _res: Response, next: NextFunction) {
+  const bodyTenant = (req.body && typeof (req.body as any).tenant === "string") ? String((req.body as any).tenant).trim() : "";
+  if (bodyTenant) {
+    (req.query as Record<string, any>).tenant = bodyTenant;
+  }
+  next();
+}
+
+type ManualPayload = {
+  userId: string;
+  userName?: string;
+  deltaXp: number;
+  badge?: string;
+  note?: string;
+};
+
+function extractManualPayload(body: any): ManualPayload {
+  const userId = String(body?.userId ?? "").trim();
+  if (!userId) {
+    throw new Error("userId-required");
+  }
+  const deltaSrc = body?.delta ?? body?.deltaXp;
+  const delta = Number(deltaSrc);
+  if (!Number.isFinite(delta)) {
+    throw new Error("deltaXp-invalid");
+  }
+  const deltaXp = Math.trunc(delta);
+  const userName = String(body?.userName ?? "").trim();
+  const badge = String(body?.badge ?? "").trim();
+  const note = String(body?.note ?? body?.reason ?? "").trim();
+  return {
+    userId,
+    userName: userName ? userName : undefined,
+    deltaXp,
+    badge: badge ? badge : undefined,
+    note: note ? note : undefined,
+  };
+}
+
+async function listAdjustments(
+  tenant: string,
+  limit: number,
+  userIdFilter?: string | null
+): Promise<XpAdjustment[]> {
+  const dir = await ensureTenantDir(tenant);
+  const items = await readLastN(adjustmentsPath(dir), limit);
+  const filtered = userIdFilter
+    ? items.filter((item) => String(item?.userId || "") === userIdFilter)
+    : items;
+  return filtered.slice(0, limit) as XpAdjustment[];
+}
+
+async function recordAdjustment(
+  tenant: string,
+  payload: ManualPayload & { source: XpAdjustment["source"] },
+  req: Request,
+  auditMeta: { action: AuditEvent["action"]; detail?: (adjustment: XpAdjustment) => Record<string, any> }
+): Promise<XpAdjustment> {
+  const dir = await ensureTenantDir(tenant);
+  const adjustment: XpAdjustment = {
+    id: randomUUID(),
+    tenant,
+    userId: payload.userId,
+    userName: payload.userName,
+    deltaXp: payload.deltaXp,
+    badge: payload.badge,
+    note: payload.note,
+    source: payload.source,
+    createdAt: new Date().toISOString(),
+  };
+  await appendJsonl(adjustmentsPath(dir), adjustment);
+
+  const audit: AuditEvent = {
+    id: randomUUID(),
+    tenant,
+    actor: actorFrom(req),
+    action: auditMeta.action,
+    detail: auditMeta.detail ? auditMeta.detail(adjustment) : undefined,
+    ip: req.ip,
+    at: new Date().toISOString(),
+  };
+  await appendJsonl(auditPath(dir), audit);
+  return adjustment;
+}
+
+async function processPurchase(
+  tenant: string,
+  body: any,
+  req: Request
+): Promise<{ adjustment: XpAdjustment; newStock: number | null }> {
+  const userId = String(body?.userId ?? "").trim();
+  if (!userId) {
+    throw new Error("userId-required");
+  }
+  const itemId = String(body?.itemId ?? "").trim();
+  if (!itemId) {
+    throw new Error("itemId-required");
+  }
+  const quantity = Number.isFinite(Number(body?.qty))
+    ? Math.max(1, Math.floor(Number(body?.qty)))
+    : 1;
+
+  const userNameVal = String(body?.userName ?? "").trim();
+  const dir = await ensureTenantDir(tenant);
+  const shopFile = shopPath(dir);
+  const currentItems = normalizeShopItems(await readJson<ShopItem[]>(shopFile, []));
+  const item = currentItems.find((it) => it.id === itemId);
+  if (!item) {
+    throw new Error("item-not-found");
+  }
+  if (item.enabled === false) {
+    throw new Error("item-disabled");
+  }
+  if (item.stock != null) {
+    if (item.stock < quantity) {
+      throw new Error("stock-shortage");
+    }
+    item.stock -= quantity;
+    if (item.stock < 0) item.stock = 0;
+  }
+
+  const deltaXp = -Math.abs(item.priceXp) * quantity;
+  const note = `shop:${item.title} x${quantity}`;
+
+  await writeJson(shopFile, currentItems);
+  const adjustment = await recordAdjustment(
+    tenant,
+    {
+      userId,
+      userName: userNameVal ? userNameVal : undefined,
+      deltaXp,
+      badge: item.badgeOnBuy ? String(item.badgeOnBuy).trim() || undefined : undefined,
+      note,
+      source: "shop",
+    },
+    req,
+    {
+      action: "shop.purchase",
+      detail: (adj) => ({
+        itemId: item.id,
+        title: item.title,
+        qty: quantity,
+        userId: adj.userId,
+        deltaXp: adj.deltaXp,
+        newStock: item.stock ?? null,
+      }),
+    }
+  );
+
+  return { adjustment, newStock: item.stock ?? null };
+}
+
+function toOpsLogEntry(tenant: string, item: any): OpsLogEntry | null {
+  if (!item || typeof item !== "object") return null;
+  const delta = Number((item as any).deltaXp ?? (item as any).delta ?? NaN);
+  if (!Number.isFinite(delta)) return null;
+  const createdAt =
+    (item as any).createdAt ||
+    (item as any).ts ||
+    (item as any).at ||
+    new Date().toISOString();
+  const sourceRaw = (item as any).source || "";
+  const type: OpsLogEntry["type"] = sourceRaw === "shop" ? "purchase" : "adjust";
+  const noteRaw = (item as any).note;
+  const badgeRaw = (item as any).badge;
+  return {
+    id: String((item as any).id ?? randomUUID()),
+    tenant,
+    type,
+    ts: String(createdAt),
+    userId: String((item as any).userId ?? ""),
+    userName: (item as any).userName ? String((item as any).userName) : undefined,
+    deltaXp: Math.trunc(delta),
+    badge: badgeRaw ? String(badgeRaw) : undefined,
+    note: noteRaw ? String(noteRaw) : undefined,
+    source: sourceRaw ? String(sourceRaw) : type,
+  };
+}
+
 opsRouter.get("/:id/adjustments", async (req: Request, res: Response) => {
   try {
     const tenant = tenantId(req);
     const limit = clampLimit(req.query?.limit, 100);
     const userIdFilter = req.query?.userId ? String(req.query.userId) : null;
-    const dir = await ensureTenantDir(tenant);
-    const items = await readLastN(adjustmentsPath(dir), limit);
-    const filtered = userIdFilter
-      ? items.filter((item) => String(item?.userId || "") === userIdFilter)
-      : items;
-    res.json({ items: filtered.slice(0, limit) });
+    const items = await listAdjustments(tenant, limit, userIdFilter);
+    res.json({ items });
   } catch (err: any) {
     log(`[ops] adjustments.get error: ${err?.message || err}`);
     res.status(500).json({ ok: false, error: "internal-error" });
@@ -123,45 +300,35 @@ opsRouter.post(
   async (req: Request, res: Response) => {
     try {
       const tenant = tenantId(req);
-      const dir = await ensureTenantDir(tenant);
-      const { userId, userName, deltaXp, badge, note } = req.body || {};
-      if (!userId || !String(userId).trim()) {
-        return res.status(400).json({ ok: false, error: "userId-required" });
+      let payload: ManualPayload;
+      try {
+        payload = extractManualPayload(req.body);
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg === "userId-required") {
+          return res.status(400).json({ ok: false, error: "userId-required" });
+        }
+        if (msg === "deltaXp-invalid") {
+          return res.status(400).json({ ok: false, error: "deltaXp-invalid" });
+        }
+        throw err;
       }
-      const delta = Number(deltaXp);
-      if (!Number.isFinite(delta)) {
-        return res.status(400).json({ ok: false, error: "deltaXp-invalid" });
-      }
-      const adjustment: XpAdjustment = {
-        id: randomUUID(),
+      const adjustment = await recordAdjustment(
         tenant,
-        userId: String(userId).trim(),
-        userName: userName ? String(userName).trim() || undefined : undefined,
-        deltaXp: Math.trunc(delta),
-        badge: badge ? String(badge).trim() || undefined : undefined,
-        note: note ? String(note).trim() || undefined : undefined,
-        source: "manual",
-        createdAt: new Date().toISOString(),
-      };
-      await appendJsonl(adjustmentsPath(dir), adjustment);
-
-      const audit: AuditEvent = {
-        id: randomUUID(),
-        tenant,
-        actor: actorFrom(req),
-        action: "adjust.create",
-        detail: {
-          id: adjustment.id,
-          userId: adjustment.userId,
-          deltaXp: adjustment.deltaXp,
-          badge: adjustment.badge,
-          note: adjustment.note,
-        },
-        ip: req.ip,
-        at: new Date().toISOString(),
-      };
-      await appendJsonl(auditPath(dir), audit);
-      res.json({ ok: true, id: adjustment.id });
+        { ...payload, source: "manual" },
+        req,
+        {
+          action: "adjust.create",
+          detail: (adj) => ({
+            id: adj.id,
+            userId: adj.userId,
+            deltaXp: adj.deltaXp,
+            badge: adj.badge,
+            note: adj.note,
+          }),
+        }
+      );
+      res.json({ ok: true, id: adjustment.id, createdAt: adjustment.createdAt });
     } catch (err: any) {
       log(`[ops] adjustments.post error: ${err?.message || err}`);
       res.status(500).json({ ok: false, error: "internal-error" });
@@ -224,72 +391,26 @@ opsRouter.post(
   async (req: Request, res: Response) => {
     try {
       const tenant = tenantId(req);
-      const dir = await ensureTenantDir(tenant);
-      const { userId, userName, itemId, qty } = req.body || {};
-      if (!userId || !String(userId).trim()) {
-        return res.status(400).json({ ok: false, error: "userId-required" });
-      }
-      if (!itemId || !String(itemId).trim()) {
-        return res.status(400).json({ ok: false, error: "itemId-required" });
-      }
-      const quantity = Number.isFinite(Number(qty)) ? Math.max(1, Math.floor(Number(qty))) : 1;
-
-      const shopFile = shopPath(dir);
-      const currentItems = normalizeShopItems(await readJson<ShopItem[]>(shopFile, []));
-      const item = currentItems.find((it) => it.id === String(itemId));
-      if (!item) {
-        return res.status(404).json({ ok: false, error: "item-not-found" });
-      }
-      if (item.enabled === false) {
-        return res.status(400).json({ ok: false, error: "item-disabled" });
-      }
-      if (item.stock != null) {
-        if (item.stock < quantity) {
-          return res.status(400).json({ ok: false, error: "stock-shortage" });
+      try {
+        const { adjustment, newStock } = await processPurchase(tenant, req.body, req);
+        res.json({
+          ok: true,
+          newStock,
+          adjustmentId: adjustment.id,
+        });
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg === "userId-required" || msg === "itemId-required") {
+          return res.status(400).json({ ok: false, error: msg });
         }
-        item.stock -= quantity;
-        if (item.stock < 0) item.stock = 0;
+        if (msg === "item-not-found") {
+          return res.status(404).json({ ok: false, error: msg });
+        }
+        if (msg === "item-disabled" || msg === "stock-shortage") {
+          return res.status(400).json({ ok: false, error: msg });
+        }
+        throw err;
       }
-
-      const deltaXp = -Math.abs(item.priceXp) * quantity;
-      const adjustment: XpAdjustment = {
-        id: randomUUID(),
-        tenant,
-        userId: String(userId).trim(),
-        userName: userName ? String(userName).trim() || undefined : undefined,
-        deltaXp,
-        badge: item.badgeOnBuy ? String(item.badgeOnBuy) : undefined,
-        note: `shop:${item.title} x${quantity}`,
-        source: "shop",
-        createdAt: new Date().toISOString(),
-      };
-
-      await writeJson(shopFile, currentItems);
-      await appendJsonl(adjustmentsPath(dir), adjustment);
-
-      const audit: AuditEvent = {
-        id: randomUUID(),
-        tenant,
-        actor: actorFrom(req),
-        action: "shop.purchase",
-        detail: {
-          itemId: item.id,
-          title: item.title,
-          qty: quantity,
-          userId: adjustment.userId,
-          deltaXp: adjustment.deltaXp,
-          newStock: item.stock ?? null,
-        },
-        ip: req.ip,
-        at: new Date().toISOString(),
-      };
-      await appendJsonl(auditPath(dir), audit);
-
-      res.json({
-        ok: true,
-        newStock: item.stock ?? null,
-        adjustmentId: adjustment.id,
-      });
     } catch (err: any) {
       if (err instanceof Error && err.message.endsWith("required")) {
         return res.status(400).json({ ok: false, error: err.message });
@@ -312,6 +433,155 @@ opsRouter.get("/:id/audit", async (req: Request, res: Response) => {
     res.json({ items: events.slice(0, limit) });
   } catch (err: any) {
     log(`[ops] audit.get error: ${err?.message || err}`);
+    res.status(500).json({ ok: false, error: "internal-error" });
+  }
+});
+
+/* ===== New Ops API (tenant via query/body) ===== */
+opsApiRouter.get("/catalog", async (req: Request, res: Response) => {
+  try {
+    const tenant = tenantFrom(req as AnyReq);
+    const dir = await ensureTenantDir(tenant);
+    const items = await readJson<ShopItem[]>(shopPath(dir), []);
+    res.json({ items: enrichItemsForResponse(normalizeShopItems(items)) });
+  } catch (err: any) {
+    log(`[ops] api.catalog.get error: ${err?.message || err}`);
+    res.status(500).json({ ok: false, error: "internal-error" });
+  }
+});
+
+opsApiRouter.put(
+  "/catalog",
+  jsonParser,
+  ensureTenantFromBody,
+  requireEditorToken,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      const dir = await ensureTenantDir(tenant);
+      const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+      const items = normalizeShopItems(rawItems);
+      await writeJson(shopPath(dir), items);
+
+      const audit: AuditEvent = {
+        id: randomUUID(),
+        tenant,
+        actor: actorFrom(req),
+        action: "shop.item.put",
+        detail: { count: items.length },
+        ip: req.ip,
+        at: new Date().toISOString(),
+      };
+      await appendJsonl(auditPath(dir), audit);
+      res.json({ ok: true, count: items.length });
+    } catch (err: any) {
+      if (err instanceof Error && err.message.endsWith("required")) {
+        return res.status(400).json({ ok: false, error: err.message });
+      }
+      if (err instanceof Error && err.message.endsWith("invalid")) {
+        return res.status(400).json({ ok: false, error: err.message });
+      }
+      log(`[ops] api.catalog.put error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
+opsApiRouter.post(
+  "/adjust",
+  jsonParser,
+  ensureTenantFromBody,
+  requireEditorToken,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      let payload: ManualPayload;
+      try {
+        payload = extractManualPayload(req.body);
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg === "userId-required" || msg === "deltaXp-invalid") {
+          return res.status(400).json({ ok: false, error: msg });
+        }
+        throw err;
+      }
+      const adjustment = await recordAdjustment(
+        tenant,
+        { ...payload, source: "manual" },
+        req,
+        {
+          action: "adjust.create",
+          detail: (adj) => ({
+            id: adj.id,
+            userId: adj.userId,
+            deltaXp: adj.deltaXp,
+            badge: adj.badge,
+            note: adj.note,
+          }),
+        }
+      );
+      res.json({
+        ok: true,
+        id: adjustment.id,
+        ts: adjustment.createdAt,
+        deltaXp: adjustment.deltaXp,
+      });
+    } catch (err: any) {
+      log(`[ops] api.adjust.post error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
+opsApiRouter.post(
+  "/purchase",
+  jsonParser,
+  ensureTenantFromBody,
+  requireEditorToken,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      try {
+        const { adjustment, newStock } = await processPurchase(tenant, req.body, req);
+        res.json({
+          ok: true,
+          newStock,
+          adjustmentId: adjustment.id,
+          deltaXp: adjustment.deltaXp,
+        });
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg === "userId-required" || msg === "itemId-required") {
+          return res.status(400).json({ ok: false, error: msg });
+        }
+        if (msg === "item-not-found") {
+          return res.status(404).json({ ok: false, error: msg });
+        }
+        if (msg === "item-disabled" || msg === "stock-shortage") {
+          return res.status(400).json({ ok: false, error: msg });
+        }
+        throw err;
+      }
+    } catch (err: any) {
+      log(`[ops] api.purchase.post error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
+opsApiRouter.get("/logs", async (req: Request, res: Response) => {
+  try {
+    const tenant = tenantFrom(req as AnyReq);
+    const limit = clampLimit(req.query?.limit, 100);
+    const userIdFilter = req.query?.userId ? String(req.query.userId).trim() : null;
+    const adjustments = await listAdjustments(tenant, limit, userIdFilter);
+    const logs = adjustments
+      .map((item) => toOpsLogEntry(tenant, item))
+      .filter((entry): entry is OpsLogEntry => Boolean(entry))
+      .slice(0, limit);
+    res.json({ items: logs });
+  } catch (err: any) {
+    log(`[ops] api.logs.get error: ${err?.message || err}`);
     res.status(500).json({ ok: false, error: "internal-error" });
   }
 });

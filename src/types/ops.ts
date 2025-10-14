@@ -13,6 +13,7 @@ export type XpAdjustment = {
 export type ShopItem = {
   id: string;
   title: string;
+  name?: string;
   priceXp: number;
   stock?: number | null;
   badgeOnBuy?: string;
@@ -27,4 +28,17 @@ export type AuditEvent = {
   detail?: any;
   ip?: string;
   at: string;
+};
+
+export type OpsLogEntry = {
+  id: string;
+  tenant: string;
+  type: "adjust" | "purchase";
+  ts: string;
+  userId: string;
+  userName?: string;
+  deltaXp: number;
+  badge?: string;
+  note?: string;
+  source: string;
 };
