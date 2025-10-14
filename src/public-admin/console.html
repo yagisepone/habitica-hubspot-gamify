@@ -1368,5 +1368,162 @@
 })();
 </script>
 
+<!-- === Readability / Comfort Mode (v2025-10-14) === -->
+<style id="sgc-a11y">
+  /* Base font and line-height */
+  #sgc-modal, 
+  #sgc-modal input, 
+  #sgc-modal select, 
+  #sgc-modal textarea, 
+  #sgc-modal button {
+    font-size: 15.5px;
+    line-height: 1.6;
+  }
+
+  /* Modal width and paddings */
+  #sgc-modal { width: min(1200px, 96vw); }
+  .sgc-hd{ padding: 14px 18px; }
+  .sgc-title{ font-size: 18px; }
+  .sgc-tabs{ gap: 8px; }
+  .sgc-tab{ padding: 8px 12px; font-size: 14.5px; }
+
+  /* Two-column rows and labels */
+  .sgc-row{
+    grid-template-columns: 240px 1fr;
+    gap: 14px;
+    align-items: center;
+  }
+  .sgc-row label{ font-size: 14.5px; color:#222; }
+
+  /* Inputs / selects / textareas */
+  .sgc-row input,
+  .sgc-row select,
+  .sgc-row textarea{
+    height: 42px;               /* comfortable click target */
+    padding: 10px 12px;
+    border-radius: 10px;
+    font-size: 15.5px;
+  }
+  .sgc-row textarea{ min-height: 90px; }
+
+  /* Make compact rows (used in manual ops / shop) wider by default */
+  .sgc-row-compact input,
+  .sgc-row-compact select{
+    min-width: 180px;
+  }
+
+  /* Buttons */
+  .sgc-btn{
+    min-height: 40px;
+    padding: 0 14px;
+    border-radius: 10px;
+    font-weight: 700;
+    font-size: 14.5px;
+  }
+
+  /* Cards / help text */
+  .sgc-card{ gap: 12px; border-radius: 14px; }
+  .sgc-help{ font-size: 13.5px; color:#666; }
+
+  /* Slightly larger checkboxes */
+  #sgc-modal input[type="checkbox"],
+  #sgc-modal input[type="radio"]{
+    transform: scale(1.25);
+    transform-origin: center;
+    margin-right: 6px;
+  }
+
+  /* Tables (history/catalog) */
+  #sgc-modal table{ font-size: 14.5px; }
+  #sgc-modal table th,
+  #sgc-modal table td{ padding: 10px 12px; }
+
+  /* Numeric fields a bit wider */
+  #sgc-modal input[type="number"]{ width: 120px; }
+
+  /* Utility for explicitly wide fields */
+  #sgc-modal input[type="text"].wide,
+  #sgc-modal select.wide{ min-width: 260px; }
+</style>
+
+<!-- Optional: simple UI-scale toggle (100% / 110% / 120%) -->
+<script>
+  (function () {
+    const KEY = "sgc.uiScale";
+    const modal = document.getElementById("sgc-modal");
+    if (!modal) return;
+
+    const saved = Number(localStorage.getItem(KEY) || "1");
+    modal.style.zoom = (saved || 1);
+
+    const btn = document.createElement("button");
+    btn.className = "sgc-btn";
+    btn.style.marginLeft = "8px";
+    btn.title = "表示サイズ切替（100%/110%/120%）";
+    btn.textContent = `${Math.round((saved || 1) * 100)}%`;
+
+    btn.onclick = () => {
+      const order = [1, 1.1, 1.2];
+      const next = order[(order.indexOf(saved || 1) + 1) % order.length];
+      localStorage.setItem(KEY, String(next));
+      location.reload();
+    };
+
+    document.querySelector(".sgc-hd .sgc-kv:last-of-type")?.appendChild(btn);
+  })();
+</script>
+
+<!-- Ensure UI-scale toggle is available after modal initialization -->
+<script>
+  (function () {
+    const KEY = "sgc.uiScale";
+    const ORDER = [1, 1.1, 1.2];
+    const TITLE = "表示サイズ切替（100%/110%/120%）";
+
+    function apply(modal) {
+      if (!modal) return false;
+      const saved = Number(localStorage.getItem(KEY) || "1") || 1;
+      modal.style.zoom = String(saved);
+      const host = modal.querySelector(".sgc-hd .sgc-kv:last-of-type");
+      if (!host) return true;
+      let btn = host.querySelector(`button[title="${TITLE}"]`);
+      if (!btn) {
+        btn = document.createElement("button");
+        btn.className = "sgc-btn";
+        btn.type = "button";
+        btn.title = TITLE;
+        btn.style.marginLeft = "8px";
+        btn.setAttribute("data-ui-scale-btn", "1");
+        btn.addEventListener("click", () => {
+          const current = Number(localStorage.getItem(KEY) || "1") || 1;
+          const idx = ORDER.indexOf(current);
+          const next = ORDER[(idx + 1) % ORDER.length];
+          localStorage.setItem(KEY, String(next));
+          location.reload();
+        });
+        host.appendChild(btn);
+      }
+      btn.textContent = `${Math.round(saved * 100)}%`;
+      return true;
+    }
+
+    function ensure() {
+      if (apply(document.getElementById("sgc-modal"))) return;
+      const observer = new MutationObserver(() => {
+        if (apply(document.getElementById("sgc-modal"))) {
+          observer.disconnect();
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", ensure, { once: true });
+    } else {
+      ensure();
+    }
+  })();
+</script>
+
 </body>
 </html>
