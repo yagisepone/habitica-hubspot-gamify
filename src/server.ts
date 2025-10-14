@@ -15,6 +15,7 @@ import {
 } from "./lib/env.js";
 import { log } from "./lib/utils.js";
 import { HAB_MAP, NAME2MAIL } from "./lib/maps.js";
+import { requireEditorToken } from "./lib/auth.js";
 
 // ルールAPI（既存）
 import { rulesGet, rulesPut, statsToday as statsTodayBase } from "./routes/rules.js";
@@ -33,6 +34,7 @@ import { dashboardHandler, mappingHandler } from "./routes/admin.js";
 
 // 観測ラベル（既存）
 import { labelsGet, labelsPut } from "./routes/labels.js";
+import { opsRouter } from "./routes/ops.js";
 
 /* =========================
    認可（トークン）ミドルウェア
@@ -40,31 +42,6 @@ import { labelsGet, labelsPut } from "./routes/labels.js";
      例: {"ワビサビ株式会社":"wabisabi-habitica-hubspot-connection", "*":"wabisabi-habitica-hubspot-connection"}
    - PUT のみトークン必須（GETは公開のまま）
    ========================= */
-type AnyReq = any;
-
-function tenantFrom(req: AnyReq): string {
-  return String(req.params?.id || req.query?.tenant || "default").trim() || "default";
-}
-function getTokenFromHeaders(req: AnyReq): string {
-  const raw = req.get("authorization") || req.get("x-authorization") || "";
-  return raw.replace(/^Bearer\s+/i, "").trim();
-}
-function readTokenMap(): Record<string, string> {
-  try {
-    return JSON.parse(process.env.SGC_TOKENS || "{}");
-  } catch {
-    return {};
-  }
-}
-function requireEditorToken(req: AnyReq, res: AnyReq, next: AnyReq) {
-  const tMap = readTokenMap();
-  const tenant = tenantFrom(req);
-  const token = getTokenFromHeaders(req);
-  const expected = tMap[tenant] || tMap["*"];
-  if (!expected) return res.status(401).json({ ok: false, error: "no-token-config" });
-  if (token !== expected) return res.status(401).json({ ok: false, error: "bad-token" });
-  next();
-}
 
 /* ===== 静的UIの場所を自動検出 =====
    - prod: dist/public-admin/console.html
@@ -148,6 +125,9 @@ app.post("/admin/csv", express.text({ type: "text/csv", limit: "20mb" }), csvUps
 /* Admin UI（既存） */
 app.get("/admin/dashboard", dashboardHandler);
 app.get("/admin/mapping", mappingHandler);
+
+/* Operations API（新規） */
+app.use("/tenant", opsRouter);
 
 /* ルール（UI保存）— GETは誰でも、PUTは編集トークン必須 */
 app.get("/tenant/:id/rules", rulesGet);
