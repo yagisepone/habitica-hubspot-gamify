@@ -1,92 +1,245 @@
-/* Sales Gamify Console – injector v2 (overlay + persistent gear button) */
 (() => {
-  const WRAP_ID = "sgc-overlay";
-  const FAB_ID  = "sgc-fab-outer";
+  const PROFILE_KEY = "sgc.profile.v3";
+  const ALWAYS_KEY = "sgc.alwaysShowFab";
+  const HIDE_PAID_KEY = "sgc.hidePaidRewards";
+  const STYLE_ID = "sgc-injector-style";
+  const HIDE_STYLE_ID = "sgc-hide-paid-style";
+  const HIDE_CSS = `
+    [href="/shops"]{display:none!important;}
+    .sidebar .rewards,.right-panel .rewards{display:none!important;}
+    .gems,.gem-balance,[class*="gem"]{display:none!important;}
+  `;
 
-  // 既定の BASE（必要に応じて自社Renderに変更）
-  const DEFAULT_BASE = "https://sales-gamify.onrender.com";
+  const script = document.currentScript;
+  let scriptOrigin = "";
+  try {
+    scriptOrigin = script ? new URL(script.src, window.location.href).origin : "";
+  } catch {
+    scriptOrigin = "";
+  }
 
-  // すでに外側の⚙️が無ければ作る（リロードまでは残る）
-  if (!document.getElementById(FAB_ID)) {
+  function readProfile() {
+    try {
+      const raw = localStorage.getItem(PROFILE_KEY);
+      if (!raw) return {};
+      const data = JSON.parse(raw);
+      return data && typeof data === "object" ? data : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveProfile(profile) {
+    try {
+      localStorage.setItem(PROFILE_KEY, JSON.stringify(profile || {}));
+    } catch {
+      /* noop */
+    }
+  }
+
+  function getProfile() {
+    const profile = readProfile();
+    if (!profile.baseUrl && scriptOrigin) {
+      profile.baseUrl = scriptOrigin.replace(/\/+$/, "");
+      saveProfile(profile);
+    }
+    return profile;
+  }
+
+  function shouldShowFab() {
+    const flag = localStorage.getItem(ALWAYS_KEY);
+    return flag === "1" || flag === "true";
+  }
+
+  function injectStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      #sgc-fab{
+        position:fixed;
+        top:110px;
+        right:18px;
+        z-index:2147483646;
+        background:#6c5ce7;
+        color:#fff;
+        border-radius:14px;
+        padding:10px 14px;
+        box-shadow:0 6px 18px rgba(0,0,0,.25);
+        font-weight:700;
+        display:flex;
+        gap:8px;
+        align-items:center;
+        cursor:pointer;
+        user-select:none;
+        font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans JP",sans-serif;
+      }
+      #sgc-fab:hover{filter:brightness(1.06);}
+      #sgc-console-overlay{
+        position:fixed;
+        inset:0;
+        background:rgba(0,0,0,0.4);
+        display:none;
+        align-items:center;
+        justify-content:center;
+        z-index:2147483647;
+      }
+      #sgc-console-overlay iframe{
+        width:min(1200px,95vw);
+        height:90vh;
+        border:none;
+        border-radius:14px;
+        box-shadow:0 24px 48px rgba(0,0,0,0.25);
+        background:#fff;
+      }
+      #sgc-console-overlay .sgc-console-close{
+        position:absolute;
+        top:24px;
+        right:24px;
+        width:44px;
+        height:44px;
+        border:none;
+        border-radius:50%;
+        font-size:24px;
+        cursor:pointer;
+        background:#fff;
+        box-shadow:0 8px 24px rgba(0,0,0,0.2);
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function applyHidePaidRewards() {
+    const flag = localStorage.getItem(HIDE_PAID_KEY);
+    const enabled = flag === "1" || flag === "true";
+    let style = document.getElementById(HIDE_STYLE_ID);
+    if (enabled) {
+      if (!style) {
+        style = document.createElement("style");
+        style.id = HIDE_STYLE_ID;
+        style.textContent = HIDE_CSS;
+        document.head.appendChild(style);
+      }
+    } else if (style) {
+      style.remove();
+    }
+  }
+
+  function ensureFab() {
+    if (!shouldShowFab()) return;
+    injectStyles();
+    if (document.getElementById("sgc-fab")) return;
     const fab = document.createElement("div");
-    fab.id = FAB_ID;
+    fab.id = "sgc-fab";
     fab.textContent = "⚙️ 設定";
-    fab.style.cssText =
-      "position:fixed;top:110px;right:18px;z-index:2147483646;background:#6c5ce7;color:#fff;" +
-      "border-radius:14px;padding:10px 14px;box-shadow:0 6px 18px rgba(0,0,0,.25);" +
-      "font-weight:700;display:flex;gap:8px;align-items:center;cursor:pointer;user-select:none";
-    fab.addEventListener("mouseenter", () => (fab.style.filter = "brightness(1.06)"));
-    fab.addEventListener("mouseleave", () => (fab.style.filter = ""));
-    fab.addEventListener("click", () => toggleOverlay(true));
+    fab.setAttribute("role", "button");
+    fab.setAttribute("tabindex", "0");
+    const open = () => openConsole();
+    fab.addEventListener("click", open);
+    fab.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
     document.body.appendChild(fab);
   }
 
-  // Escで閉じる
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      const wrap = document.getElementById(WRAP_ID);
-      if (wrap) wrap.style.display = "none";
+  function removeFab() {
+    const fab = document.getElementById("sgc-fab");
+    if (fab) fab.remove();
+  }
+
+  function openConsole() {
+    const profile = getProfile();
+    const base = (profile.baseUrl || scriptOrigin || "").replace(/\/+$/, "");
+    if (!base) {
+      window.alert("BaseURL が未設定です。ブックマークレットを実行してから再度お試しください。");
+      return;
+    }
+    injectStyles();
+    let overlay = document.getElementById("sgc-console-overlay");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.id = "sgc-console-overlay";
+      const iframe = document.createElement("iframe");
+      iframe.id = "sgc-console-frame";
+      iframe.title = "Sales Gamify Console";
+      const tenant = profile.tenant || "default";
+      const token = profile.token || "";
+      const hash = `#tenant=${encodeURIComponent(tenant)}&token=${encodeURIComponent(token)}&base=${encodeURIComponent(base)}`;
+      iframe.src = `${base}/admin/console/${hash}`;
+      iframe.allow = "clipboard-write";
+      const closeBtn = document.createElement("button");
+      closeBtn.className = "sgc-console-close";
+      closeBtn.type = "button";
+      closeBtn.textContent = "×";
+      closeBtn.addEventListener("click", () => closeConsole());
+      overlay.appendChild(iframe);
+      overlay.appendChild(closeBtn);
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) {
+          closeConsole();
+        }
+      });
+      document.body.appendChild(overlay);
+    }
+    overlay.style.display = "flex";
+  }
+
+  function closeConsole() {
+    const overlay = document.getElementById("sgc-console-overlay");
+    if (overlay) {
+      overlay.style.display = "none";
+    }
+  }
+
+  applyHidePaidRewards();
+  if (shouldShowFab()) {
+    ensureFab();
+  }
+
+  const observer = new MutationObserver(() => {
+    if (shouldShowFab()) ensureFab();
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  window.addEventListener("storage", () => {
+    applyHidePaidRewards();
+    if (shouldShowFab()) ensureFab();
+    else removeFab();
+  });
+
+  const allowedOrigin = scriptOrigin;
+  window.addEventListener("message", (event) => {
+    if (allowedOrigin && event.origin && event.origin !== allowedOrigin) return;
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (data.type === "sgc.alwaysShowFab") {
+      if (data.value) {
+        localStorage.setItem(ALWAYS_KEY, "1");
+        ensureFab();
+      } else {
+        localStorage.removeItem(ALWAYS_KEY);
+        removeFab();
+      }
+    } else if (data.type === "sgc.hidePaidRewards") {
+      if (data.value) {
+        localStorage.setItem(HIDE_PAID_KEY, "1");
+      } else {
+        localStorage.removeItem(HIDE_PAID_KEY);
+      }
+      applyHidePaidRewards();
     }
   });
 
-  // 表示/非表示のトグル
-  function toggleOverlay(forceShow) {
-    let wrap = document.getElementById(WRAP_ID);
-    if (!wrap) {
-      wrap = buildOverlay();
-      document.body.appendChild(wrap);
-    }
-    wrap.style.display =
-      forceShow ? "block" : wrap.style.display === "none" ? "block" : "none";
-  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeConsole();
+  });
 
-  // オーバーレイ生成
-  function buildOverlay() {
-    // 既存のプロファイル（console.html が保存する localStorage）を利用
-    let prof = {};
-    try {
-      prof = JSON.parse(localStorage.getItem("sgc.profile.v3") || "{}") || {};
-    } catch {}
-    const tenant = prof.tenant || "default";
-    const base = (prof.baseUrl || DEFAULT_BASE).replace(/\/+$/, "");
-    const token = prof.token || "";
-
-    // console.html にマジック値をブリッジ（初回が楽）
-    const q = new URLSearchParams();
-    if (tenant) q.set("tenant", tenant);
-    if (token) q.set("token", token);
-    if (base) q.set("base", base);
-    const consoleUrl = `${base}/admin/console/${q.toString() ? "#" + q.toString() : ""}`;
-
-    const wrap = document.createElement("div");
-    wrap.id = WRAP_ID;
-    wrap.style.cssText =
-      "position:fixed;inset:0;z-index:2147483645;background:rgba(0,0,0,.40);" +
-      "backdrop-filter:saturate(110%) blur(1.5px);display:block";
-    wrap.innerHTML = `
-      <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
-                  width:min(1100px,95vw);height:min(85vh,95vh);background:#fff;border-radius:14px;
-                  box-shadow:0 20px 48px rgba(0,0,0,.35);overflow:hidden;display:flex;flex-direction:column">
-        <div style="display:flex;align-items:center;justify-content:space-between;
-                    background:#f7f7fb;border-bottom:1px solid #ececf5;padding:8px 12px">
-          <div style="font-weight:800">Sales Gamify Console</div>
-          <div style="display:flex;gap:10px;align-items:center;font-size:12px;color:#666">
-            <span>Tenant: <b>${tenant}</b></span>
-            <span>Base: <a href="${base}" target="_blank" style="color:#6c5ce7;text-decoration:none">${base}</a></span>
-            <button id="sgc-close" style="border:1px solid #e1e1ef;border-radius:8px;padding:6px 10px;cursor:pointer;background:#fff">閉じる</button>
-          </div>
-        </div>
-        <iframe id="sgc-frame" src="${consoleUrl}" style="border:0;width:100%;height:100%;background:#fff"></iframe>
-      </div>
-    `;
-    // 枠外クリックで閉じる
-    wrap.addEventListener("click", (e) => {
-      if (e.target === wrap) wrap.style.display = "none";
-    });
-    wrap.querySelector("#sgc-close").addEventListener("click", () => (wrap.style.display = "none"));
-    return wrap;
-  }
-
-  // ブックマークから呼ばれた瞬間に開く
-  toggleOverlay(true);
+  // expose for debugging
+  window.SGCInjector = {
+    open: openConsole,
+    close: closeConsole,
+  };
 })();

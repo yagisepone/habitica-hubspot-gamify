@@ -24,9 +24,16 @@ export type AuditEvent = {
   id: string;
   tenant: string;
   actor: string;
-  action: "adjust.create" | "shop.item.put" | "shop.purchase";
+  action:
+    | "adjust.create"
+    | "shop.item.put"
+    | "shop.purchase"
+    | "manual.xp"
+    | "manual.level"
+    | "labels.bulk.replace";
   detail?: any;
   ip?: string;
+  ua?: string;
   at: string;
 };
 
@@ -41,4 +48,17 @@ export type OpsLogEntry = {
   badge?: string;
   note?: string;
   source: string;
+};
+
+export type ManualLogEntry = {
+  id: string;
+  tenant: string;
+  type: "xp" | "level";
+  userId: string;
+  deltaXp?: number;
+  deltaLevel?: number;
+  reason?: string;
+  ip?: string;
+  ua?: string;
+  createdAt: string;
 };

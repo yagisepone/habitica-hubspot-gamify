@@ -47,6 +47,8 @@
   const LS_UNDO = "sgc.undo.v1";
   const MAX_UNDO = 8;
   const PIN_KEY = "sgc_pin";
+  const PIN_KEY_NEW = "sgc.alwaysShowFab";
+  const HIDE_PAID_KEY = "sgc.hidePaidRewards";
 
   const h = (html) => { const t=document.createElement("template"); t.innerHTML=html.trim(); return t.content.firstElementChild; };
   const asNum=(v,d=0)=>{ const n=Number(v); return Number.isFinite(n)?n:d; };
@@ -54,14 +56,71 @@
   const load=(k,def={})=>{ try{ return JSON.parse(localStorage.getItem(k)||"")||def; }catch{ return def; } };
   const save=(k,v)=> localStorage.setItem(k, JSON.stringify(v||{}));
   const toast=(msg,bad=false)=>{ const el=h(`<div class="sgc-toast" style="background:${bad?"#c0392b":"#222"}">${msg}</div>`); document.body.appendChild(el); setTimeout(()=>el.remove(),3000); };
+  const statusOf=(err)=> Number.isFinite(Number(err?.status)) ? Number(err.status) : null;
+  const describeHttpError=(err)=>{
+    if(!err) return "unknown error";
+    const status = statusOf(err);
+    const statusText = err?.statusText ? String(err.statusText).trim() : "";
+    const bodyText = err?.body ? String(err.body).trim() : err?.responseText ? String(err.responseText).trim() : "";
+    let msg = "";
+    if(status){ msg = `${status}${statusText ? ` ${statusText}` : ""}`; }
+    if(bodyText){ msg = msg ? `${msg} - ${bodyText}` : bodyText; }
+    const base = String(err?.message || "").trim();
+    if(!msg) msg = base || "unknown error";
+    return msg;
+  };
+  const csvEscape=(value)=>{
+    const text = value === null || value === undefined ? "" : String(value);
+    if(/["\r\n,]/.test(text)){
+      return `"${text.replace(/"/g,'""')}"`;
+    }
+    return text;
+  };
+  const downloadCsv=(filename, header, rows)=>{
+    const lines=[header.map(csvEscape).join(",")];
+    rows.forEach((row)=> lines.push(row.map(csvEscape).join(",")));
+    const blob=new Blob([lines.join("\r\n")],{type:"text/csv;charset=utf-8"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download=filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),0);
+  };
   const loadProfile=()=>load(LS_KEY,{ tenant:"default", baseUrl:"", token:"" });
   const saveProfile=(p)=>save(LS_KEY,p);
 
   const headers=(p)=>{ const hd={"Accept":"application/json"}; if(p?.token){ hd.Authorization=`Bearer ${p.token}`; } return hd; };
-  const apiGET=async(url,p)=>{ const r=await fetch(url,{headers:headers(p)}); if(!r.ok) throw new Error(String(r.status)); return r.json(); };
-  const apiPUT=async(url,body,p)=>{ const r=await fetch(url,{method:"PUT",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)}); if(!r.ok) throw new Error(String(r.status)); try{return await r.json();}catch{return {ok:true}} };
-  const apiPOST=async(url,body,p)=>{ const r=await fetch(url,{method:"POST",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)}); if(!r.ok) throw new Error(String(r.status)); try{return await r.json();}catch{return {ok:true}} };
-  const apiPOSTForm=async(url,form,p)=>{ const r=await fetch(url,{method:"POST",headers:headers(p),body:form}); if(!r.ok) throw new Error(String(r.status)); try{return await r.json();}catch{return {ok:true}} };
+  async function parseJsonText(text){
+    if(!text) return null;
+    try{
+      return JSON.parse(text);
+    }catch{
+      return text;
+    }
+  }
+  async function requestJson(url, options, profile){
+    const res = await fetch(url, options);
+    let text = "";
+    try{ text = await res.text(); }catch{ text = ""; }
+    if(!res.ok){
+      const err = new Error((text || `${res.status} ${res.statusText}`).trim());
+      err.status = res.status;
+      err.statusText = res.statusText;
+      err.body = text;
+      err.url = url;
+      err.options = options;
+      err.profile = profile;
+      throw err;
+    }
+    return parseJsonText(text);
+  }
+  const apiGET=async(url,p)=> requestJson(url,{headers:headers(p)},p);
+  const apiPUT=async(url,body,p)=> requestJson(url,{method:"PUT",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)},p);
+  const apiPOST=async(url,body,p)=> requestJson(url,{method:"POST",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)},p);
+  const apiPOSTForm=async(url,form,p)=> requestJson(url,{method:"POST",headers:headers(p),body:form},p);
 
   /* ====== スタイル（オリジナル + 使い勝手改良） ====== */
   GM_addStyle(`
@@ -148,8 +207,25 @@
   `);
 
   /* ====== 固定ボタン ====== */
-  const isPinned = ()=> localStorage.getItem(PIN_KEY)==="1";
-  const setPinned = (flag)=>{ if(flag){ localStorage.setItem(PIN_KEY,"1"); } else { localStorage.removeItem(PIN_KEY); } syncFabState(); maintainFab(); };
+  const isPinned = ()=> {
+    const legacy = localStorage.getItem(PIN_KEY);
+    const modern = localStorage.getItem(PIN_KEY_NEW);
+    return legacy === "1" || modern === "1" || modern === "true";
+  };
+  const setPinned = (flag)=>{ 
+    if(flag){
+      localStorage.setItem(PIN_KEY,"1");
+      localStorage.setItem(PIN_KEY_NEW,"true");
+    } else {
+      localStorage.removeItem(PIN_KEY);
+      localStorage.removeItem(PIN_KEY_NEW);
+    }
+    try{
+      window.top?.postMessage({ type:"sgc.alwaysShowFab", value: flag }, "*");
+    }catch(_){}
+    syncFabState(); 
+    maintainFab(); 
+  };
 
   function syncFabState(){
     const fab = document.getElementById("sgc-fab");
@@ -206,7 +282,7 @@
             <input id="sgc-base" style="width:300px" placeholder="https://sales-gamify.onrender.com">
             <label style="font-size:12px;color:#666">Token:</label>
             <input id="sgc-token" style="width:240px" placeholder="(Bearer不要)">
-            <label class="sgc-pin-toggle"><input id="sgc-pin" type="checkbox"> ピン留め</label>
+            <label class="sgc-pin-toggle"><input id="sgc-pin" type="checkbox"> 常時表示</label>
             <button id="sgc-ping" class="sgc-btn">Ping</button>
             <button id="sgc-save-top" class="sgc-btn primary">保存</button>
             <button id="sgc-close" class="sgc-btn">閉じる</button>
@@ -229,9 +305,13 @@
     modal.querySelector("#sgc-pin").addEventListener("change", (e)=>{
       const flag = !!e.target.checked;
       setPinned(flag);
-      if(flag){ toast("設定ボタンをピン留めしました"); }
-      else{ toast("ピン留めを解除しました"); }
+      if(flag){ toast("設定ボタンを常時表示にしました"); }
+      else{ toast("常時表示を解除しました"); }
       ensureFab();
+    });
+    ["#sgc-tenant","#sgc-base","#sgc-token"].forEach(sel=>{
+      modal.querySelector(sel)?.addEventListener("input", ()=> ensureProfileFromInputs());
+      modal.querySelector(sel)?.addEventListener("change", ()=> ensureProfileFromInputs());
     });
     document.addEventListener("keydown",(e)=>{ if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="s"){ e.preventDefault(); saveAll(); }});
     document.getElementById("sgc-modal-mask").addEventListener("click", closeModal);
@@ -246,6 +326,7 @@
     modal.querySelector("#sgc-tenant").value=profile.tenant||"default";
     modal.querySelector("#sgc-base").value=profile.baseUrl||"";
     modal.querySelector("#sgc-token").value=profile.token||"";
+    ensureProfileFromInputs();
     initTabs();
     loadAll();
   }
@@ -318,20 +399,20 @@
     collectHubToCache();
 
     try{
-      await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/rules`, rulesCache||{}, profile);
-      await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/labels`, { items: labelsCache||[] }, profile);
-      toast("保存しました");
-      await loadAll();
-    }catch(e){
-      console.error(e);
-      const msg = String(e||"");
-      if (msg.includes("401")) {
-        toast("保存に失敗: 401 Unauthorized（テナント名とトークンの組み合わせが Render の SGC_TOKENS と一致していません）", true);
-      } else {
-        toast("保存に失敗: "+msg, true);
-      }
+    await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/rules`, rulesCache||{}, profile);
+    await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/labels`, { items: labelsCache||[] }, profile);
+    toast("保存しました");
+    await loadAll();
+  }catch(e){
+    console.error(e);
+    const status = statusOf(e);
+    if (status === 401) {
+      toast("保存に失敗: 401 Unauthorized（テナント名とトークンの組み合わせが Render の SGC_TOKENS と一致していません）", true);
+    } else {
+      toast("保存に失敗: "+describeHttpError(e), true);
     }
   }
+}
 
   /* ====== タブ描画 ====== */
   function render(){
@@ -492,6 +573,7 @@
 
     const toolbar=h(`<div class="sgc-kv" style="margin:8px 0">
         <button id="sgc-add-row" class="sgc-btn">＋ 行を追加</button>
+        <button id="sgc-bulk-labels" class="sgc-btn">一括貼り付け（CSV/TSV）</button>
         <button id="sgc-del-all" class="sgc-btn sgc-del">全行をクリア</button>
       </div>`);
     bodyArea.appendChild(toolbar);
@@ -503,6 +585,7 @@
 
     bodyArea.querySelector("#sgc-add-row").addEventListener("click",()=> area.appendChild(renderHubRow({id:"", title:""})));
     bodyArea.querySelector("#sgc-del-all").addEventListener("click",()=>{ labelsCache=[]; area.innerHTML=""; area.appendChild(renderHubRow({id:"", title:""})); });
+    bodyArea.querySelector("#sgc-bulk-labels").addEventListener("click", openBulkLabelModal);
 
     function renderHubRow(item){
       const row=h(`
@@ -519,6 +602,72 @@
       if(Number.isFinite(Number(item.xp))) row.setAttribute("data-xp", String(item.xp));
       if(item.badge) row.setAttribute("data-badge", item.badge);
       return row;
+    }
+
+    function parseBulkLabelText(text){
+      const lines = String(text||"")
+        .split(/\r?\n/)
+        .map((line)=>line.trim())
+        .filter((line)=>line.length>0);
+      if(!lines.length) return [];
+      const delim = lines.some((line)=>line.includes("\t")) ? "\t" : ",";
+      const items=[];
+      for(const line of lines){
+        const cols = line.split(delim).map((c)=>c.trim());
+        if(!cols[0]) continue;
+        const xpVal = cols[2] !== undefined ? Number(cols[2]) : NaN;
+        items.push({
+          id: cols[0],
+          title: cols[1] || "",
+          xp: Number.isFinite(xpVal) ? Math.trunc(xpVal) : undefined,
+          badge: cols[3] || "",
+        });
+      }
+      return items;
+    }
+
+    function openBulkLabelModal(){
+      const overlay=h(`
+        <div class="sgc-overlay">
+          <div class="sgc-overlay-card">
+            <div class="sgc-help">1行あたり <code>ラベルID,タイトル,XP(任意),バッジ(任意)</code> 形式で貼り付けてください。タブ区切りにも対応します。</div>
+            <textarea id="sgc-bulk-text" placeholder="例: label-id-1,見込みA,5,🏅優良見込み"></textarea>
+            <div class="sgc-compact" style="justify-content:flex-end;">
+              <button id="sgc-bulk-cancel" class="sgc-btn">閉じる</button>
+              <button id="sgc-bulk-apply" class="sgc-btn primary">追加</button>
+            </div>
+          </div>
+        </div>
+      `);
+      modal.appendChild(overlay);
+      const textarea = overlay.querySelector("#sgc-bulk-text");
+      textarea?.focus();
+      const close=()=> overlay.remove();
+      overlay.querySelector("#sgc-bulk-cancel")?.addEventListener("click", (e)=>{ e.preventDefault(); close(); });
+      overlay.addEventListener("click",(event)=>{
+        if(event.target === overlay){ close(); }
+      });
+      overlay.querySelector("#sgc-bulk-apply")?.addEventListener("click",(event)=>{
+        event.preventDefault();
+        const text = textarea?.value || "";
+        const parsed = parseBulkLabelText(text);
+        if(!parsed.length){
+          toast("貼り付け内容が解析できませんでした。ラベルIDとタイトルを確認してください。", true);
+          return;
+        }
+        parsed.forEach((item)=>{
+          labelsCache.push({
+            id: item.id,
+            title: item.title,
+            xp: item.xp,
+            badge: item.badge || undefined,
+          });
+        });
+        area.innerHTML="";
+        labelsCache.forEach(it=> area.appendChild(renderHubRow(it)));
+        toast(`${parsed.length} 行を追加しました`);
+        close();
+      });
     }
   }
 
@@ -626,30 +775,109 @@
     };
   }
 
+  function mapManualEventToRow(ev){
+    if(!ev || typeof ev !== "object") return null;
+    const action = ev.action || ev.type;
+    const detail = ev.detail || {};
+    const base = {
+      id: ev.id || `${action || "manual"}-${ev.at || ev.ts || Date.now()}`,
+      createdAt: ev.at || ev.ts || ev.createdAt || ev.date || null,
+      actor: ev.actor || "",
+      ip: ev.ip || "",
+      ua: ev.ua || "",
+      reason: detail.reason || detail.note || "",
+      userId: detail.userId || detail.uid || "",
+    };
+    if(action === "manual.xp"){
+      const delta = Number(detail.deltaXp ?? detail.delta ?? 0);
+      return {
+        ...base,
+        type: "xp",
+        deltaXp: Number.isFinite(delta) ? delta : 0,
+      };
+    }
+    if(action === "manual.level"){
+      const delta = Number(detail.deltaLevel ?? detail.delta ?? 0);
+      return {
+        ...base,
+        type: "level",
+        deltaLevel: Number.isFinite(delta) ? delta : 0,
+      };
+    }
+    return null;
+  }
+
+  function downloadManualCsv(items){
+    const header=["timestamp","userId","deltaXp","deltaLevel","reason","actor","ip","ua"];
+    const rows=(items||[]).map((item)=>[
+      item?.createdAt || "",
+      item?.userId || "",
+      Number.isFinite(item?.deltaXp) ? item.deltaXp : "",
+      Number.isFinite(item?.deltaLevel) ? item.deltaLevel : "",
+      item?.reason || "",
+      item?.actor || "",
+      item?.ip || "",
+      item?.ua || "",
+    ]);
+    downloadCsv(`manual-log-${tenant()}.csv`, header, rows);
+  }
+
+  function downloadAuditCsv(items){
+    const header=["timestamp","action","actor","detail","ip","ua"];
+    const rows=(items||[]).map((item)=>{
+      let detail="";
+      if(typeof item?.detail === "string"){
+        detail = item.detail;
+      }else if(item?.detail){
+        try{ detail = JSON.stringify(item.detail); }catch{ detail=""; }
+      }
+      return [
+        item?.at || item?.ts || "",
+        item?.action || "",
+        item?.actor || "",
+        detail,
+        item?.ip || "",
+        item?.ua || "",
+      ];
+    });
+    downloadCsv(`audit-log-${tenant()}.csv`, header, rows);
+  }
+
   async function fetchAdjustments(limit=50, userIdFilter=""){
     ensureProfileFromInputs();
     if(!profile.baseUrl){ adjustmentsCache=[]; return adjustmentsCache; }
     const params = new URLSearchParams();
-    params.set("tenant", tenant());
-    params.set("limit", String(clamp(limit, 1, 200)));
-    if(userIdFilter) params.set("userId", userIdFilter);
-    const url = `${baseURL()}/ops/logs?${params.toString()}`;
+    params.set("limit", String(clamp(Math.max(50, limit), 1, 200)));
+    const url = `${baseURL()}/ops/${encodeURIComponent(tenant())}/audit?${params.toString()}`;
     try{
       const res = await apiGET(url, profile);
       const items = Array.isArray(res?.items) ? res.items : [];
-      adjustmentsCache = items.map(normalizeOpsLog);
+      const rows = [];
+      for(const ev of items){
+        const mapped = mapManualEventToRow(ev);
+        if(!mapped) continue;
+        if(userIdFilter && mapped.userId !== userIdFilter) continue;
+        rows.push(mapped);
+      }
+      adjustmentsCache = rows;
       return adjustmentsCache;
     }catch(e){
-      const code = e && typeof e === "object" && "message" in e ? String(e.message) : String(e ?? "");
-      if(code === "404" || code === "405"){
+      const status = statusOf(e);
+      if(status === 404 || status === 405){
         try{
           const legacyParams = new URLSearchParams();
-          legacyParams.set("limit", String(clamp(limit, 1, 200)));
-          if(userIdFilter) legacyParams.set("userId", userIdFilter);
-          const legacyUrl = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/adjustments?${legacyParams.toString()}`;
+          legacyParams.set("limit", String(clamp(Math.max(50, limit), 1, 200)));
+          const legacyUrl = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/audit?${legacyParams.toString()}`;
           const res = await apiGET(legacyUrl, profile);
           const items = Array.isArray(res?.items) ? res.items : [];
-          adjustmentsCache = items.map(normalizeOpsLog);
+          const rows = [];
+          for(const ev of items){
+            const mapped = mapManualEventToRow(ev);
+            if(!mapped) continue;
+            if(userIdFilter && mapped.userId !== userIdFilter) continue;
+            rows.push(mapped);
+          }
+          adjustmentsCache = rows;
           return adjustmentsCache;
         }catch(err){
           console.error("fetchAdjustments (legacy)", err);
@@ -694,12 +922,24 @@
     if(!profile.baseUrl){ auditCache=[]; return auditCache; }
     const params = new URLSearchParams();
     params.set("limit", String(clamp(limit, 1, 200)));
-    const url = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/audit?${params.toString()}`;
+    const url = `${baseURL()}/ops/${encodeURIComponent(tenant())}/audit?${params.toString()}`;
     try{
       const res = await apiGET(url, profile);
       auditCache = Array.isArray(res?.items) ? res.items : [];
       return auditCache;
     }catch(e){
+      const status = statusOf(e);
+      if(status === 404 || status === 405){
+        try{
+          const legacyUrl = `${baseURL()}/tenant/${encodeURIComponent(tenant())}/audit?${params.toString()}`;
+          const res = await apiGET(legacyUrl, profile);
+          auditCache = Array.isArray(res?.items) ? res.items : [];
+          return auditCache;
+        }catch(err){
+          console.error("fetchAudit (legacy)", err);
+          throw err;
+        }
+      }
       console.error("fetchAudit", e);
       throw e;
     }
@@ -796,31 +1036,36 @@
     ensureProfileFromInputs();
     const form=h(`
       <div class="sgc-bare">
-        <div class="sgc-compact">
-          <input id="sgc-adj-user" placeholder="ユーザーID" style="width:160px">
-          <input id="sgc-adj-name" placeholder="ユーザー名 (任意)" style="width:180px">
-          <input id="sgc-adj-delta" type="number" step="1" value="10" style="width:120px">
-          <input id="sgc-adj-badge" placeholder="バッジ (任意)" style="width:200px">
+        <div class="sgc-compact sgc-row-compact">
+          <label class="sgc-inline" style="display:flex;flex-direction:column;gap:4px;">
+            <span class="muted">ユーザーID</span>
+            <input id="sgc-adj-user" placeholder="ユーザーID" style="width:200px" title="社内ユーザーを識別するためのIDです（HubSpot/Zoom/HabiticaのIDマッピングに使用）。不明な場合は担当者に確認してください。">
+          </label>
+          <label class="sgc-inline" style="display:flex;flex-direction:column;gap:4px;">
+            <span class="muted">XP増減</span>
+            <input id="sgc-adj-delta" type="number" step="1" value="0" style="width:140px">
+          </label>
+          <label class="sgc-inline" style="display:flex;flex-direction:column;gap:4px;">
+            <span class="muted">レベル増減</span>
+            <input id="sgc-adj-level" type="number" step="1" value="0" style="width:140px">
+          </label>
         </div>
-        <div class="sgc-compact sgc-filter">
-          <input id="sgc-adj-note" placeholder="メモ (任意)" style="flex:1;min-width:280px">
+        <div class="sgc-compact">
+          <textarea id="sgc-adj-reason" class="wide" placeholder="理由 / メモ (任意)" style="min-height:80px;"></textarea>
         </div>
         <div class="sgc-compact">
-          <button id="sgc-adj-submit" class="sgc-btn primary">XPを登録</button>
+          <button id="sgc-adj-submit" class="sgc-btn primary">手動調整を登録</button>
           <button id="sgc-adj-reload" class="sgc-btn">履歴を再読込</button>
-          <span class="sgc-help">XPは正負どちらも可。最新50件を表示します。</span>
+          <button id="sgc-adj-export" class="sgc-btn">CSVダウンロード</button>
+          <span class="sgc-help">XPとレベルは片方のみでも可。最新50件を表示します。</span>
+        </div>
+        <div class="sgc-kv" style="margin-top:6px; gap:8px;">
+          <button id="sgc-quick-misscall" type="button" class="sgc-btn">ミス架電 -1</button>
+          <button id="sgc-quick-demo5" type="button" class="sgc-btn">デモ +5</button>
         </div>
       </div>
     `);
     bodyArea.appendChild(form);
-
-    const quick=h(`
-      <div class="sgc-kv" style="margin-top:6px; gap:8px;">
-        <button id="sgc-quick-misscall" type="button" class="sgc-btn">ミス架電 -1</button>
-        <button id="sgc-quick-demo5" type="button" class="sgc-btn">デモ +5</button>
-      </div>
-    `);
-    bodyArea.appendChild(quick);
 
     const filterRow=h(`
       <div class="sgc-compact sgc-filter">
@@ -839,9 +1084,10 @@
             <th>時刻</th>
             <th>ユーザー</th>
             <th>XP</th>
-            <th>バッジ</th>
-            <th>メモ</th>
-            <th>source</th>
+            <th>レベル</th>
+            <th>理由</th>
+            <th>実行者</th>
+            <th>IP</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -860,7 +1106,7 @@
       if(!adjustmentsCache.length){
         const tr=document.createElement("tr");
         const td=document.createElement("td");
-        td.colSpan=6;
+        td.colSpan=7;
         td.style.color="#777";
         td.textContent="履歴がありません";
         tr.appendChild(td);
@@ -870,18 +1116,27 @@
       }
       adjustmentsCache.forEach(item=>{
         const tr=document.createElement("tr");
+        if(item?.ua){
+          tr.title = item.ua;
+        }
+        const xpText = Number.isFinite(item?.deltaXp) ? `${item.deltaXp>=0?"+":""}${item.deltaXp}` : "";
+        const lvText = Number.isFinite(item?.deltaLevel) ? `${item.deltaLevel>=0?"+":""}${item.deltaLevel}` : "";
         const cells=[
-          formatDateTime(item?.createdAt || item?.ts),
-          item?.userName ? `${item.userName} (${item.userId||""})` : item?.userId || "",
-          typeof item?.deltaXp==="number" ? `${item.deltaXp>=0?"+":""}${item.deltaXp}` : "",
-          item?.badge || "",
-          item?.note || "",
-          item?.source || item?.type || "",
+          formatDateTime(item?.createdAt),
+          item?.userId || "",
+          xpText,
+          lvText,
+          item?.reason || "",
+          item?.actor || "",
+          item?.ip || "",
         ];
         cells.forEach((txt,idx)=>{
           const td=document.createElement("td");
           td.textContent = txt ?? "";
-          if(idx===2) td.style.fontWeight="700";
+          if(idx===2 || idx===3){
+            td.style.fontWeight="700";
+            td.style.textAlign="right";
+          }
           tr.appendChild(td);
         });
         tbody.appendChild(tr);
@@ -895,7 +1150,7 @@
         await fetchAdjustments(50, currentFilter);
         renderRows();
       }catch(e){
-        toast("履歴の取得に失敗しました", true);
+        toast("履歴の取得に失敗しました: "+describeHttpError(e), true);
       }
     }
 
@@ -906,54 +1161,73 @@
         return;
       }
       const userId = form.querySelector("#sgc-adj-user").value.trim();
-      const userName = form.querySelector("#sgc-adj-name").value.trim();
-      const deltaRaw = Number(form.querySelector("#sgc-adj-delta").value);
-      const badge = form.querySelector("#sgc-adj-badge").value.trim();
-      const note = form.querySelector("#sgc-adj-note").value.trim();
+      const xpInput = form.querySelector("#sgc-adj-delta").value.trim();
+      const levelInput = form.querySelector("#sgc-adj-level").value.trim();
+      const reason = form.querySelector("#sgc-adj-reason").value.trim();
       if(!userId){
         toast("ユーザーIDを入力してください", true);
         form.querySelector("#sgc-adj-user").focus();
         return;
       }
-      if(!Number.isFinite(deltaRaw)){
+      const xpDelta = xpInput === "" ? 0 : Number(xpInput);
+      const levelDelta = levelInput === "" ? 0 : Number(levelInput);
+      if(!Number.isFinite(xpDelta)){
         toast("XP増減は整数で入力してください", true);
         form.querySelector("#sgc-adj-delta").focus();
         return;
       }
-      const delta = Math.trunc(deltaRaw);
-      const payload={
-        tenant: tenant(),
-        userId,
-        userName: userName || undefined,
-        delta,
-        deltaXp: delta,
-        badge: badge || undefined,
-        note: note || undefined,
-      };
+      if(!Number.isFinite(levelDelta)){
+        toast("レベル増減は整数で入力してください", true);
+        form.querySelector("#sgc-adj-level").focus();
+        return;
+      }
+      if(xpDelta === 0 && levelDelta === 0){
+        toast("XP または レベルのいずれかに値を入力してください", true);
+        return;
+      }
+      const payloadReason = reason || undefined;
+      const tasks=[];
+      const resultsLabel=[];
+      if(xpDelta !== 0){
+        tasks.push(
+          apiPOST(`${baseURL()}/ops/${encodeURIComponent(tenant())}/manual-xp`, {
+            userId,
+            deltaXp: Math.trunc(xpDelta),
+            reason: payloadReason,
+          }, profile).then(()=>resultsLabel.push(`XP:${xpDelta>=0?"+":""}${Math.trunc(xpDelta)}`))
+        );
+      }
+      if(levelDelta !== 0){
+        tasks.push(
+          apiPOST(`${baseURL()}/ops/${encodeURIComponent(tenant())}/manual-level`, {
+            userId,
+            deltaLevel: Math.trunc(levelDelta),
+            reason: payloadReason,
+          }, profile).then(()=>resultsLabel.push(`Lv:${levelDelta>=0?"+":""}${Math.trunc(levelDelta)}`))
+        );
+      }
       try{
-        try{
-          await apiPOST(`${baseURL()}/ops/adjust`, payload, profile);
-        }catch(err){
-          const code = err && typeof err === "object" && "message" in err ? String(err.message) : String(err ?? "");
-          if(code === "404" || code === "405"){
-            await apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/adjustments`, payload, profile);
-          }else{
-            throw err;
-          }
-        }
-        toast("手動XPを登録しました");
-        form.querySelector("#sgc-adj-note").value="";
+        await Promise.all(tasks);
+        const summary = resultsLabel.length ? resultsLabel.join(" / ") : "OK";
+        toast(`手動調整を登録しました (${summary})`);
         await reload(currentFilter);
       }catch(e){
         console.error("adjustment.submit", e);
-        const msg=String(e||"");
-        if(msg.includes("401")) toast("保存に失敗: 401 Unauthorized", true);
-        else toast("保存に失敗しました", true);
+        const status = statusOf(e);
+        if(status === 401) toast("保存に失敗: 401 Unauthorized", true);
+        else toast("保存に失敗: "+describeHttpError(e), true);
       }
     }
 
     form.querySelector("#sgc-adj-submit").addEventListener("click", submitAdjustment);
     form.querySelector("#sgc-adj-reload").addEventListener("click", ()=>reload(currentFilter));
+    form.querySelector("#sgc-adj-export").addEventListener("click", ()=>{
+      if(!adjustmentsCache.length){
+        toast("ダウンロード対象の履歴がありません", true);
+        return;
+      }
+      downloadManualCsv(adjustmentsCache);
+    });
     filterRow.querySelector("#sgc-adj-filter-btn").addEventListener("click", ()=>{
       const v=filterRow.querySelector("#sgc-adj-filter").value;
       reload(v);
@@ -969,19 +1243,23 @@
       }
     });
 
-    quick.querySelector("#sgc-quick-misscall")?.addEventListener("click",(event)=>{
+    form.querySelector("#sgc-quick-misscall")?.addEventListener("click",(event)=>{
       event.preventDefault();
-      const amo = form.querySelector("#sgc-adj-delta");
-      const note = form.querySelector("#sgc-adj-note");
-      if(amo) amo.value = "-1";
-      if(note) note.value = "ミス架電";
+      const xp = form.querySelector("#sgc-adj-delta");
+      const lv = form.querySelector("#sgc-adj-level");
+      const reasonEl = form.querySelector("#sgc-adj-reason");
+      if(xp) xp.value = "-1";
+      if(lv) lv.value = "0";
+      if(reasonEl) reasonEl.value = "ミス架電";
     });
-    quick.querySelector("#sgc-quick-demo5")?.addEventListener("click",(event)=>{
+    form.querySelector("#sgc-quick-demo5")?.addEventListener("click",(event)=>{
       event.preventDefault();
-      const amo = form.querySelector("#sgc-adj-delta");
-      const note = form.querySelector("#sgc-adj-note");
-      if(amo) amo.value = "5";
-      if(note) note.value = "デモ付与";
+      const xp = form.querySelector("#sgc-adj-delta");
+      const lv = form.querySelector("#sgc-adj-level");
+      const reasonEl = form.querySelector("#sgc-adj-reason");
+      if(xp) xp.value = "5";
+      if(lv) lv.value = "0";
+      if(reasonEl) reasonEl.value = "デモ付与";
     });
 
     reload("");
@@ -990,6 +1268,30 @@
   function renderShop(){
     ensureProfileFromInputs();
     bodyArea.appendChild(h(`<div class="sgc-help">ショップ品目を管理し、購入処理を登録します。</div>`));
+    const hidePref = localStorage.getItem(HIDE_PAID_KEY)==="1" || localStorage.getItem(HIDE_PAID_KEY)==="true";
+    const hideToggle=h(`
+      <div class="sgc-compact" style="margin:8px 0 4px;">
+        <label style="display:flex;align-items:center;gap:6px">
+          <input id="sgc-hide-paid-toggle" type="checkbox" ${hidePref?"checked":""}>
+          Habitica公式の有料アイテムを非表示にする
+        </label>
+        <span class="sgc-help">有効にすると、ブックマークレット/インジェクタ経由で Habitica 側の有料リワードを隠します。</span>
+      </div>
+    `);
+    bodyArea.appendChild(hideToggle);
+    hideToggle.querySelector("#sgc-hide-paid-toggle")?.addEventListener("change",(event)=>{
+      const flag = !!event.target.checked;
+      if(flag){
+        localStorage.setItem(HIDE_PAID_KEY, "1");
+        toast("有料アイテムを非表示に設定しました（Habitica画面を再読み込みしてください）");
+      }else{
+        localStorage.removeItem(HIDE_PAID_KEY);
+        toast("有料アイテムの非表示を解除しました");
+      }
+      try{
+        window.top?.postMessage({ type:"sgc.hidePaidRewards", value: flag }, "*");
+      }catch(_){}
+    });
     const cols=h(`<div class="sgc-cols"></div>`);
     bodyArea.appendChild(cols);
     const manageCol=h(`<div class="sgc-col"></div>`);
@@ -1126,7 +1428,7 @@
         renderShopRows();
         fillPurchaseItems(currentSelect);
       }catch(e){
-        toast("ショップの読み込みに失敗しました", true);
+        toast("ショップの読み込みに失敗しました: "+describeHttpError(e), true);
       }
     }
 
@@ -1194,11 +1496,12 @@
         await reloadShop();
       }catch(e){
         console.error("shop.save", e);
-        const msg=String(e||"");
-        if(msg.includes("401")) toast("保存に失敗: 401 Unauthorized", true);
-        else if(msg.includes("price-invalid")) toast("保存に失敗: 価格が正の整数ではありません", true);
-        else if(msg.includes("stock-invalid")) toast("保存に失敗: 在庫が0以上の整数ではありません", true);
-        else toast("保存に失敗しました", true);
+        const status = statusOf(e);
+        const bodyText = String(e?.body || e?.message || "");
+        if(status === 401) toast("保存に失敗: 401 Unauthorized", true);
+        else if(bodyText.includes("price-invalid")) toast("保存に失敗: 価格が正の整数ではありません", true);
+        else if(bodyText.includes("stock-invalid")) toast("保存に失敗: 在庫が0以上の整数ではありません", true);
+        else toast("保存に失敗: "+describeHttpError(e), true);
       }
     }
 
@@ -1256,11 +1559,12 @@
         }
       }catch(e){
         console.error("shop.purchase", e);
-        const msg=String(e||"");
-        if(msg.includes("401")) toast("購入に失敗: 401 Unauthorized", true);
-        else if(msg.includes("404")) toast("購入に失敗: 品目が見つかりません", true);
-        else if(msg.includes("stock-shortage")) toast("購入に失敗: 在庫が不足しています", true);
-        else toast("購入に失敗しました", true);
+        const status = statusOf(e);
+        const bodyText = String(e?.body || e?.message || "");
+        if(status === 401) toast("購入に失敗: 401 Unauthorized", true);
+        else if(status === 404 || bodyText.includes("item-not-found")) toast("購入に失敗: 品目が見つかりません", true);
+        else if(bodyText.includes("stock-shortage")) toast("購入に失敗: 在庫が不足しています", true);
+        else toast("購入に失敗: "+describeHttpError(e), true);
       }
     }
 
@@ -1278,6 +1582,7 @@
     const controls=h(`
       <div class="sgc-compact">
         <button id="sgc-audit-reload" class="sgc-btn">監査ログを再読込</button>
+        <button id="sgc-audit-export" class="sgc-btn">CSVダウンロード</button>
       </div>
     `);
     bodyArea.appendChild(controls);
@@ -1317,6 +1622,9 @@
       }
       auditCache.forEach(ev=>{
         const tr=document.createElement("tr");
+        if(ev?.ua){
+          tr.title = ev.ua;
+        }
         const cells=[
           formatDateTime(ev?.at),
           ev?.actor || "api",
@@ -1339,11 +1647,18 @@
         await fetchAudit(100);
         renderRows();
       }catch(e){
-        toast("監査ログの取得に失敗しました", true);
+        toast("監査ログの取得に失敗しました: "+describeHttpError(e), true);
       }
     }
 
     controls.querySelector("#sgc-audit-reload").addEventListener("click", reload);
+    controls.querySelector("#sgc-audit-export").addEventListener("click", ()=>{
+      if(!auditCache.length){
+        toast("ダウンロード対象の監査ログがありません", true);
+        return;
+      }
+      downloadAuditCsv(auditCache);
+    });
     reload();
   }
 
@@ -1371,100 +1686,126 @@
 <!-- === Readability / Comfort Mode (v2025-10-14) === -->
 <style id="sgc-a11y">
   /* Base font and line-height */
-  #sgc-modal, 
-  #sgc-modal input, 
-  #sgc-modal select, 
-  #sgc-modal textarea, 
+  #sgc-modal,
+  #sgc-modal input,
+  #sgc-modal select,
+  #sgc-modal textarea,
   #sgc-modal button {
-    font-size: 15.5px;
-    line-height: 1.6;
+    font-size: 16px;
+    line-height: 1.5;
   }
 
-  /* Modal width and paddings */
   #sgc-modal { width: min(1200px, 96vw); }
-  .sgc-hd{ padding: 14px 18px; }
-  .sgc-title{ font-size: 18px; }
-  .sgc-tabs{ gap: 8px; }
-  .sgc-tab{ padding: 8px 12px; font-size: 14.5px; }
+  .sgc-hd{ padding: 16px 20px; }
+  .sgc-title{ font-size: 19px; }
+  .sgc-tabs{ gap: 10px; }
+  .sgc-tab{ padding: 8px 14px; font-size: 15px; }
 
-  /* Two-column rows and labels */
   .sgc-row{
-    grid-template-columns: 240px 1fr;
-    gap: 14px;
+    grid-template-columns: 220px 1fr;
+    gap: 16px;
     align-items: center;
+    padding: 10px 0;
   }
-  .sgc-row label{ font-size: 14.5px; color:#222; }
+  .sgc-row label{ font-size: 15px; color:#222; }
 
-  /* Inputs / selects / textareas */
   .sgc-row input,
   .sgc-row select,
   .sgc-row textarea{
-    height: 42px;               /* comfortable click target */
-    padding: 10px 12px;
+    min-height: 44px;
+    padding: 10px 14px;
     border-radius: 10px;
-    font-size: 15.5px;
+    font-size: 16px;
   }
-  .sgc-row textarea{ min-height: 90px; }
+  .sgc-row textarea{ min-height: 96px; }
 
-  /* Make compact rows (used in manual ops / shop) wider by default */
   .sgc-row-compact input,
   .sgc-row-compact select{
     min-width: 180px;
   }
 
-  /* Buttons */
   .sgc-btn{
-    min-height: 40px;
-    padding: 0 14px;
+    min-height: 42px;
+    padding: 0 16px;
     border-radius: 10px;
     font-weight: 700;
-    font-size: 14.5px;
+    font-size: 15px;
   }
 
-  /* Cards / help text */
-  .sgc-card{ gap: 12px; border-radius: 14px; }
-  .sgc-help{ font-size: 13.5px; color:#666; }
+  .sgc-card{ gap: 14px; border-radius: 14px; }
+  .sgc-help{ font-size: 14px; color:#666; }
 
-  /* Slightly larger checkboxes */
   #sgc-modal input[type="checkbox"],
   #sgc-modal input[type="radio"]{
-    transform: scale(1.25);
+    transform: scale(1.2);
     transform-origin: center;
     margin-right: 6px;
   }
 
-  /* Tables (history/catalog) */
-  #sgc-modal table{ font-size: 14.5px; }
+  #sgc-modal table{ font-size: 15px; }
   #sgc-modal table th,
-  #sgc-modal table td{ padding: 10px 12px; }
+  #sgc-modal table td{ padding: 12px 14px; }
 
-  /* Numeric fields a bit wider */
-  #sgc-modal input[type="number"]{ width: 120px; }
+  #sgc-modal input[type="number"]{ width: 130px; }
 
-  /* Utility for explicitly wide fields */
   #sgc-modal input[type="text"].wide,
   #sgc-modal select.wide{ min-width: 260px; }
+
+  #sgc-modal .sgc-compact{ align-items: center; }
+  #sgc-modal .sgc-row-compact{ align-items: center; }
+
+  #sgc-modal .sgc-overlay{
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 30;
+  }
+  #sgc-modal .sgc-overlay-card{
+    background: #fff;
+    padding: 20px;
+    border-radius: 14px;
+    width: min(520px, 90%);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    box-shadow: 0 16px 32px rgba(0,0,0,0.18);
+  }
+  #sgc-modal .sgc-overlay-card textarea{
+    width: 100%;
+    min-height: 220px;
+    border: 1px solid #dfe3f0;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 15.5px;
+  }
 </style>
 
-<!-- Optional: simple UI-scale toggle (100% / 110% / 120%) -->
+<!-- Optional: simple UI-scale toggle (90% / 100% / 110% / 125%) -->
 <script>
   (function () {
     const KEY = "sgc.uiScale";
+    const ORDER = [0.9, 1, 1.1, 1.25];
+    const TITLE = "表示サイズ切替（90%/100%/110%/125%）";
     const modal = document.getElementById("sgc-modal");
     if (!modal) return;
 
-    const saved = Number(localStorage.getItem(KEY) || "1");
-    modal.style.zoom = (saved || 1);
+    const savedRaw = Number(localStorage.getItem(KEY));
+    const scale = ORDER.includes(savedRaw) ? savedRaw : 1;
+    modal.style.zoom = String(scale);
 
     const btn = document.createElement("button");
     btn.className = "sgc-btn";
     btn.style.marginLeft = "8px";
-    btn.title = "表示サイズ切替（100%/110%/120%）";
-    btn.textContent = `${Math.round((saved || 1) * 100)}%`;
+    btn.title = TITLE;
+    btn.textContent = `${Math.round(scale * 100)}%`;
 
     btn.onclick = () => {
-      const order = [1, 1.1, 1.2];
-      const next = order[(order.indexOf(saved || 1) + 1) % order.length];
+      const currentRaw = Number(localStorage.getItem(KEY));
+      const current = ORDER.includes(currentRaw) ? currentRaw : scale;
+      const next = ORDER[(ORDER.indexOf(current) + 1) % ORDER.length];
       localStorage.setItem(KEY, String(next));
       location.reload();
     };
@@ -1477,13 +1818,14 @@
 <script>
   (function () {
     const KEY = "sgc.uiScale";
-    const ORDER = [1, 1.1, 1.2];
-    const TITLE = "表示サイズ切替（100%/110%/120%）";
+    const ORDER = [0.9, 1, 1.1, 1.25];
+    const TITLE = "表示サイズ切替（90%/100%/110%/125%）";
 
     function apply(modal) {
       if (!modal) return false;
-      const saved = Number(localStorage.getItem(KEY) || "1") || 1;
-      modal.style.zoom = String(saved);
+      const savedRaw = Number(localStorage.getItem(KEY));
+      const scale = ORDER.includes(savedRaw) ? savedRaw : 1;
+      modal.style.zoom = String(scale);
       const host = modal.querySelector(".sgc-hd .sgc-kv:last-of-type");
       if (!host) return true;
       let btn = host.querySelector(`button[title="${TITLE}"]`);
@@ -1495,15 +1837,15 @@
         btn.style.marginLeft = "8px";
         btn.setAttribute("data-ui-scale-btn", "1");
         btn.addEventListener("click", () => {
-          const current = Number(localStorage.getItem(KEY) || "1") || 1;
-          const idx = ORDER.indexOf(current);
-          const next = ORDER[(idx + 1) % ORDER.length];
+          const currentRaw = Number(localStorage.getItem(KEY));
+          const current = ORDER.includes(currentRaw) ? currentRaw : scale;
+          const next = ORDER[(ORDER.indexOf(current) + 1) % ORDER.length];
           localStorage.setItem(KEY, String(next));
           location.reload();
         });
         host.appendChild(btn);
       }
-      btn.textContent = `${Math.round(saved * 100)}%`;
+      btn.textContent = `${Math.round(scale * 100)}%`;
       return true;
     }
 

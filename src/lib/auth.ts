@@ -6,7 +6,13 @@ export type AnyReq = Request & {
 };
 
 export function tenantFrom(req: AnyReq): string {
-  return String(req.params?.id || req.query?.tenant || "default").trim() || "default";
+  const params = req.params || {};
+  const tenant =
+    params.id ??
+    params.tenant ??
+    req.query?.tenant ??
+    "default";
+  return String(tenant || "default").trim() || "default";
 }
 
 export function getTokenFromHeaders(req: AnyReq): string {

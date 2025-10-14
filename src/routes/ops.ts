@@ -12,7 +12,14 @@ import {
   readLastN,
   writeJson,
 } from "../store/ops.js";
-import type { AuditEvent, OpsLogEntry, ShopItem, XpAdjustment } from "../types/ops.js";
+import { writeLabels } from "../store/labels.js";
+import type {
+  AuditEvent,
+  ManualLogEntry,
+  OpsLogEntry,
+  ShopItem,
+  XpAdjustment,
+} from "../types/ops.js";
 
 export const opsRouter = express.Router();
 export const opsApiRouter = express.Router();
@@ -96,9 +103,73 @@ function shopPath(dir: string) {
 function auditPath(dir: string) {
   return path.join(dir, "audit.jsonl");
 }
+function manualPath(dir: string) {
+  return path.join(dir, "manual.jsonl");
+}
 
 function tenantId(req: Request): string {
   return tenantFrom(req as AnyReq);
+}
+
+function mapTenantParam(req: Request, _res: Response, next: NextFunction) {
+  if ((req.params as any)?.tenant && !(req.params as any).id) {
+    (req.params as any).id = (req.params as any).tenant;
+  }
+  next();
+}
+
+function normalizeUserId(raw: any): string | null {
+  if (raw === null || raw === undefined) return null;
+  const v = String(raw).trim();
+  return v ? v : null;
+}
+
+function normalizeReason(raw: any): string | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const text = String(raw).trim();
+  if (!text) return undefined;
+  return text.length > 512 ? text.slice(0, 512) : text;
+}
+
+function normalizeDelta(value: any, min: number, max: number): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const clamped = Math.trunc(num);
+  if (clamped < min || clamped > max) return null;
+  return clamped;
+}
+
+function parseBulkLabelItems(payload: any): any[] {
+  if (Array.isArray(payload?.items)) return payload.items;
+  const text =
+    typeof payload?.text === "string"
+      ? payload.text
+      : typeof payload?.csv === "string"
+      ? payload.csv
+      : typeof payload?.tsv === "string"
+      ? payload.tsv
+      : "";
+  if (!text.trim()) return [];
+  const lines = text
+    .split(/\r?\n/)
+    .map((line: string) => line.trim())
+    .filter((line: string) => line.length > 0);
+  if (!lines.length) return [];
+  const delimiter = lines.some((line: string) => line.includes("\t")) ? "\t" : ",";
+  const items = [];
+  for (const line of lines) {
+    const cols = line.split(delimiter).map((segment: string) => segment.trim());
+    if (!cols[0]) continue;
+    const xp = cols[2] ? Number(cols[2]) : undefined;
+    items.push({
+      id: cols[0],
+      title: cols[1] || "",
+      xp: Number.isFinite(xp) ? xp : undefined,
+      badge: cols[3] || undefined,
+    });
+  }
+  return items;
 }
 
 function ensureTenantFromBody(req: Request, _res: Response, next: NextFunction) {
@@ -180,6 +251,7 @@ async function recordAdjustment(
     action: auditMeta.action,
     detail: auditMeta.detail ? auditMeta.detail(adjustment) : undefined,
     ip: req.ip,
+    ua: req.get("user-agent") || undefined,
     at: new Date().toISOString(),
   };
   await appendJsonl(auditPath(dir), audit);
@@ -367,6 +439,7 @@ opsRouter.put(
         action: "shop.item.put",
         detail: { count: items.length },
         ip: req.ip,
+        ua: req.get("user-agent") || undefined,
         at: new Date().toISOString(),
       };
       await appendJsonl(auditPath(dir), audit);
@@ -438,6 +511,160 @@ opsRouter.get("/:id/audit", async (req: Request, res: Response) => {
 });
 
 /* ===== New Ops API (tenant via query/body) ===== */
+opsApiRouter.post(
+  "/:tenant/manual-xp",
+  mapTenantParam,
+  requireEditorToken,
+  jsonParser,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      const dir = await ensureTenantDir(tenant);
+      const userId = normalizeUserId(req.body?.userId);
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: "userId-required" });
+      }
+      const deltaXp = normalizeDelta(req.body?.deltaXp ?? req.body?.delta, -100000, 100000);
+      if (deltaXp === null) {
+        return res.status(400).json({ ok: false, error: "deltaXp-invalid" });
+      }
+      const reason = normalizeReason(req.body?.reason);
+      const now = new Date().toISOString();
+      const entry: ManualLogEntry = {
+        id: randomUUID(),
+        tenant,
+        type: "xp",
+        userId,
+        deltaXp,
+        reason,
+        ip: req.ip,
+        ua: req.get("user-agent") || undefined,
+        createdAt: now,
+      };
+      await appendJsonl(manualPath(dir), entry);
+      const audit: AuditEvent = {
+        id: randomUUID(),
+        tenant,
+        actor: actorFrom(req),
+        action: "manual.xp",
+        detail: { userId, deltaXp, reason },
+        ip: req.ip,
+        ua: req.get("user-agent") || undefined,
+        at: now,
+      };
+      await appendJsonl(auditPath(dir), audit);
+      res.json({ ok: true, id: entry.id, createdAt: entry.createdAt });
+    } catch (err: any) {
+      log(`[ops] api.manual-xp error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
+opsApiRouter.post(
+  "/:tenant/manual-level",
+  mapTenantParam,
+  requireEditorToken,
+  jsonParser,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      const dir = await ensureTenantDir(tenant);
+      const userId = normalizeUserId(req.body?.userId);
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: "userId-required" });
+      }
+      const deltaLevel = normalizeDelta(
+        req.body?.deltaLevel ?? req.body?.delta,
+        -1000,
+        1000
+      );
+      if (deltaLevel === null) {
+        return res.status(400).json({ ok: false, error: "deltaLevel-invalid" });
+      }
+      const reason = normalizeReason(req.body?.reason);
+      const now = new Date().toISOString();
+      const entry: ManualLogEntry = {
+        id: randomUUID(),
+        tenant,
+        type: "level",
+        userId,
+        deltaLevel,
+        reason,
+        ip: req.ip,
+        ua: req.get("user-agent") || undefined,
+        createdAt: now,
+      };
+      await appendJsonl(manualPath(dir), entry);
+      const audit: AuditEvent = {
+        id: randomUUID(),
+        tenant,
+        actor: actorFrom(req),
+        action: "manual.level",
+        detail: { userId, deltaLevel, reason },
+        ip: req.ip,
+        ua: req.get("user-agent") || undefined,
+        at: now,
+      };
+      await appendJsonl(auditPath(dir), audit);
+      res.json({ ok: true, id: entry.id, createdAt: entry.createdAt });
+    } catch (err: any) {
+      log(`[ops] api.manual-level error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
+opsApiRouter.post(
+  "/:tenant/labels/bulk",
+  mapTenantParam,
+  requireEditorToken,
+  jsonParser,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      const dir = await ensureTenantDir(tenant);
+      const items = parseBulkLabelItems(req.body);
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ ok: false, error: "items-required" });
+      }
+      const saved = await writeLabels(tenant, { items });
+      const audit: AuditEvent = {
+        id: randomUUID(),
+        tenant,
+        actor: actorFrom(req),
+        action: "labels.bulk.replace",
+        detail: { count: saved.items?.length ?? 0 },
+        ip: req.ip,
+        ua: req.get("user-agent") || undefined,
+        at: new Date().toISOString(),
+      };
+      await appendJsonl(auditPath(dir), audit);
+      res.json({ ok: true, count: saved.items?.length ?? 0 });
+    } catch (err: any) {
+      log(`[ops] api.labels.bulk error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
+opsApiRouter.get(
+  "/:tenant/audit",
+  mapTenantParam,
+  async (req: Request, res: Response) => {
+    try {
+      const tenant = tenantFrom(req as AnyReq);
+      const limit = Math.min(200, clampLimit(req.query?.limit, 100));
+      const dir = await ensureTenantDir(tenant);
+      const events = await readLastN(auditPath(dir), limit);
+      res.json({ items: events.slice(0, limit) });
+    } catch (err: any) {
+      log(`[ops] api.audit.get error: ${err?.message || err}`);
+      res.status(500).json({ ok: false, error: "internal-error" });
+    }
+  }
+);
+
 opsApiRouter.get("/catalog", async (req: Request, res: Response) => {
   try {
     const tenant = tenantFrom(req as AnyReq);
