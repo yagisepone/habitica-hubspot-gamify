@@ -43,23 +43,7 @@ import { opsApiRouter, opsRouter } from "./routes/ops.js";
    - PUT のみトークン必須（GETは公開のまま）
    ========================= */
 
-/* ===== 静的UIの場所を自動検出 =====
-   - prod: dist/public-admin/console.html
-   - dev : src/public-admin/console.html
-   どちらか存在する方を使う。import.meta は使わないので赤線も消えます。
-*/
-function resolvePublicAdminDir(): string {
-  const candidates = [
-    path.resolve(process.cwd(), "dist", "public-admin"),
-    path.resolve(process.cwd(), "src", "public-admin"),
-  ];
-  for (const dir of candidates) {
-    if (fs.existsSync(path.join(dir, "console.html"))) return dir;
-  }
-  // 見つからなくても一番目を返す（あとで 404 になったらログを見る）
-  return candidates[0];
-}
-const PUBLIC_ADMIN_DIR = resolvePublicAdminDir();
+const PUBLIC_ADMIN_DIR = path.join(__dirname, "public-admin");
 
 /* 基本設定 */
 const app = express();
@@ -88,7 +72,16 @@ app.use((req, res, next) => {
 /* ===== 管理ページ（1画面UI）を静的配信 =====
    https://<host>/admin/console/ で console.html を返す
 */
-app.use("/admin/console", express.static(PUBLIC_ADMIN_DIR, { index: "console.html", extensions: ["html"] }));
+app.use(
+  "/admin/console",
+  express.static(PUBLIC_ADMIN_DIR, {
+    index: "console.html",
+    extensions: ["html"],
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "public, max-age=300");
+    },
+  })
+);
 app.get("/admin/console/*", (_req, res) => {
   res.sendFile(path.join(PUBLIC_ADMIN_DIR, "console.html"));
 });
