@@ -15,3 +15,10 @@ javascript:(function(){var d=document,s=d.createElement('script');s.src='https:/
 ```javascript
 javascript:(function(){var d=document,s=d.createElement('script');s.src='https://sales-gamify.onrender.com/i.js?tenant=acme&t='+Date.now();s.crossOrigin='anonymous';(d.head||d.documentElement).appendChild(s);})();
 ```
+
+## Console UI 操作ヒント
+
+- タイトルバー右側のツールバーで Zoom（80–125%）、表示密度（標準/コンパクト）、フォントサイズ（S/M/L）、コントラスト（標準/高）を即時調整できます。設定はテナントごとに保存されます。
+- 各テーブル左上の「⚙ 列」から表示列を切り替え、ヘッダー右端をドラッグして列幅を変更できます。変更内容はタブごとに保存されます。
+- モーダルはヘッダーをドラッグして移動でき、最寄りの四隅へスナップします。右下グリップでリサイズし、位置とサイズは再利用時に復元されます。
+- ショートカット: `Ctrl/Cmd + S` で保存（API保存ボタンと同等）、`Esc` でモーダルを閉じます。

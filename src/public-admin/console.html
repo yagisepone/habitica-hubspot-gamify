@@ -122,13 +122,78 @@
   const apiPOST=async(url,body,p)=> requestJson(url,{method:"POST",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)},p);
   const apiPOSTForm=async(url,form,p)=> requestJson(url,{method:"POST",headers:headers(p),body:form},p);
 
+  const DEFAULT_VIEW_STATE = { zoom: 100, density: "standard", fontSize: "m", contrast: "standard" };
+  let keyboardShortcutsInitialized = false;
+  let modalInteractionInitialized = false;
+
+  function getTenant(){
+    const el = document.querySelector('[name="tenant"],#sgc-tenant,#tenant,select#tenant');
+    if(el && typeof el.value === "string"){
+      const v = el.value.trim();
+      if(v) return v;
+    }
+    try{
+      const prof = loadProfile();
+      if(prof && prof.tenant) return prof.tenant;
+    }catch(_){}
+    return "default";
+  }
+  function storageKey(suffix){
+    return `gamify_${getTenant()}_${suffix}`;
+  }
+  function loadUIState(){
+    try{
+      return JSON.parse(localStorage.getItem(storageKey("ui")) || "{}") || {};
+    }catch(_){
+      return {};
+    }
+  }
+  function mergeState(base, patch){
+    const result = base && typeof base === "object" && !Array.isArray(base) ? { ...base } : {};
+    Object.keys(patch || {}).forEach((key)=>{
+      const value = patch[key];
+      if(value && typeof value === "object" && !Array.isArray(value)){
+        result[key] = mergeState(base && base[key], value);
+      } else {
+        result[key] = value;
+      }
+    });
+    return result;
+  }
+  function saveUIState(partial){
+    try{
+      const current = loadUIState();
+      const next = mergeState(current, partial || {});
+      localStorage.setItem(storageKey("ui"), JSON.stringify(next));
+    }catch(_){}
+  }
+  function getViewState(){
+    const st = loadUIState();
+    return { ...DEFAULT_VIEW_STATE, ...(st.view || {}) };
+  }
+  function setViewState(view){
+    saveUIState({ view: { ...view } });
+  }
+  function updateTablePrefs(tableId, updater){
+    const st = loadUIState();
+    const tablePrefs = { ...(st.tablePrefs || {}) };
+    const current = { hiddenCols: [], widths: {}, ...(tablePrefs[tableId] || {}) };
+    const next = updater ? updater(current) || current : current;
+    tablePrefs[tableId] = { hiddenCols: Array.from(new Set(next.hiddenCols || [])), widths: { ...(next.widths || {}) } };
+    saveUIState({ tablePrefs });
+  }
+  function getTablePrefs(tableId){
+    const st = loadUIState();
+    const prefs = st.tablePrefs || {};
+    return { hiddenCols: [], widths: {}, ...(prefs[tableId] || {}) };
+  }
+
   /* ====== スタイル（オリジナル + 使い勝手改良） ====== */
   GM_addStyle(`
     #sgc-fab{position:fixed; top:110px; right:18px; z-index:2147483646;
       background:#6c5ce7; color:#fff; border-radius:14px; padding:10px 14px;
       box-shadow:0 6px 18px rgba(0,0,0,.25); font-weight:700; display:flex; gap:8px; align-items:center; cursor:pointer; user-select:none}
     #sgc-fab:hover{filter:brightness(1.06)}
-    #sgc-modal-mask{position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:2147483645; display:none}
     #sgc-modal{position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
       z-index:2147483646; width:min(1160px,96vw); max-height:88vh; background:#fff; border-radius:14px;
       overflow:hidden; box-shadow:0 24px 48px rgba(0,0,0,.25); display:none;
@@ -139,7 +204,7 @@
     .sgc-tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid #f1f1f6;flex-wrap:wrap}
     .sgc-tab{padding:6px 10px;border-radius:8px;font-weight:700;color:#555;cursor:pointer}
     .sgc-tab.active{background:#6c5ce7;color:#fff}
-    .sgc-body{padding:14px;max-height:calc(88vh - 134px);overflow:auto}
+    .sgc-body{padding:14px;}
     .sgc-row{display:grid;grid-template-columns:220px 1fr;gap:12px;align-items:center;padding:8px 0}
     .sgc-row input,.sgc-row select,.sgc-row textarea{border:1px solid #dfe3f0;border-radius:8px;padding:9px 10px;width:100%;font-size:14px;background:#fff}
     .sgc-help{font-size:12px;color:#777}
@@ -204,6 +269,49 @@
     .sgc-row input:focus,.sgc-row select:focus,.sgc-row textarea:focus{
       outline:2px solid #6c5ce7; outline-offset:1px;
     }
+
+    /* --- enhanced modal and view controls --- */
+    #sgc-modal{position:fixed;inset:0;top:auto;left:auto;transform:none;background:rgba(0,0,0,.35);z-index:2147483647;display:none;}
+    #sgc-modal.is-open{display:block;}
+    #sgc-shell{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(940px,94vw);height:min(680px,92vh);background:#fff;border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.35);overflow:hidden;display:flex;flex-direction:column;}
+    #sgc-titlebar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #eee;background:#fff;cursor:move;}
+    #sgc-titlebar .spacer{flex:1}
+    #sgc-toolbar{display:flex;align-items:center;gap:12px;font-size:12px;cursor:auto;}
+    #sgc-toolbar label{display:flex;align-items:center;gap:6px;color:#666;white-space:nowrap;}
+    #sgc-toolbar input,#sgc-toolbar select{font-size:12px}
+    #sgc-header-controls{display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px;align-items:center;border-bottom:1px solid #f1f1f6;background:#fafbff;}
+    #sgc-header-controls label{font-size:12px;color:#666}
+    #sgc-header-controls input{height:32px;border-radius:8px;padding:6px 8px;border:1px solid #dfe3f0}
+    #sgc-header-controls .sgc-btn{height:32px;padding:0 12px;}
+    #sgc-header-controls .sgc-pin-toggle{font-size:12px;}
+    #sgc-content-wrap{position:relative;width:100%;flex:1;overflow:auto;padding:12px;}
+    #sgc-content{position:relative;width:100%;transform-origin:top left;}
+    #sgc-body{width:100%;}
+    #sgc-resizer{position:absolute;right:6px;bottom:6px;width:10px;height:10px;border-right:2px solid #bbb;border-bottom:2px solid #bbb;cursor:se-resize;opacity:.8}
+    .density-compact .sgc-row{padding:6px 0;}
+    .density-compact .sgc-table td,.density-compact .sgc-table th{padding:6px 8px}
+    .font-s{font-size:12px}
+    .font-m{font-size:14px}
+    .font-l{font-size:16px}
+    .contrast-high{color:#111;background:#fff}
+    .contrast-high .sgc-card{border-color:#cbd5f5}
+    .contrast-high .sgc-tabs{background:#f5f7ff}
+    .contrast-high .sgc-body{background:#fff}
+    #sgc-tabs{position:sticky;top:0;background:#fff;z-index:2}
+    table.sgc-table thead{position:sticky;top:0;background:inherit;z-index:1}
+    .th-resize{position:relative}
+    .th-resize .resizer{position:absolute;top:0;right:0;width:6px;height:100%;cursor:col-resize;background:transparent}
+    .column-menu{position:absolute;top:100%;right:0;background:#fff;border:1px solid #ddd;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:8px;z-index:3;min-width:180px;display:flex;flex-direction:column;gap:4px;}
+    .column-menu label{display:flex;align-items:center;gap:6px;font-size:12px;color:#444;}
+    .sgc-table-controls{display:flex;justify-content:flex-end;gap:8px;margin:4px 0;position:relative;}
+    .sgc-table-controls .sgc-columns-btn{background:#f3f4ff;border:none;border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;}
+    .sgc-table-controls .sgc-columns-btn:hover{background:#e4e7ff;}
+    #sgc-content-wrap::-webkit-scrollbar{width:10px;height:10px}
+    #sgc-content-wrap::-webkit-scrollbar-thumb{background:#ccc;border-radius:8px}
+    @media (max-width: 900px){
+      #sgc-toolbar{flex-wrap:wrap;row-gap:8px}
+      #sgc-titlebar{flex-wrap:wrap;cursor:default;}
+    }
   `);
 
   /* ====== 固定ボタン ====== */
@@ -264,45 +372,69 @@
   let profile={}, currentTab="score", rulesCache=null, labelsCache=null;
   let adjustmentsCache=[], shopItemsCache=[], auditCache=[];
   let fabObserver=null;
-  let modal, bodyArea;
+  let modal, shell, bodyArea, contentScroll;
 
   function ensureModal(){
-    if(document.getElementById("sgc-modal")) return;
-
-    document.body.appendChild(h(`<div id="sgc-modal-mask"></div>`));
+    if(document.getElementById("sgc-modal")){
+      modal = document.getElementById("sgc-modal");
+      shell = modal.querySelector("#sgc-shell");
+      bodyArea = modal.querySelector("#sgc-body");
+      contentScroll = modal.querySelector("#sgc-content-wrap");
+      return;
+    }
 
     modal = h(`
       <div id="sgc-modal" role="dialog" aria-modal="true" aria-label="Sales Gamify Console">
-        <div class="sgc-hd">
-          <div class="sgc-kv"><div class="sgc-title">Sales Gamify Console</div><span class="sgc-badge">UI全XP編集+CSV</span></div>
-          <div class="sgc-kv">
-            <label style="font-size:12px;color:#666">Tenant:</label>
-            <input id="sgc-tenant" style="width:180px" placeholder="default">
-            <label style="font-size:12px;color:#666">BaseURL:</label>
-            <input id="sgc-base" style="width:300px" placeholder="https://sales-gamify.onrender.com">
-            <label style="font-size:12px;color:#666">Token:</label>
-            <input id="sgc-token" style="width:240px" placeholder="(Bearer不要)">
+        <div id="sgc-shell">
+          <div id="sgc-titlebar">
+            <div class="sgc-kv">
+              <div class="sgc-title">Sales Gamify Console</div>
+              <span class="sgc-badge">UI全XP編集+CSV</span>
+            </div>
+            <div class="spacer"></div>
+            <div id="sgc-toolbar"></div>
+            <button id="sgc-close" class="sgc-btn">閉じる</button>
+          </div>
+          <div id="sgc-header-controls">
+            <label>Tenant:</label>
+            <input id="sgc-tenant" style="width:160px" placeholder="default">
+            <label>BaseURL:</label>
+            <input id="sgc-base" style="width:260px" placeholder="https://sales-gamify.onrender.com">
+            <label>Token:</label>
+            <input id="sgc-token" style="width:220px" placeholder="(Bearer不要)">
             <label class="sgc-pin-toggle"><input id="sgc-pin" type="checkbox"> 常時表示</label>
             <button id="sgc-ping" class="sgc-btn">Ping</button>
             <button id="sgc-save-top" class="sgc-btn primary">保存</button>
-            <button id="sgc-close" class="sgc-btn">閉じる</button>
           </div>
-        </div>
-        <div class="sgc-tabs" id="sgc-tabs"></div>
-        <div id="sgc-body" class="sgc-body"></div>
-        <div class="sgc-actions">
-          <button id="sgc-save" class="sgc-btn primary">保存</button>
+          <div id="sgc-tabs" class="sgc-tabs"></div>
+          <div id="sgc-content-wrap">
+            <div id="sgc-content">
+              <div id="sgc-body" class="sgc-body"></div>
+            </div>
+          </div>
+          <div class="sgc-actions">
+            <button id="sgc-save" class="sgc-btn primary">保存</button>
+          </div>
+          <div id="sgc-resizer"></div>
         </div>
       </div>
     `);
     document.body.appendChild(modal);
-
+    shell = modal.querySelector("#sgc-shell");
     bodyArea = modal.querySelector("#sgc-body");
-    modal.querySelector("#sgc-ping").addEventListener("click", doPing);
-    modal.querySelector("#sgc-close").addEventListener("click", closeModal);
-    modal.querySelector("#sgc-save").addEventListener("click", saveAll);
-    modal.querySelector("#sgc-save-top").addEventListener("click", saveAll);
-    modal.querySelector("#sgc-pin").addEventListener("change", (e)=>{
+    contentScroll = modal.querySelector("#sgc-content-wrap");
+
+    const closeBtn = modal.querySelector("#sgc-close");
+    const pingBtn = modal.querySelector("#sgc-ping");
+    const saveBtn = modal.querySelector("#sgc-save");
+    const saveTopBtn = modal.querySelector("#sgc-save-top");
+    const pinToggle = modal.querySelector("#sgc-pin");
+
+    pingBtn?.addEventListener("click", doPing);
+    saveBtn?.addEventListener("click", saveAll);
+    saveTopBtn?.addEventListener("click", saveAll);
+    closeBtn?.addEventListener("click", closeModal);
+    pinToggle?.addEventListener("change", (e)=>{
       const flag = !!e.target.checked;
       setPinned(flag);
       if(flag){ toast("設定ボタンを常時表示にしました"); }
@@ -311,28 +443,473 @@
     });
     ["#sgc-tenant","#sgc-base","#sgc-token"].forEach(sel=>{
       modal.querySelector(sel)?.addEventListener("input", ()=> ensureProfileFromInputs());
-      modal.querySelector(sel)?.addEventListener("change", ()=> ensureProfileFromInputs());
+      modal.querySelector(sel)?.addEventListener("change", ()=> {
+        ensureProfileFromInputs();
+        applyViewState();
+        initViewControls(); // rebuild to reflect tenant-specific state
+      });
     });
-    document.addEventListener("keydown",(e)=>{ if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="s"){ e.preventDefault(); saveAll(); }});
-    document.getElementById("sgc-modal-mask").addEventListener("click", closeModal);
+
+    modal.addEventListener("pointerdown",(e)=>{
+      if(e.target === modal){
+        closeModal();
+      }
+    });
+
+    initKeyboardShortcuts();
+    initModalInteractions();
+  }
+
+  const MODAL_MARGIN = 16;
+  const MODAL_MIN_WIDTH = 640;
+  const MODAL_MIN_HEIGHT = 420;
+
+  function ensureShellAbsolute(){
+    if(!shell) return;
+    const rect = shell.getBoundingClientRect();
+    shell.style.transform = "translate(0,0)";
+    shell.style.left = `${Math.round(rect.left)}px`;
+    shell.style.top = `${Math.round(rect.top)}px`;
+  }
+
+  function ensureShellWithinViewport(persist=false){
+    if(!shell) return;
+    ensureShellAbsolute();
+    const margin = MODAL_MARGIN;
+    const rect = shell.getBoundingClientRect();
+    const availWidth = Math.max(260, window.innerWidth - margin * 2);
+    const availHeight = Math.max(260, window.innerHeight - margin * 2);
+    const minWidth = Math.min(MODAL_MIN_WIDTH, availWidth);
+    const minHeight = Math.min(MODAL_MIN_HEIGHT, availHeight);
+    const width = clamp(rect.width, minWidth, availWidth);
+    const height = clamp(rect.height, minHeight, availHeight);
+    shell.style.width = `${Math.round(width)}px`;
+    shell.style.height = `${Math.round(height)}px`;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    const left = clamp(rect.left, margin, maxLeft);
+    const top = clamp(rect.top, margin, maxTop);
+    shell.style.left = `${Math.round(left)}px`;
+    shell.style.top = `${Math.round(top)}px`;
+    shell.style.transform = "translate(0,0)";
+    if(persist){
+      saveUIState({
+        modal: {
+          x: Math.round(left),
+          y: Math.round(top),
+          width: Math.round(width),
+          height: Math.round(height),
+        },
+      });
+    }
+    return { left, top, width, height };
+  }
+
+  function applyModalState(){
+    if(!shell) return;
+    const stored = loadUIState().modal || {};
+    const hasSize = Number.isFinite(stored.width) && Number.isFinite(stored.height);
+    if(hasSize){
+      ensureShellAbsolute();
+      if(Number.isFinite(stored.width)) shell.style.width = `${Math.round(stored.width)}px`;
+      if(Number.isFinite(stored.height)) shell.style.height = `${Math.round(stored.height)}px`;
+      if(Number.isFinite(stored.x) && Number.isFinite(stored.y)){
+        shell.style.left = `${Math.round(stored.x)}px`;
+        shell.style.top = `${Math.round(stored.y)}px`;
+        shell.style.transform = "translate(0,0)";
+      }
+      ensureShellWithinViewport(true);
+    } else {
+      shell.style.width = "";
+      shell.style.height = "";
+      shell.style.left = "50%";
+      shell.style.top = "50%";
+      shell.style.transform = "translate(-50%,-50%)";
+      setTimeout(()=>ensureShellWithinViewport(false),0);
+    }
+  }
+
+  function initModalInteractions(){
+    if(modalInteractionInitialized) return;
+    if(!shell) return;
+    const titlebar = document.getElementById("sgc-titlebar");
+    const resizer = document.getElementById("sgc-resizer");
+    if(!titlebar || !resizer) return;
+    modalInteractionInitialized = true;
+
+    titlebar.addEventListener("pointerdown",(e)=>{
+      if(e.button !== undefined && e.button !== 0) return;
+      if(e.target.closest("#sgc-toolbar") || e.target.closest("#sgc-close")) return;
+      ensureShellAbsolute();
+      const startRect = shell.getBoundingClientRect();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const pointerId = e.pointerId;
+      function move(ev){
+        if(pointerId !== undefined && ev.pointerId !== pointerId) return;
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        const margin = MODAL_MARGIN;
+        const width = startRect.width;
+        const height = startRect.height;
+        const x = clamp(startRect.left + dx, margin, Math.max(margin, window.innerWidth - width - margin));
+        const y = clamp(startRect.top + dy, margin, Math.max(margin, window.innerHeight - height - margin));
+        shell.style.left = `${Math.round(x)}px`;
+        shell.style.top = `${Math.round(y)}px`;
+        shell.style.transform = "translate(0,0)";
+      }
+      function up(ev){
+        if(pointerId !== undefined && ev.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        (()=>{
+          const rect = shell.getBoundingClientRect();
+          const margin = MODAL_MARGIN;
+          const distLeft = rect.left - margin;
+          const distRight = window.innerWidth - rect.right - margin;
+          const distTop = rect.top - margin;
+          const distBottom = window.innerHeight - rect.bottom - margin;
+          const snapLeft = distLeft <= distRight;
+          const snapTop = distTop <= distBottom;
+          const width = rect.width;
+          const height = rect.height;
+          const x = snapLeft ? margin : Math.max(margin, window.innerWidth - width - margin);
+          const y = snapTop ? margin : Math.max(margin, window.innerHeight - height - margin);
+          shell.style.left = `${Math.round(x)}px`;
+          shell.style.top = `${Math.round(y)}px`;
+          shell.style.transform = "translate(0,0)";
+          ensureShellWithinViewport(true);
+        })();
+      }
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once:true });
+    });
+
+    resizer.addEventListener("pointerdown",(e)=>{
+      if(e.button !== undefined && e.button !== 0) return;
+      e.preventDefault();
+      ensureShellAbsolute();
+      const startRect = shell.getBoundingClientRect();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const pointerId = e.pointerId;
+      function move(ev){
+        if(pointerId !== undefined && ev.pointerId !== pointerId) return;
+        const margin = MODAL_MARGIN;
+        const availWidth = Math.max(260, window.innerWidth - margin * 2);
+        const availHeight = Math.max(260, window.innerHeight - margin * 2);
+        const minWidth = Math.min(MODAL_MIN_WIDTH, availWidth);
+        const minHeight = Math.min(MODAL_MIN_HEIGHT, availHeight);
+        let width = startRect.width + (ev.clientX - startX);
+        let height = startRect.height + (ev.clientY - startY);
+        width = clamp(width, minWidth, availWidth);
+        height = clamp(height, minHeight, availHeight);
+        shell.style.width = `${Math.round(width)}px`;
+        shell.style.height = `${Math.round(height)}px`;
+      }
+      function up(ev){
+        if(pointerId !== undefined && ev.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        ensureShellWithinViewport(true);
+      }
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once:true });
+    });
+
+    window.addEventListener("resize", ()=>{
+      if(modal && modal.classList.contains("is-open")){
+        ensureShellWithinViewport(true);
+      }
+    });
+  }
+
+  function initKeyboardShortcuts(){
+    if(keyboardShortcutsInitialized) return;
+    keyboardShortcutsInitialized = true;
+    window.addEventListener("keydown",(e)=>{
+      if(!modal || !modal.classList.contains("is-open")) return;
+      if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="s"){
+        e.preventDefault();
+        saveAll();
+      } else if(e.key === "Escape"){
+        e.preventDefault();
+        closeModal();
+      }
+    });
+  }
+
+  function applyViewState(view){
+    const state = { ...DEFAULT_VIEW_STATE, ...(view || {}) };
+    const content = document.getElementById("sgc-content");
+    const wrap = document.getElementById("sgc-content-wrap");
+    if(!content || !wrap) return state;
+    const zoom = clamp(Number(state.zoom) || 100, 80, 125);
+    content.style.transform = `scale(${zoom / 100})`;
+    ["density-compact"].forEach(cls => content.classList.remove(cls));
+    if(state.density === "compact"){
+      content.classList.add("density-compact");
+    }
+    ["font-s","font-m","font-l"].forEach(cls=>content.classList.remove(cls));
+    content.classList.add(`font-${state.fontSize || "m"}`);
+    content.classList.toggle("contrast-high", state.contrast === "high");
+    return state;
+  }
+
+  function initViewControls(){
+    const toolbar = document.getElementById("sgc-toolbar");
+    const content = document.getElementById("sgc-content");
+    const wrap = document.getElementById("sgc-content-wrap");
+    if(!toolbar || !content || !wrap) return;
+    toolbar.innerHTML = "";
+    let current = getViewState();
+    applyViewState(current);
+
+    function wrapCtl(label, node){
+      const el = document.createElement("label");
+      el.textContent = label;
+      el.appendChild(node);
+      return el;
+    }
+    function commit(update){
+      current = { ...current, ...update };
+      setViewState(current);
+      applyViewState(current);
+    }
+
+    const zoomInput = document.createElement("input");
+    zoomInput.type = "range";
+    zoomInput.min = "80";
+    zoomInput.max = "125";
+    zoomInput.step = "5";
+    zoomInput.value = String(current.zoom);
+    const zoomLabel = document.createElement("span");
+    zoomLabel.textContent = `${current.zoom}%`;
+    zoomInput.addEventListener("input",()=>{
+      zoomLabel.textContent = `${zoomInput.value}%`;
+      applyViewState({ ...current, zoom: Number(zoomInput.value) });
+    });
+    zoomInput.addEventListener("change",()=>{
+      commit({ zoom: Number(zoomInput.value) });
+    });
+    toolbar.appendChild(wrapCtl("Zoom", zoomInput));
+    toolbar.appendChild(zoomLabel);
+
+    const density = document.createElement("select");
+    [["standard","標準"],["compact","コンパクト"]].forEach(([value,label])=>{
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = label;
+      density.appendChild(opt);
+    });
+    density.value = current.density;
+    density.addEventListener("change",()=>{
+      commit({ density: density.value });
+    });
+    toolbar.appendChild(wrapCtl("Density", density));
+
+    const font = document.createElement("select");
+    [["s","S"],["m","M"],["l","L"]].forEach(([value,label])=>{
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = label;
+      font.appendChild(opt);
+    });
+    font.value = current.fontSize;
+    font.addEventListener("change",()=>{
+      commit({ fontSize: font.value });
+    });
+    toolbar.appendChild(wrapCtl("Font", font));
+
+    const contrast = document.createElement("select");
+    [["standard","標準"],["high","高"]].forEach(([value,label])=>{
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = label;
+      contrast.appendChild(opt);
+    });
+    contrast.value = current.contrast;
+    contrast.addEventListener("change",()=>{
+      commit({ contrast: contrast.value });
+    });
+    toolbar.appendChild(wrapCtl("Contrast", contrast));
+  }
+
+  function enhanceTablesAfterRender(){
+    if(!bodyArea) return;
+    const tables = bodyArea.querySelectorAll("table");
+    tables.forEach((table, index)=>{
+      const explicit = table.getAttribute("data-table-id") || table.id || "";
+      const tableId = explicit ? explicit : `${currentTab}-table-${index}`;
+      enhanceTable(table, tableId);
+    });
+  }
+
+  function enhanceTable(table, tableId){
+    if(!table) return;
+    const head = table.querySelector("thead");
+    if(!head) return;
+    const ths = head.querySelectorAll("th");
+    if(!ths.length) return;
+    const columnKeys = [];
+    const columnLabels = [];
+
+    ths.forEach((th, index)=>{
+      let key = th.dataset.sgcColumnKey;
+      if(!key){
+        const raw = th.dataset.key || th.dataset.field || th.dataset.column || th.getAttribute("id") || (th.textContent || "").trim();
+        key = (raw || `col${index}`).replace(/\s+/g,"_").toLowerCase();
+        if(columnKeys.includes(key)){
+          key = `${key}_${index}`;
+        }
+        th.dataset.sgcColumnKey = key;
+      }
+      columnKeys.push(key);
+      columnLabels.push((th.textContent || key).trim() || key);
+      th.classList.add("th-resize");
+      if(!th.querySelector(".resizer")){
+        const resizer = document.createElement("div");
+        resizer.className = "resizer";
+        th.appendChild(resizer);
+        resizer.addEventListener("pointerdown",(e)=>{
+          if(e.button !== undefined && e.button !== 0) return;
+          e.preventDefault();
+          const startWidth = th.getBoundingClientRect().width;
+          const startX = e.clientX;
+          const pointerId = e.pointerId;
+          function move(ev){
+            if(pointerId !== undefined && ev.pointerId !== pointerId) return;
+            const delta = ev.clientX - startX;
+            const width = Math.max(60, startWidth + delta);
+            th.style.width = `${Math.round(width)}px`;
+          }
+          function up(ev){
+            if(pointerId !== undefined && ev.pointerId !== pointerId) return;
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", up);
+            const width = Math.round(th.getBoundingClientRect().width);
+            updateTablePrefs(tableId,(pref)=>{
+              const next = { hiddenCols: Array.from(pref.hiddenCols || []), widths: { ...(pref.widths || {}) } };
+              next.widths[key] = width;
+              return next;
+            });
+          }
+          window.addEventListener("pointermove", move);
+          window.addEventListener("pointerup", up, { once:true });
+        });
+      }
+    });
+
+    table.dataset.sgcEnhanced = "1";
+    table.dataset.sgcTableId = tableId;
+
+    function setColumnVisibility(key, index, visible){
+      const cells = table.querySelectorAll(`tr > *:nth-child(${index + 1})`);
+      cells.forEach((cell)=>{
+        cell.style.display = visible ? "" : "none";
+      });
+    }
+
+    function applyPrefs(){
+      const latest = getTablePrefs(tableId);
+      ths.forEach((th, index)=>{
+        const key = th.dataset.sgcColumnKey;
+        if(!key) return;
+        if(latest.widths && Number.isFinite(latest.widths[key])){
+          th.style.width = `${Math.round(latest.widths[key])}px`;
+        }
+        const hidden = Array.isArray(latest.hiddenCols) && latest.hiddenCols.includes(key);
+        setColumnVisibility(key, index, !hidden);
+      });
+    }
+
+    let controls = table.previousElementSibling;
+    if(!controls || !(controls.dataset && controls.dataset.sgcTableControls === tableId)){
+      controls = document.createElement("div");
+      controls.dataset.sgcTableControls = tableId;
+      controls.className = "sgc-table-controls";
+      controls.style.display = "flex";
+      controls.style.justifyContent = "flex-end";
+      controls.style.margin = "4px 0";
+      controls.style.position = "relative";
+      table.parentElement?.insertBefore(controls, table);
+    } else {
+      controls.innerHTML = "";
+    }
+
+    const gear = document.createElement("button");
+    gear.type = "button";
+    gear.textContent = "⚙ 列";
+    gear.className = "sgc-btn sgc-columns-btn";
+    gear.style.fontSize = "12px";
+    controls.appendChild(gear);
+
+    let menu=null;
+    function closeMenu(){
+      if(menu){
+        menu.remove();
+        menu=null;
+      }
+    }
+    gear.addEventListener("click",(e)=>{
+      e.stopPropagation();
+      if(menu){
+        closeMenu();
+        return;
+      }
+      const latest = getTablePrefs(tableId);
+      menu = document.createElement("div");
+      menu.className = "column-menu";
+      columnKeys.forEach((key, index)=>{
+        const row = document.createElement("label");
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !(latest.hiddenCols || []).includes(key);
+        cb.addEventListener("change",()=>{
+          const visible = cb.checked;
+          setColumnVisibility(key, index, visible);
+          updateTablePrefs(tableId,(pref)=>{
+            const next = { hiddenCols: Array.from(pref.hiddenCols || []), widths: { ...(pref.widths || {}) } };
+            if(visible){
+              next.hiddenCols = next.hiddenCols.filter((v)=>v!==key);
+            }else if(!next.hiddenCols.includes(key)){
+              next.hiddenCols.push(key);
+            }
+            return next;
+          });
+        });
+        row.appendChild(cb);
+        const labelText = document.createElement("span");
+        labelText.textContent = ` ${columnLabels[index]}`;
+        row.appendChild(labelText);
+        menu.appendChild(row);
+      });
+      controls.appendChild(menu);
+      setTimeout(()=>document.addEventListener("click", closeMenu, { once:true }),0);
+    });
+
+    applyPrefs();
   }
 
   function openModal(){
     ensureModal();
     syncFabState();
     profile=loadProfile();
-    document.getElementById("sgc-modal-mask").style.display="block";
-    modal.style.display="block";
+    modal.classList.add("is-open");
     modal.querySelector("#sgc-tenant").value=profile.tenant||"default";
     modal.querySelector("#sgc-base").value=profile.baseUrl||"";
     modal.querySelector("#sgc-token").value=profile.token||"";
     ensureProfileFromInputs();
+    applyModalState();
+    applyViewState();
+    initViewControls();
     initTabs();
     loadAll();
   }
   function closeModal(){
-    modal.style.display="none";
-    document.getElementById("sgc-modal-mask").style.display="none";
+    if(modal){
+      modal.classList.remove("is-open");
+    }
   }
 
   function initTabs(){
@@ -426,6 +1003,8 @@
     else if(currentTab==="adjust") renderAdjust();
     else if(currentTab==="shop") renderShop();
     else if(currentTab==="audit") renderAudit();
+    enhanceTablesAfterRender();
+    applyViewState();
   }
 
   function safeRules(){
