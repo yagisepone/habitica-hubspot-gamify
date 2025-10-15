@@ -44,6 +44,7 @@ import { opsApiRouter, opsRouter } from "./routes/ops.js";
    ========================= */
 
 const PUBLIC_ADMIN_DIR = path.join(__dirname, "public-admin");
+const PUBLIC_DIR = path.join(__dirname, "public");
 
 /* 基本設定 */
 const app = express();
@@ -72,6 +73,26 @@ app.use((req, res, next) => {
 /* ===== 管理ページ（1画面UI）を静的配信 =====
    https://<host>/admin/console/ で console.html を返す
 */
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "https://habitica.com");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  next();
+});
+
+app.use(
+  express.static(PUBLIC_DIR, {
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "public, max-age=60");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    },
+  })
+);
+
+app.get("/t/:tenant", (req, res) => {
+  res.redirect(302, `/i.js?tenant=${encodeURIComponent(req.params.tenant)}`);
+});
+
 app.use(
   "/admin/console",
   express.static(PUBLIC_ADMIN_DIR, {
@@ -79,6 +100,7 @@ app.use(
     extensions: ["html"],
     setHeaders(res) {
       res.setHeader("Cache-Control", "public, max-age=300");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     },
   })
 );
