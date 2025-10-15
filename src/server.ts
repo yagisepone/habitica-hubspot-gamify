@@ -80,6 +80,11 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get("/admin/console/i.js", (_req, res) => {
+  res.type("application/javascript");
+  res.sendFile(path.join(ADMIN_STATIC_DIR, "i.js"));
+});
+
 app.get("/i.js", (_req, res) => {
   res.type("application/javascript");
   res.sendFile(path.join(ADMIN_STATIC_DIR, "i.js"));
