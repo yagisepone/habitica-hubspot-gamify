@@ -1,26 +1,27 @@
-/* Sales Gamify – Injector (top-right fixed, robust open)
- * - 右上固定の「設定」ボタン（1個だけ）
- * - クリックでモーダル表示（iframe）
- * - iframe が X-Frame-Options/CSP でブロックされたら、別タブで自動オープン + ガイダンス表示
+/* Sales Gamify – Habitica header native button injector
+ * - Habiticaのヘッダー右上アイコン列に“歯車アイコン”を一個だけ追加（非固定・非被り）
+ * - SPA遷移でも自動復活（MutationObserver）
+ * - クリックで埋め込みモーダル。ブロック時は自動で別タブ
  * - BaseURL: UI保存 > ?base > 既定
  */
 (function () {
-  if (window.__SG_INJECTED__) return;            // 多重注入ガード
+  if (window.__SG_INJECTED__) return;
   window.__SG_INJECTED__ = true;
 
-  const BTN_ID    = 'sg-settings-btn';
+  const BTN_ID    = 'sg-header-gear';
   const MODAL_ID  = 'sg-console-modal';
   const IFRAME_ID = 'sg-console-iframe';
+  const DEFAULT_BASE = 'https://sales-gamify.onrender.com';
 
   // ---------- BaseURL ----------
-  function getSavedBase() {
+  const getSavedBase = () => {
     try {
       const v = localStorage.getItem('gamify_base_url');
       if (v && /^https?:\/\//.test(v)) return v.trim();
     } catch {}
     return '';
-  }
-  function getParamBase() {
+  };
+  const getParamBase = () => {
     try {
       const self = document.currentScript || document.querySelector('script[src*="injector.js"]');
       const u = new URL(self ? self.src : location.href);
@@ -28,49 +29,79 @@
       if (q && /^https?:\/\//.test(q)) return q.trim();
     } catch {}
     return '';
-  }
-  const DEFAULT_BASE = 'https://sales-gamify.onrender.com';
+  };
   const BASE_URL = getSavedBase() || getParamBase() || DEFAULT_BASE;
 
-  // ---------- utils ----------
-  const doc = document;
-  const $ = (id) => doc.getElementById(id);
+  // ---------- DOM utils ----------
+  const $id = (id) => document.getElementById(id);
 
-  // ---------- 右上固定ボタン ----------
-  function ensureButton() {
-    let b = $(BTN_ID);
-    if (b) return b;
+  // Habitica のヘッダー右上“アイコン群”を推定して返す
+  const findHeaderActions = () => {
+    // できるだけ狭い→広い順に探索
+    const candidates = [
+      // 新UI/旧UIでよくあるパターン
+      '.header .actions, .header-actions',
+      '.navbar .navbar-right, .nav .navbar-right',
+      '[class*="Header"] [class*="actions"]',
+      '#app header [class*="right"]',
+      'header [class*="icon"], header [class*="actions"]',
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el && el.querySelector('svg, button, a, span')) return el;
+    }
+    // 最後の保険（ヘッダー全体）
+    return document.querySelector('header') || null;
+  };
 
-    b = doc.createElement('button');
-    b.id = BTN_ID;
-    b.textContent = '設定';
-    Object.assign(b.style, {
-      position: 'fixed',
-      top: '12px',           // ★右上固定
-      right: '16px',
-      zIndex: 2147483647,
-      padding: '8px 12px',
-      border: 'none',
-      borderRadius: '12px',
-      boxShadow: '0 6px 18px rgba(0,0,0,.20)',
-      background: '#6c5ce7',
-      color: '#fff',
-      fontSize: '13px',
-      lineHeight: '1',
-      cursor: 'pointer'
+  // ヘッダーに歯車ボタンを“溶け込む形で”追加
+  const ensureHeaderGear = () => {
+    if ($id(BTN_ID)) return true;
+    const container = findHeaderActions();
+    if (!container) return false;
+
+    const btn = document.createElement('button');
+    btn.id = BTN_ID;
+    btn.type = 'button';
+    btn.title = 'Sales Gamify 設定';
+    btn.setAttribute('aria-label', 'Sales Gamify 設定');
+
+    // 見た目は既存の丸アイコンに寄せる（継承 + 最小限の上書き）
+    Object.assign(btn.style, {
+      all: 'unset',
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: '32px',
+      height: '32px',
+      marginLeft: '8px',
+      borderRadius: '50%',
+      cursor: 'pointer',
+      color: 'inherit',              // 既存色を継承
     });
-    b.addEventListener('click', openConsole, { passive: true });
-    (doc.body || doc.documentElement).appendChild(b);
-    return b;
-  }
+    btn.onmouseover = () => (btn.style.background = 'rgba(0,0,0,.07)');
+    btn.onmouseout  = () => (btn.style.background = 'transparent');
 
-  // ---------- モーダル ----------
+    // 歯車SVG（小さめ）
+    btn.innerHTML = `
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm9.94 3.06-.98-.28a8 8 0 0 0-.7-1.69l.6-.82a1 1 0 0 0-.12-1.28l-1.57-1.57a1 1 0 0 0-1.28-.12l-.82.6a8 8 0 0 0-1.69-.7l-.28-.98A1 1 0 0 0 12 2h-2a1 1 0 0 0-.96.72l-.28.98a8 8 0 0 0-1.69.7l-.82-.6a1 1 0 0 0-1.28.12L2.4 6.49a1 1 0 0 0-.12 1.28l.6.82a8 8 0 0 0-.7 1.69l-.98.28A1 1 0 0 0 1 12v2c0 .46.31.86.76.98l.98.28c.15.58.38 1.14.7 1.69l-.6.82a1 1 0 0 0 .12 1.28l1.57 1.57a1 1 0 0 0 1.28.12l.82-.6c.55.32 1.11.55 1.69.7l.28.98c.12.45.52.76.98.76h2c.46 0 .86-.31.98-.76l.28-.98c.58-.15 1.14-.38 1.69-.7l.82.6a1 1 0 0 0 1.28-.12l1.57-1.57a1 1 0 0 0 .12-1.28l-.6-.82c.32-.55.55-1.11.7-1.69l.98-.28c.45-.12.76-.52.76-.98v-2c0-.46-.31-.86-.76-.98Z"/>
+      </svg>
+    `;
+
+    btn.addEventListener('click', openConsole, { passive: true });
+
+    // 右端に自然に並ぶよう最後に追加
+    container.appendChild(btn);
+    return true;
+  };
+
+  // モーダル（iframe）を開く。ブロック時は自動で別タブ
   function openConsole() {
-    // 既に開いてたら前面へ
-    const ex = $(MODAL_ID);
-    if (ex) { ex.style.display = 'block'; ex.focus?.(); return; }
+    const exist = $id(MODAL_ID);
+    if (exist) { exist.style.display = 'block'; exist.focus?.(); return; }
 
-    const overlay = doc.createElement('div');
+    const overlay = document.createElement('div');
     overlay.id = MODAL_ID;
     Object.assign(overlay.style, {
       position: 'fixed',
@@ -81,7 +112,7 @@
     });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeConsole(); });
 
-    const shell = doc.createElement('div');
+    const shell = document.createElement('div');
     Object.assign(shell.style, {
       position: 'absolute',
       top: '50%',
@@ -95,9 +126,9 @@
       overflow: 'hidden'
     });
 
-    const close = doc.createElement('button');
-    close.textContent = '×';
-    Object.assign(close.style, {
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '×';
+    Object.assign(closeBtn.style, {
       position: 'absolute',
       right: '10px',
       top: '6px',
@@ -109,9 +140,9 @@
       cursor: 'pointer',
       zIndex: 2
     });
-    close.addEventListener('click', closeConsole);
+    closeBtn.addEventListener('click', closeConsole);
 
-    const iframe = doc.createElement('iframe');
+    const iframe = document.createElement('iframe');
     iframe.id = IFRAME_ID;
     iframe.src = `${BASE_URL}/admin/console?embed=1`;
     iframe.setAttribute('allow', 'clipboard-read; clipboard-write');
@@ -122,14 +153,15 @@
       background: '#fff'
     });
 
-    // --- iframe ブロック検知 & フォールバック ---
     let fallbackShown = false;
     const showFallback = () => {
       if (fallbackShown) return;
       fallbackShown = true;
-      // ガイダンス + 自動で別タブ
-      const msg = doc.createElement('div');
-      msg.innerHTML = 'ページのポリシーにより埋め込みできませんでした。<a target="_blank" rel="noopener" href="'+iframe.src+'">別タブで開く</a> をクリックしてください。';
+      const msg = document.createElement('div');
+      msg.innerHTML =
+        '埋め込みがブロックされたため、<a target="_blank" rel="noopener" href="' +
+        iframe.src +
+        '">別タブ</a>で開きます。';
       Object.assign(msg.style, {
         position: 'absolute',
         left: '16px',
@@ -139,25 +171,29 @@
         fontSize: '14px'
       });
       shell.appendChild(msg);
-      // 自動で別タブ（ポップアップブロック回避のため遅延）
-      setTimeout(() => { try { window.open(iframe.src, '_blank', 'noopener'); } catch {} }, 150);
+      setTimeout(() => { try { window.open(iframe.src, '_blank', 'noopener'); } catch {} }, 120);
     };
-
-    // X-Frame-Options / frame-ancestors によるブロックは onload が来ないことが多い
     const t = setTimeout(showFallback, 2000);
     iframe.addEventListener('load', () => { clearTimeout(t); });
 
-    shell.appendChild(close);
+    shell.appendChild(closeBtn);
     shell.appendChild(iframe);
     overlay.appendChild(shell);
-    (doc.body || doc.documentElement).appendChild(overlay);
+    (document.body || document.documentElement).appendChild(overlay);
   }
 
   function closeConsole() {
-    const m = $(MODAL_ID);
+    const m = $id(MODAL_ID);
     if (m) m.remove();
   }
 
-  // 初回
-  ensureButton();
+  // 初回 & SPA復活
+  const tryMount = () => { ensureHeaderGear(); };
+  tryMount();
+
+  // SPAでヘッダーが差し替わっても復活
+  const obs = new MutationObserver(() => {
+    if (!$id(BTN_ID)) tryMount();
+  });
+  obs.observe(document.documentElement, { childList: true, subtree: true });
 })();
