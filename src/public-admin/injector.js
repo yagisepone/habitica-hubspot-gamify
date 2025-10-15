@@ -11,7 +11,7 @@
   const BTN_ID    = 'sg-header-gear';
   const MODAL_ID  = 'sg-console-modal';
   const IFRAME_ID = 'sg-console-iframe';
-  const DEFAULT_BASE = 'https://sales-gamify.onrender.com';
+  const DEFAULT_BASE = "https://sales-gamify.onrender.com"; // TODO: wire env var override (SGC_DEFAULT_BASE)
 
   // ---------- BaseURL ----------
   const getSavedBase = () => {

@@ -80,6 +80,24 @@ app.use((req, res, next) => {
   next();
 });
 
+// ---- allow Habitica iframe embed for admin console ----
+app.use((req, res, next) => {
+  if (req.path.startsWith("/admin/console")) {
+    // allow embedding from Habitica
+    res.setHeader(
+      "Content-Security-Policy",
+      "frame-ancestors 'self' https://habitica.com https://*.habitica.com"
+    );
+    // Remove/override X-Frame-Options if any middleware set it
+    res.removeHeader("X-Frame-Options");
+
+    // Avoid overly strict cross-origin isolation for this endpoint
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+    res.setHeader("Cross-Origin-Embedder-Policy", "unsafe-none");
+  }
+  next();
+});
+
 app.get("/admin/console/i.js", (_req, res) => {
   res.type("application/javascript");
   res.sendFile(path.join(ADMIN_STATIC_DIR, "i.js"));
