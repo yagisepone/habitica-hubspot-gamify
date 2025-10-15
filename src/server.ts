@@ -43,7 +43,7 @@ import { opsApiRouter, opsRouter } from "./routes/ops.js";
    - PUT のみトークン必須（GETは公開のまま）
    ========================= */
 
-const PUBLIC_ADMIN_DIR = path.join(__dirname, "public-admin");
+const ADMIN_STATIC_DIR = path.join(__dirname, "public-admin");
 const PUBLIC_DIR = path.join(__dirname, "public");
 
 /* 基本設定 */
@@ -80,6 +80,15 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get("/i.js", (_req, res) => {
+  res.type("application/javascript");
+  res.sendFile(path.join(ADMIN_STATIC_DIR, "i.js"));
+});
+
+app.get("/t/:tenant", (req, res) => {
+  res.redirect(302, `/i.js?tenant=${encodeURIComponent(req.params.tenant)}`);
+});
+
 app.use(
   express.static(PUBLIC_DIR, {
     setHeaders(res) {
@@ -89,13 +98,9 @@ app.use(
   })
 );
 
-app.get("/t/:tenant", (req, res) => {
-  res.redirect(302, `/i.js?tenant=${encodeURIComponent(req.params.tenant)}`);
-});
-
 app.use(
   "/admin/console",
-  express.static(PUBLIC_ADMIN_DIR, {
+  express.static(ADMIN_STATIC_DIR, {
     index: "console.html",
     extensions: ["html"],
     setHeaders(res) {
@@ -105,7 +110,7 @@ app.use(
   })
 );
 app.get("/admin/console/*", (_req, res) => {
-  res.sendFile(path.join(PUBLIC_ADMIN_DIR, "console.html"));
+  res.sendFile(path.join(ADMIN_STATIC_DIR, "console.html"));
 });
 
 /* Health / Support */
@@ -121,8 +126,8 @@ app.get("/healthz", (_req, res) => {
     nameMapCount: Object.keys(NAME2MAIL).length,
     apptValues: APPOINTMENT_VALUES,
     totalize: CALL_TOTALIZE_5MIN,
-    publicAdminDirExists: fs.existsSync(path.join(PUBLIC_ADMIN_DIR, "console.html")),
-    publicAdminDir: PUBLIC_ADMIN_DIR,
+    publicAdminDirExists: fs.existsSync(path.join(ADMIN_STATIC_DIR, "console.html")),
+    publicAdminDir: ADMIN_STATIC_DIR,
   });
 });
 app.get("/support", (_req, res) => res.type("text/plain").send("Support page"));
@@ -160,6 +165,6 @@ app.listen(PORT, () => {
     `listening :${PORT} DRY_RUN=${DRY_RUN} totalize=${CALL_TOTALIZE_5MIN} unit=${CALL_XP_UNIT_MS}ms per5min=${CALL_XP_PER_5MIN} perCall=${CALL_XP_PER_CALL}`
   );
   log(`[habitica] users=${Object.keys(HAB_MAP).length}, [name->email] entries=${Object.keys(NAME2MAIL).length}`);
-  log(`[admin] console at /admin/console/ from ${PUBLIC_ADMIN_DIR}`);
+  log(`[admin] console at /admin/console/ from ${ADMIN_STATIC_DIR}`);
 });
 export {};

@@ -14,7 +14,9 @@
   };
   const baseURL = baseURLMap[tenant] || baseURLMap.default;
 
-  const u = `${baseURL}/admin/console/injector.js?tenant=${encodeURIComponent(tenant)}&base=${encodeURIComponent(baseURL)}&ts=${Date.now()}`;
+  const u = `${baseURL}/admin/console/injector.js?tenant=${encodeURIComponent(tenant)}&base=${encodeURIComponent(
+    baseURL
+  )}&ts=${Date.now()}`;
   const s = document.createElement("script");
   s.src = u;
   s.crossOrigin = "anonymous";
