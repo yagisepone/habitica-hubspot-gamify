@@ -35,6 +35,7 @@ import { dashboardHandler, mappingHandler } from "./routes/admin.js";
 // 観測ラベル（既存）
 import { labelsGet, labelsPut } from "./routes/labels.js";
 import { opsApiRouter, opsRouter } from "./routes/ops.js";
+import { tenantOpsRouter } from "./routes/tenantOps.js";
 
 /* ===========================================
    PATHS
@@ -210,6 +211,7 @@ app.get("/admin/mapping",  mappingHandler);
 /* ===========================================
    OPS / TENANT API
    =========================================== */
+app.use("/tenant/:id/ops", tenantOpsRouter);
 app.use("/tenant", opsRouter);
 app.use("/ops",    opsApiRouter);
 

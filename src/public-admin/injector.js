@@ -12,6 +12,34 @@
   const MODAL_ID  = 'sg-console-modal';
   const IFRAME_ID = 'sg-console-iframe';
   const DEFAULT_BASE = "https://sales-gamify.onrender.com"; // TODO: wire env var override (SGC_DEFAULT_BASE)
+  const POSITION_KEY = 'sgc.settings.position';
+
+  const normalizePos = (pos) => {
+    const top = Math.max(0, Math.round(Number(pos?.top ?? 120)));
+    const left = Math.max(0, Math.round(Number(pos?.left ?? 18)));
+    return { top, left };
+  };
+  const loadPosition = () => {
+    try {
+      const raw = localStorage.getItem(POSITION_KEY);
+      if (!raw) return { top: 120, left: 18 };
+      const parsed = JSON.parse(raw);
+      return normalizePos(parsed);
+    } catch {
+      return { top: 120, left: 18 };
+    }
+  };
+  const persistPosition = (pos, broadcast = true) => {
+    const normalized = normalizePos(pos);
+    localStorage.setItem(POSITION_KEY, JSON.stringify(normalized));
+    if (broadcast) {
+      try {
+        window.top?.postMessage({ type: 'sgc.updateGearPosition', position: normalized }, '*');
+      } catch {}
+    }
+    return normalized;
+  };
+  let gearPosition = loadPosition();
 
   // ---------- BaseURL ----------
   const getSavedBase = () => {
@@ -35,6 +63,31 @@
   // ---------- DOM utils ----------
   const $id = (id) => document.getElementById(id);
 
+  window.addEventListener('message', (event) => {
+    try {
+      const data = event?.data;
+      if (data && data.type === 'sgc.updateGearPosition' && data.position) {
+        const saved = persistPosition(data.position, false);
+        const btn = $id(BTN_ID);
+        if (btn) applyGearPosition(btn, saved);
+      }
+    } catch {}
+  });
+
+  const applyGearPosition = (btn, pos) => {
+    const target = normalizePos(pos || gearPosition);
+    gearPosition = target;
+    Object.assign(btn.style, {
+      position: 'fixed',
+      top: `${target.top}px`,
+      left: `${target.left}px`,
+      right: 'auto',
+      bottom: 'auto',
+      marginLeft: '0',
+      zIndex: 2147483645,
+    });
+  };
+
   // Habitica のヘッダー右上“アイコン群”を推定して返す
   const findHeaderActions = () => {
     // できるだけ狭い→広い順に探索
@@ -57,13 +110,13 @@
   // ヘッダーに歯車ボタンを“溶け込む形で”追加
   const ensureHeaderGear = () => {
     if ($id(BTN_ID)) return true;
-    const container = findHeaderActions();
-    if (!container) return false;
+    const mountTarget = document.body || findHeaderActions() || document.documentElement;
+    if (!mountTarget) return false;
 
     const btn = document.createElement('button');
     btn.id = BTN_ID;
     btn.type = 'button';
-    btn.title = 'Sales Gamify 設定';
+    btn.title = 'Sales Gamify 設定 (Shift+ドラッグで移動)';
     btn.setAttribute('aria-label', 'Sales Gamify 設定');
 
     // 見た目は既存の丸アイコンに寄せる（継承 + 最小限の上書き）
@@ -74,13 +127,15 @@
       justifyContent: 'center',
       width: '32px',
       height: '32px',
-      marginLeft: '8px',
       borderRadius: '50%',
       cursor: 'pointer',
       color: 'inherit',              // 既存色を継承
+      boxShadow: '0 6px 18px rgba(0,0,0,.25)',
+      background: 'rgba(34,34,34,0.85)',
+      color: '#fff',
     });
-    btn.onmouseover = () => (btn.style.background = 'rgba(0,0,0,.07)');
-    btn.onmouseout  = () => (btn.style.background = 'transparent');
+    btn.onmouseover = () => (btn.style.background = 'rgba(34,34,34,0.9)');
+    btn.onmouseout  = () => (btn.style.background = 'rgba(34,34,34,0.85)');
 
     // 歯車SVG（小さめ）
     btn.innerHTML = `
@@ -89,10 +144,60 @@
       </svg>
     `;
 
-    btn.addEventListener('click', openConsole, { passive: true });
+    let movedWhileDragging = false;
 
-    // 右端に自然に並ぶよう最後に追加
-    container.appendChild(btn);
+    btn.addEventListener('click', (event) => {
+      if (event.shiftKey || movedWhileDragging) {
+        event.preventDefault();
+        movedWhileDragging = false;
+        return;
+      }
+      openConsole();
+    });
+
+    let dragging = false;
+    let pointerId = null;
+    let offset = { x: 0, y: 0 };
+
+    btn.addEventListener('pointerdown', (event) => {
+      if (!event.shiftKey) return;
+      event.preventDefault();
+      dragging = true;
+      pointerId = event.pointerId;
+      const rect = btn.getBoundingClientRect();
+      offset = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      btn.setPointerCapture(pointerId);
+      btn.style.transition = 'none';
+      movedWhileDragging = false;
+    });
+
+    btn.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      const next = {
+        top: event.clientY - offset.y,
+        left: event.clientX - offset.x,
+      };
+      applyGearPosition(btn, next);
+      movedWhileDragging = true;
+    });
+
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      btn.style.transition = '';
+      const saved = persistPosition(gearPosition);
+      applyGearPosition(btn, saved);
+      if (pointerId != null) {
+        try { btn.releasePointerCapture(pointerId); } catch {}
+        pointerId = null;
+      }
+    };
+
+    btn.addEventListener('pointerup', endDrag);
+    btn.addEventListener('pointercancel', endDrag);
+
+    mountTarget.appendChild(btn);
+    applyGearPosition(btn, gearPosition);
     return true;
   };
 

@@ -9,8 +9,9 @@ import {
 import { appendJsonl, fmtJST, isoDay, log } from "../lib/utils.js";
 import { getHabitica } from "../lib/maps.js";
 import { habSafe } from "../lib/habiticaQueue.js";
-import { createTodo, completeTask } from "../connectors/habitica.js";
+import { createTodo, completeTask, adjustUserStats } from "../connectors/habitica.js";
 import { resolveActor } from "./resolveActor.js";
+import { checkAndAwardBadges } from "./badges.js";
 
 export type CallDurEv = {
   source: "v3" | "workflow" | "zoom";
@@ -33,6 +34,42 @@ function computePerCallExtra(ms: number) {
   return ms > 0 ? Math.floor(ms / CALL_XP_UNIT_MS) * CALL_XP_PER_5MIN : 0;
 }
 
+function isMissedCall(ev: CallDurEv): boolean {
+  const raw = ev.raw || {};
+  const statusRaw =
+    raw.status ||
+    raw.call_status ||
+    raw.result ||
+    raw.callResult ||
+    raw.callStatus;
+  const status = statusRaw ? String(statusRaw).toLowerCase() : "";
+  if (status.includes("miss")) return true;
+  if (status.includes("no_answer")) return true;
+  const labels = Array.isArray(raw.labels) ? raw.labels : Array.isArray(raw.tags) ? raw.tags : [];
+  if (labels.some((label: any) => String(label).includes("ミス架電"))) return true;
+  if (ev.durationMs <= 0) return true;
+  return false;
+}
+
+async function applyMissPenalty(ev: CallDurEv, userId?: string) {
+  if (!userId) return;
+  const magnitude = Number.isFinite(CALL_XP_PER_CALL) && CALL_XP_PER_CALL !== 0 ? Math.abs(Number(CALL_XP_PER_CALL)) : 1;
+  const penalty = -Math.abs(magnitude || 1);
+  if (penalty === 0) return;
+  const tenantId = String(ev.raw?.tenantId || "default");
+  await adjustUserStats(tenantId, userId, penalty);
+  log(`[penalty] call tenant=${tenantId} user=${userId} xp=${penalty}`);
+  try {
+    await checkAndAwardBadges(tenantId, userId, {
+      type: "call",
+      metrics: { deltaXp: penalty, callDurationMs: Number(ev.durationMs) || 0 },
+      labels: Array.isArray(ev.raw?.labels) ? ev.raw.labels : undefined,
+    });
+  } catch (err: any) {
+    log(`[penalty] badge-check error=${err?.message || err}`);
+  }
+}
+
 export async function awardXpForCallDuration(ev: CallDurEv) {
   if (ev.source !== "zoom") {
     console.log(`[call] skip non-zoom source=${ev.source} durMs=${ev.durationMs}`);
@@ -45,6 +82,11 @@ export async function awardXpForCallDuration(ev: CallDurEv) {
 
   const when = fmtJST(ev.occurredAt);
   const who = resolveActor({ source: ev.source, raw: ev.raw });
+
+  if (isMissedCall(ev)) {
+    await applyMissPenalty(ev, who.email || who.name);
+    return;
+  }
 
   console.log(
     `[call] calc who=${who.email || who.name} durMs=${durMs} unit=${Number(
@@ -98,6 +140,21 @@ export async function awardXpForCallDuration(ev: CallDurEv) {
     if (id) await completeTask(id, cred);
     return undefined as any;
   });
+
+  const tenantId = String(ev.raw?.tenantId || "default");
+  try {
+    await checkAndAwardBadges(tenantId, who.email || who.name, {
+      type: "call",
+      metrics: {
+        deltaXp: (CALL_XP_PER_CALL || 0) + xpExtra,
+        callDurationMs: durMs,
+        totalCallDurationMs: durMs,
+      },
+      labels: Array.isArray(ev.raw?.labels) ? ev.raw.labels : undefined,
+    });
+  } catch (err: any) {
+    log(`[call] badge-check error=${err?.message || err}`);
+  }
 }
 
 export async function handleCallDurationEvent(ev: CallDurEv) {

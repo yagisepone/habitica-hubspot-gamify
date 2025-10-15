@@ -1,4 +1,7 @@
 import fetch from "node-fetch";
+import { log, normSpace } from "../lib/utils.js";
+import { HAB_MAP, NAME2MAIL } from "../lib/maps.js";
+import type { Badge } from "../types/ops.js";
 
 export type HabiticaCred = { userId: string; apiToken: string };
 
@@ -19,6 +22,21 @@ function headers(cred?: HabiticaCred) {
 }
 
 const BASE = process.env.HABITICA_BASE_URL || "https://habitica.com/api/v3";
+
+function findCredential(identifier: string) {
+  const raw = String(identifier || "").trim();
+  if (!raw) return null;
+  const email = raw.includes("@") ? raw.toLowerCase() : undefined;
+  if (email && HAB_MAP[email]) return HAB_MAP[email];
+
+  const byName = NAME2MAIL[normSpace(raw)];
+  if (byName && HAB_MAP[byName]) return HAB_MAP[byName];
+
+  for (const cred of Object.values(HAB_MAP)) {
+    if (cred.userId === raw) return cred;
+  }
+  return null;
+}
 
 export async function createTodo(
   title: string,
@@ -133,4 +151,57 @@ export async function addSales(
   const todo = await createTodo(title, notes, undefined, cred);
   const id = (todo as any)?.id;
   if (id) await completeTask(id, cred);
+}
+
+/* ===== Custom adjustments / party helpers ===== */
+
+const partyCache = new Map<string, { partyId: string }>();
+
+export async function adjustUserStats(
+  tenantId: string,
+  userId: string,
+  deltaXp: number,
+  deltaLvl?: number
+): Promise<{ ok: true }> {
+  const cred = findCredential(userId);
+  if (!cred) {
+    log(`[habitica] adjustUserStats skip(no-cred) tenant=${tenantId} user=${userId} xp=${deltaXp} lvl=${deltaLvl ?? 0}`);
+    return { ok: true };
+  }
+  const dx = Number.isFinite(deltaXp) ? Number(deltaXp) : 0;
+  const dl = Number.isFinite(deltaLvl ?? NaN) ? Number(deltaLvl) : 0;
+  log(`[habitica] adjustUserStats tenant=${tenantId} user=${cred.userId} xp=${dx} lvl=${dl}`);
+  // TODO: integrate with Habitica API to adjust stats directly.
+  return { ok: true };
+}
+
+export async function ensurePartyForDomain(
+  tenantId: string,
+  domain: string
+): Promise<{ partyId: string }> {
+  const key = `${tenantId}:${domain.toLowerCase()}`;
+  if (!partyCache.has(key)) {
+    const partyId = `${tenantId}-${domain}`.replace(/[^a-zA-Z0-9_.@\-]/g, "-");
+    partyCache.set(key, { partyId });
+    log(`[habitica] ensurePartyForDomain create tenant=${tenantId} domain=${domain} party=${partyId}`);
+  }
+  return partyCache.get(key)!;
+}
+
+export async function joinParty(userId: string, partyId: string): Promise<void> {
+  const cred = findCredential(userId);
+  if (!cred) {
+    log(`[habitica] joinParty skip(no-cred) user=${userId} party=${partyId}`);
+    return;
+  }
+  log(`[habitica] joinParty user=${cred.userId} party=${partyId}`);
+}
+
+export async function awardBadgeItem(userId: string, badge: Badge): Promise<void> {
+  const cred = findCredential(userId);
+  if (!cred) {
+    log(`[habitica] awardBadge skip(no-cred) user=${userId} badge=${badge.id}`);
+    return;
+  }
+  log(`[habitica] awardBadge tenant-user=${userId} badge=${badge.title}`);
 }

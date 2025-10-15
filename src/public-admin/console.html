@@ -49,6 +49,7 @@
   const PIN_KEY = "sgc_pin";
   const PIN_KEY_NEW = "sgc.alwaysShowFab";
   const HIDE_PAID_KEY = "sgc.hidePaidRewards";
+  const GEAR_POSITION_KEY = "sgc.settings.position";
 
   const h = (html) => { const t=document.createElement("template"); t.innerHTML=html.trim(); return t.content.firstElementChild; };
   const asNum=(v,d=0)=>{ const n=Number(v); return Number.isFinite(n)?n:d; };
@@ -91,6 +92,30 @@
   };
   const loadProfile=()=>load(LS_KEY,{ tenant:"default", baseUrl:"", token:"" });
   const saveProfile=(p)=>save(LS_KEY,p);
+  function loadGearPositionSettings(){
+    try{
+      const raw = localStorage.getItem(GEAR_POSITION_KEY);
+      if(!raw) return { top:120, left:18 };
+      const parsed = JSON.parse(raw);
+      const top = Number(parsed?.top);
+      const left = Number(parsed?.left);
+      return {
+        top: Number.isFinite(top) ? top : 120,
+        left: Number.isFinite(left) ? left : 18,
+      };
+    }catch(_){
+      return { top:120, left:18 };
+    }
+  }
+  function saveGearPositionSettings(pos){
+    const safe = {
+      top: Number.isFinite(Number(pos?.top)) ? Math.round(Number(pos.top)) : 120,
+      left: Number.isFinite(Number(pos?.left)) ? Math.round(Number(pos.left)) : 18,
+    };
+    localStorage.setItem(GEAR_POSITION_KEY, JSON.stringify(safe));
+    try{ window.top?.postMessage({ type:"sgc.updateGearPosition", position: safe }, "*"); }catch(_){ }
+    return safe;
+  }
 
   const headers=(p)=>{ const hd={"Accept":"application/json"}; if(p?.token){ hd.Authorization=`Bearer ${p.token}`; } return hd; };
   async function parseJsonText(text){
@@ -120,6 +145,7 @@
   const apiGET=async(url,p)=> requestJson(url,{headers:headers(p)},p);
   const apiPUT=async(url,body,p)=> requestJson(url,{method:"PUT",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)},p);
   const apiPOST=async(url,body,p)=> requestJson(url,{method:"POST",headers:{...headers(p),"Content-Type":"application/json"},body:JSON.stringify(body)},p);
+  const apiDELETE=async(url,p)=> requestJson(url,{method:"DELETE",headers:headers(p)},p);
   const apiPOSTForm=async(url,form,p)=> requestJson(url,{method:"POST",headers:headers(p),body:form},p);
 
   const DEFAULT_VIEW_STATE = { zoom: 100, density: "standard", fontSize: "m", contrast: "standard" };
@@ -370,7 +396,7 @@
 
   /* ====== モーダル作成 ====== */
   let profile={}, currentTab="score", rulesCache=null, labelsCache=null;
-  let adjustmentsCache=[], shopItemsCache=[], auditCache=[];
+  let adjustmentsCache=[], shopItemsCache=[], auditCache=[], shopItemsV2Cache=[], badgesCache=[];
   let fabObserver=null;
   let modal, shell, bodyArea, contentScroll;
 
@@ -916,14 +942,17 @@
     const tabs = modal.querySelector("#sgc-tabs");
     tabs.innerHTML="";
     const defs=[
-      {id:"score",  label:"スコア設定"},
-      {id:"hub",    label:"HubSpot連携（ラベル）"},
-      {id:"approve",label:"承認・売上（CSV連動）"},
-      {id:"csv",    label:"CSV取込"},
-      {id:"dash",   label:"ダッシュボード"},
-      {id:"adjust", label:"手動調整"},
-      {id:"shop",   label:"ショップ"},
-      {id:"audit",  label:"監査ログ"},
+      {id:"score",       label:"スコア設定"},
+      {id:"hub",         label:"HubSpot連携（ラベル）"},
+      {id:"approve",     label:"承認・売上（CSV連動）"},
+      {id:"csv",         label:"CSV取込"},
+      {id:"dash",        label:"ダッシュボード"},
+      {id:"adjust",      label:"手動調整"},
+      {id:"shop",        label:"ショップ"},
+      {id:"shopManage",  label:"ショップ管理"},
+      {id:"badgeManage", label:"バッジ管理"},
+      {id:"settings",    label:"設定"},
+      {id:"audit",       label:"監査ログ"},
     ];
     defs.forEach(t=>{
       const el=h(`<div class="sgc-tab" data-tab="${t.id}">${t.label}</div>`);
@@ -962,6 +991,8 @@
       labelsCache = Array.isArray(labels?.items) ? labels.items : [];
       adjustmentsCache = [];
       shopItemsCache = [];
+      shopItemsV2Cache = [];
+      badgesCache = [];
       auditCache = [];
       render();
     }catch(e){ console.warn(e); toast("読み込みエラー", true); }
@@ -1002,6 +1033,9 @@
     else if(currentTab==="dash") renderDash();
     else if(currentTab==="adjust") renderAdjust();
     else if(currentTab==="shop") renderShop();
+    else if(currentTab==="shopManage") renderShopManage();
+    else if(currentTab==="badgeManage") renderBadgeManage();
+    else if(currentTab==="settings") renderSettings();
     else if(currentTab==="audit") renderAudit();
     enhanceTablesAfterRender();
     applyViewState();
@@ -1496,6 +1530,73 @@
     }
   }
 
+  async function fetchShopItemsV2(){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl){ shopItemsV2Cache=[]; return shopItemsV2Cache; }
+    try{
+      const res = await apiGET(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/items`, profile);
+      shopItemsV2Cache = Array.isArray(res?.items) ? res.items : [];
+      return shopItemsV2Cache;
+    }catch(e){
+      console.error("fetchShopItemsV2", e);
+      throw e;
+    }
+  }
+
+  async function saveShopItemV2(item){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl) throw new Error("base-required");
+    const payload = { ...item };
+    if(!payload.name) throw new Error("name-required");
+    if(!Number.isFinite(Number(payload.value))) throw new Error("value-invalid");
+    return apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/items`, payload, profile);
+  }
+
+  async function deleteShopItemV2(id, opts={}){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl) throw new Error("base-required");
+    const suffix = opts?.hard ? "?hard=1" : "";
+    return apiDELETE(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/items/${encodeURIComponent(id)}${suffix}`, profile);
+  }
+
+  async function restoreShopItemV2(id){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl) throw new Error("base-required");
+    return apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/items/${encodeURIComponent(id)}/restore`, {}, profile);
+  }
+
+  async function fetchBadgesV2(){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl){ badgesCache=[]; return badgesCache; }
+    try{
+      const res = await apiGET(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/badges`, profile);
+      badgesCache = Array.isArray(res?.badges) ? res.badges : [];
+      return badgesCache;
+    }catch(e){
+      console.error("fetchBadgesV2", e);
+      throw e;
+    }
+  }
+
+  async function saveBadgeV2(item){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl) throw new Error("base-required");
+    return apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/badges`, item, profile);
+  }
+
+  async function replaceBadgesV2(list){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl) throw new Error("base-required");
+    return apiPUT(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/badges`, { badges: list }, profile);
+  }
+
+  async function deleteBadgeV2(id, opts={}){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl) throw new Error("base-required");
+    const suffix = opts?.hard ? "?hard=1" : "";
+    return apiDELETE(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/badges/${encodeURIComponent(id)}${suffix}`, profile);
+  }
+
   async function fetchAudit(limit=100){
     ensureProfileFromInputs();
     if(!profile.baseUrl){ auditCache=[]; return auditCache; }
@@ -1764,30 +1865,20 @@
         toast("XP または レベルのいずれかに値を入力してください", true);
         return;
       }
-      const payloadReason = reason || undefined;
-      const tasks=[];
-      const resultsLabel=[];
-      if(xpDelta !== 0){
-        tasks.push(
-          apiPOST(`${baseURL()}/ops/${encodeURIComponent(tenant())}/manual-xp`, {
-            userId,
-            deltaXp: Math.trunc(xpDelta),
-            reason: payloadReason,
-          }, profile).then(()=>resultsLabel.push(`XP:${xpDelta>=0?"+":""}${Math.trunc(xpDelta)}`))
-        );
-      }
-      if(levelDelta !== 0){
-        tasks.push(
-          apiPOST(`${baseURL()}/ops/${encodeURIComponent(tenant())}/manual-level`, {
-            userId,
-            deltaLevel: Math.trunc(levelDelta),
-            reason: payloadReason,
-          }, profile).then(()=>resultsLabel.push(`Lv:${levelDelta>=0?"+":""}${Math.trunc(levelDelta)}`))
-        );
-      }
+      const payload = {
+        userId,
+        deltaXp: Math.trunc(xpDelta),
+        deltaLvl: Math.trunc(levelDelta),
+        note: reason || undefined,
+      };
       try{
-        await Promise.all(tasks);
-        const summary = resultsLabel.length ? resultsLabel.join(" / ") : "OK";
+        const resp = await apiPOST(`${baseURL()}/tenant/${encodeURIComponent(tenant())}/ops/adjust-xp`, payload, profile);
+        const appliedXp = Number(resp?.applied?.deltaXp || xpDelta || 0);
+        const appliedLv = Number(resp?.applied?.deltaLvl || levelDelta || 0);
+        const parts=[];
+        if(appliedXp) parts.push(`XP:${appliedXp>=0?"+":""}${appliedXp}`);
+        if(appliedLv) parts.push(`Lv:${appliedLv>=0?"+":""}${appliedLv}`);
+        const summary = parts.length ? parts.join(" / ") : "OK";
         toast(`手動調整を登録しました (${summary})`);
         await reload(currentFilter);
       }catch(e){
@@ -2154,6 +2245,407 @@
     purchaseCard.querySelector("#sgc-shop-buy-run").addEventListener("click", runPurchase);
 
     reloadShop();
+  }
+
+  function renderShopManage(){
+    ensureProfileFromInputs();
+    const wrap=h(`
+      <div class="sgc-bare">
+        <div class="sgc-compact" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button class="sgc-btn" id="sgc-shopv2-add">＋ 品目を追加</button>
+          <button class="sgc-btn" id="sgc-shopv2-reload">再読込</button>
+          <span class="sgc-help">Render デプロイ後の新API。保存後は Habitica 埋め込みに即時反映されます。</span>
+        </div>
+        <div class="sgc-list" id="sgc-shopv2-list"></div>
+        <div class="sgc-help" id="sgc-shopv2-status"></div>
+      </div>
+    `);
+    bodyArea.appendChild(wrap);
+    const listEl = wrap.querySelector("#sgc-shopv2-list");
+    const statusEl = wrap.querySelector("#sgc-shopv2-status");
+
+    function renderRow(item){
+      const row=h(`
+        <div class="sgc-card sgc-card-shop" data-id="${item?.id || ""}">
+          <div class="sgc-grid">
+            <label>
+              <span class="muted">名前</span>
+              <input class="sgc-sv2-name" placeholder="例: スタバ券">
+            </label>
+            <label>
+              <span class="muted">価値 (XP等)</span>
+              <input class="sgc-sv2-value" type="number" step="1" min="-9999">
+            </label>
+            <label>
+              <span class="muted">有料フラグ</span>
+              <input class="sgc-sv2-paid" type="checkbox">
+            </label>
+            <label>
+              <span class="muted">公開状態</span>
+              <input class="sgc-sv2-active" type="checkbox" checked>
+            </label>
+          </div>
+          <label class="muted" style="display:block;margin-top:8px;">
+            説明
+            <textarea class="sgc-sv2-desc" rows="2" placeholder="購入者向けの説明文"></textarea>
+          </label>
+          <div class="sgc-compact" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="sgc-btn primary sgc-sv2-save">保存</button>
+            <button type="button" class="sgc-btn sgc-del sgc-sv2-delete">削除</button>
+            <button type="button" class="sgc-btn sgc-sv2-restore" style="display:none;">復活</button>
+          </div>
+        </div>
+      `);
+      row.querySelector(".sgc-sv2-name").value = item?.name || "";
+      row.querySelector(".sgc-sv2-value").value = item?.value != null ? String(item.value) : "";
+      row.querySelector(".sgc-sv2-desc").value = item?.description || "";
+      row.querySelector(".sgc-sv2-paid").checked = item?.isPaid === true;
+      row.querySelector(".sgc-sv2-active").checked = item?.active !== false;
+      if(item?.active === false){
+        row.querySelector(".sgc-sv2-restore").style.display = "inline-flex";
+      }
+      row.querySelector(".sgc-sv2-save").addEventListener("click", async ()=>{
+        try{
+          const payload={
+            id: row.dataset.id || undefined,
+            name: row.querySelector(".sgc-sv2-name").value.trim(),
+            value: Number(row.querySelector(".sgc-sv2-value").value || 0),
+            description: row.querySelector(".sgc-sv2-desc").value.trim() || undefined,
+            isPaid: row.querySelector(".sgc-sv2-paid").checked,
+            active: row.querySelector(".sgc-sv2-active").checked,
+          };
+          if(!payload.name){
+            toast("品目名を入力してください", true);
+            row.querySelector(".sgc-sv2-name").focus();
+            return;
+          }
+          if(!Number.isFinite(payload.value) || payload.value === 0){
+            toast("価値は0以外の数値で入力してください", true);
+            row.querySelector(".sgc-sv2-value").focus();
+            return;
+          }
+          await saveShopItemV2(payload);
+          toast("品目を保存しました");
+          await reload();
+        }catch(e){
+          console.error("shopv2.save", e);
+          toast("保存に失敗: "+describeHttpError(e), true);
+        }
+      });
+      row.querySelector(".sgc-sv2-delete").addEventListener("click", async ()=>{
+        const id = row.dataset.id || "";
+        if(!id){
+          row.remove();
+          return;
+        }
+        try{
+          await deleteShopItemV2(id);
+          toast("品目を無効化しました");
+          await reload();
+        }catch(e){
+          console.error("shopv2.delete", e);
+          toast("削除に失敗: "+describeHttpError(e), true);
+        }
+      });
+      row.querySelector(".sgc-sv2-restore").addEventListener("click", async ()=>{
+        const id = row.dataset.id || "";
+        if(!id) return;
+        try{
+          await restoreShopItemV2(id);
+          toast("品目を復活させました");
+          await reload();
+        }catch(e){
+          console.error("shopv2.restore", e);
+          toast("復活に失敗: "+describeHttpError(e), true);
+        }
+      });
+      return row;
+    }
+
+    async function reload(){
+      try{
+        const items = await fetchShopItemsV2();
+        listEl.innerHTML="";
+        if(!items.length){
+          listEl.appendChild(h(`<div class="sgc-help">まだ品目がありません。『＋ 品目を追加』から登録してください。</div>`));
+        }else{
+          items.forEach((item)=> listEl.appendChild(renderRow(item)));
+        }
+        statusEl.textContent = `取得件数: ${items.length}`;
+      }catch(e){
+        statusEl.textContent = "読み込みに失敗しました";
+        toast("ショップ管理の読み込みに失敗: "+describeHttpError(e), true);
+      }
+    }
+
+    wrap.querySelector("#sgc-shopv2-add").addEventListener("click", ()=>{
+      const tmpRow = renderRow({ id:"", name:"", value:1, description:"" });
+      tmpRow.querySelector(".sgc-sv2-name").focus();
+      listEl.prepend(tmpRow);
+    });
+    wrap.querySelector("#sgc-shopv2-reload").addEventListener("click", ()=> reload());
+
+    reload();
+  }
+
+  function renderBadgeManage(){
+    ensureProfileFromInputs();
+    const typeOptions=[
+      { value:"totalXpAtLeast", label:"累計XP >=" },
+      { value:"callsDurationMsAtLeast", label:"通話時間(ms) >=" },
+      { value:"appointmentsCountAtLeast", label:"アポ数 >=" },
+      { value:"hasLabelCountAtLeast", label:"ラベル回数 >=" },
+    ];
+    const wrap=h(`
+      <div class="sgc-bare">
+        <div class="sgc-compact" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <button class="sgc-btn" id="sgc-badge-add">＋ バッジを追加</button>
+          <button class="sgc-btn" id="sgc-badge-reload">再読込</button>
+          <button class="sgc-btn" id="sgc-badge-saveall">まとめて保存</button>
+          <span class="sgc-help">バッジの付与条件とXP付与を管理します。</span>
+        </div>
+        <div class="sgc-list" id="sgc-badge-list"></div>
+        <div class="sgc-help" id="sgc-badge-status"></div>
+      </div>
+    `);
+    bodyArea.appendChild(wrap);
+    const listEl = wrap.querySelector("#sgc-badge-list");
+    const statusEl = wrap.querySelector("#sgc-badge-status");
+
+    function renderRow(item){
+      const row=h(`
+        <div class="sgc-card sgc-card-badge" data-id="${item?.id || ""}">
+          <div class="sgc-grid">
+            <label>
+              <span class="muted">タイトル</span>
+              <input class="sgc-badge-title" placeholder="例: 100XP達成">
+            </label>
+            <label>
+              <span class="muted">付与XP</span>
+              <input class="sgc-badge-xp" type="number" step="1">
+            </label>
+            <label>
+              <span class="muted">アイコン</span>
+              <input class="sgc-badge-icon" placeholder="例: 🏅">
+            </label>
+            <label>
+              <span class="muted">有効</span>
+              <input class="sgc-badge-active" type="checkbox" checked>
+            </label>
+          </div>
+          <label class="muted" style="display:block;margin-top:8px;">
+            説明
+            <textarea class="sgc-badge-desc" rows="2" placeholder="ユーザー向けの説明文"></textarea>
+          </label>
+          <div class="sgc-grid" style="margin-top:8px;">
+            <label>
+              <span class="muted">条件タイプ</span>
+              <select class="sgc-badge-type"></select>
+            </label>
+            <label>
+              <span class="muted">しきい値</span>
+              <input class="sgc-badge-threshold" type="number" step="1" min="0">
+            </label>
+            <label>
+              <span class="muted">ラベルID</span>
+              <input class="sgc-badge-label" placeholder="hasLabelCountAtLeast 用">
+            </label>
+          </div>
+          <div class="sgc-compact" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="sgc-btn primary sgc-badge-save">保存</button>
+            <button type="button" class="sgc-btn sgc-del sgc-badge-delete">削除</button>
+          </div>
+        </div>
+      `);
+      const typeSel=row.querySelector(".sgc-badge-type");
+      typeOptions.forEach(opt=>{
+        const option=document.createElement("option");
+        option.value=opt.value;
+        option.textContent=opt.label;
+        typeSel.appendChild(option);
+      });
+      row.querySelector(".sgc-badge-title").value = item?.title || "";
+      row.querySelector(".sgc-badge-desc").value = item?.description || "";
+      row.querySelector(".sgc-badge-xp").value = item?.xp != null ? String(item.xp) : "";
+      row.querySelector(".sgc-badge-icon").value = item?.icon || "";
+      row.querySelector(".sgc-badge-active").checked = item?.active !== false;
+      typeSel.value = item?.criteria?.type || "totalXpAtLeast";
+      row.querySelector(".sgc-badge-threshold").value = item?.criteria?.threshold != null ? String(item.criteria.threshold) : "1";
+      row.querySelector(".sgc-badge-label").value = item?.criteria?.labelId || "";
+
+      row.querySelector(".sgc-badge-save").addEventListener("click", async ()=>{
+        try{
+          const payload={
+            id: row.dataset.id || undefined,
+            title: row.querySelector(".sgc-badge-title").value.trim(),
+            description: row.querySelector(".sgc-badge-desc").value.trim() || undefined,
+            xp: row.querySelector(".sgc-badge-xp").value === "" ? undefined : Number(row.querySelector(".sgc-badge-xp").value),
+            icon: row.querySelector(".sgc-badge-icon").value.trim() || undefined,
+            active: row.querySelector(".sgc-badge-active").checked,
+            criteria: {
+              type: row.querySelector(".sgc-badge-type").value,
+              threshold: Number(row.querySelector(".sgc-badge-threshold").value || 0),
+              labelId: row.querySelector(".sgc-badge-label").value.trim() || undefined,
+            },
+          };
+          if(!payload.title){
+            toast("タイトルを入力してください", true);
+            row.querySelector(".sgc-badge-title").focus();
+            return;
+          }
+          if(!Number.isFinite(payload.criteria.threshold)){
+            toast("しきい値を整数で入力してください", true);
+            row.querySelector(".sgc-badge-threshold").focus();
+            return;
+          }
+          if(payload.criteria.type === "hasLabelCountAtLeast" && !payload.criteria.labelId){
+            toast("ラベルIDを入力してください", true);
+            row.querySelector(".sgc-badge-label").focus();
+            return;
+          }
+          await saveBadgeV2(payload);
+          toast("バッジを保存しました");
+          await reload();
+        }catch(e){
+          console.error("badge.save", e);
+          toast("保存に失敗: "+describeHttpError(e), true);
+        }
+      });
+      row.querySelector(".sgc-badge-delete").addEventListener("click", async ()=>{
+        const id=row.dataset.id || "";
+        if(!id){
+          row.remove();
+          return;
+        }
+        try{
+          await deleteBadgeV2(id);
+          toast("バッジを無効化しました");
+          await reload();
+        }catch(e){
+          console.error("badge.delete", e);
+          toast("削除に失敗: "+describeHttpError(e), true);
+        }
+      });
+      return row;
+    }
+
+    async function reload(){
+      try{
+        const items = await fetchBadgesV2();
+        listEl.innerHTML="";
+        if(!items.length){
+          listEl.appendChild(h(`<div class="sgc-help">まだバッジがありません。『＋ バッジを追加』から登録してください。</div>`));
+        }else{
+          items.forEach((item)=> listEl.appendChild(renderRow(item)));
+        }
+        statusEl.textContent = `取得件数: ${items.length}`;
+      }catch(e){
+        statusEl.textContent = "読み込みに失敗しました";
+        toast("バッジ読み込みに失敗: "+describeHttpError(e), true);
+      }
+    }
+
+    wrap.querySelector("#sgc-badge-add").addEventListener("click", ()=>{
+      const tmp = renderRow({ id:"", title:"", criteria:{ type:"totalXpAtLeast", threshold:1 } });
+      tmp.querySelector(".sgc-badge-title").focus();
+      listEl.prepend(tmp);
+    });
+    wrap.querySelector("#sgc-badge-reload").addEventListener("click", ()=> reload());
+    wrap.querySelector("#sgc-badge-saveall").addEventListener("click", async ()=>{
+      const rows=[...listEl.querySelectorAll(".sgc-card-badge")];
+      const payload=[];
+      for(const row of rows){
+        const title=row.querySelector(".sgc-badge-title").value.trim();
+        if(!title){
+          toast("タイトルを入力してください", true);
+          row.querySelector(".sgc-badge-title").focus();
+          return;
+        }
+        const thresholdVal=Number(row.querySelector(".sgc-badge-threshold").value || 0);
+        if(!Number.isFinite(thresholdVal)){
+          toast("しきい値を整数で入力してください", true);
+          row.querySelector(".sgc-badge-threshold").focus();
+          return;
+        }
+        const type=row.querySelector(".sgc-badge-type").value;
+        const label=row.querySelector(".sgc-badge-label").value.trim();
+        if(type === "hasLabelCountAtLeast" && !label){
+          toast("ラベルIDを入力してください", true);
+          row.querySelector(".sgc-badge-label").focus();
+          return;
+        }
+        payload.push({
+          id: row.dataset.id || undefined,
+          title,
+          description: row.querySelector(".sgc-badge-desc").value.trim() || undefined,
+          xp: row.querySelector(".sgc-badge-xp").value === "" ? undefined : Number(row.querySelector(".sgc-badge-xp").value),
+          icon: row.querySelector(".sgc-badge-icon").value.trim() || undefined,
+          active: row.querySelector(".sgc-badge-active").checked,
+          criteria: {
+            type,
+            threshold: thresholdVal,
+            labelId: label || undefined,
+          },
+        });
+      }
+      try{
+        await replaceBadgesV2(payload);
+        toast("バッジ一覧を保存しました");
+        await reload();
+      }catch(e){
+        console.error("badge.saveAll", e);
+        toast("保存に失敗: "+describeHttpError(e), true);
+      }
+    });
+
+    reload();
+  }
+
+  function renderSettings(){
+    ensureProfileFromInputs();
+    const pos = loadGearPositionSettings();
+    const wrap=h(`
+      <div class="sgc-bare">
+        <div class="sgc-card" style="display:flex;flex-direction:column;gap:12px;">
+          <div class="sgc-help">Habitica 上の歯車ボタンの位置を調整できます。変更すると即座に反映されます。</div>
+          <div class="sgc-grid">
+            <label>
+              <span class="muted">top (px)</span>
+              <input id="sgc-gear-top" type="number" step="1" min="0">
+            </label>
+            <label>
+              <span class="muted">left (px)</span>
+              <input id="sgc-gear-left" type="number" step="1" min="0">
+            </label>
+          </div>
+          <div class="sgc-compact" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="sgc-btn primary" id="sgc-gear-save">保存</button>
+            <button class="sgc-btn" id="sgc-gear-reset">既定値に戻す</button>
+          </div>
+        </div>
+        <div class="sgc-card">
+          <div class="muted" style="margin-bottom:6px;">AUTO_PARTY_DOMAINS</div>
+          <div class="sgc-help">許可ドメインの設定はサーバー環境変数 <code>AUTO_PARTY_DOMAINS</code> で管理します。必要に応じて運用担当へ連絡してください。</div>
+        </div>
+      </div>
+    `);
+    bodyArea.appendChild(wrap);
+    wrap.querySelector("#sgc-gear-top").value = pos.top;
+    wrap.querySelector("#sgc-gear-left").value = pos.left;
+    wrap.querySelector("#sgc-gear-save").addEventListener("click", ()=>{
+      const topVal = Number(wrap.querySelector("#sgc-gear-top").value || 0);
+      const leftVal = Number(wrap.querySelector("#sgc-gear-left").value || 0);
+      const saved = saveGearPositionSettings({ top: topVal, left: leftVal });
+      toast(`歯車位置を保存しました (top=${saved.top}px, left=${saved.left}px)`);
+      wrap.querySelector("#sgc-gear-top").value = saved.top;
+      wrap.querySelector("#sgc-gear-left").value = saved.left;
+    });
+    wrap.querySelector("#sgc-gear-reset").addEventListener("click", ()=>{
+      const saved = saveGearPositionSettings({ top:120, left:18 });
+      wrap.querySelector("#sgc-gear-top").value = saved.top;
+      wrap.querySelector("#sgc-gear-left").value = saved.left;
+      toast("既定位置にリセットしました");
+    });
   }
 
   function renderAudit(){

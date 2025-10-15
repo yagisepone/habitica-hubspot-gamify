@@ -15,9 +15,9 @@ import {
 import { writeLabels } from "../store/labels.js";
 import type {
   AuditEvent,
+  LegacyShopItem,
   ManualLogEntry,
   OpsLogEntry,
-  ShopItem,
   XpAdjustment,
 } from "../types/ops.js";
 
@@ -48,9 +48,9 @@ function actorFrom(req: Request): string {
   return "api";
 }
 
-function normalizeShopItems(items: any[]): ShopItem[] {
+function normalizeShopItems(items: any[]): LegacyShopItem[] {
   if (!Array.isArray(items)) return [];
-  const norm: ShopItem[] = [];
+  const norm: LegacyShopItem[] = [];
   for (const raw of items) {
     const title = String(raw?.title ?? raw?.name ?? "").trim();
     const price = Number(raw?.priceXp);
@@ -71,7 +71,7 @@ function normalizeShopItems(items: any[]): ShopItem[] {
       }
       stock = Math.floor(n);
     }
-    const item: ShopItem = {
+    const item: LegacyShopItem = {
       id: String(raw?.id ?? "") || randomUUID(),
       title,
       priceXp: Number(price),
@@ -84,7 +84,7 @@ function normalizeShopItems(items: any[]): ShopItem[] {
   return norm;
 }
 
-function enrichItemsForResponse(items: ShopItem[]): ShopItem[] {
+function enrichItemsForResponse(items: LegacyShopItem[]): LegacyShopItem[] {
   return items.map((item) => ({
     ...item,
     name: item.title,
@@ -278,7 +278,7 @@ async function processPurchase(
   const userNameVal = String(body?.userName ?? "").trim();
   const dir = await ensureTenantDir(tenant);
   const shopFile = shopPath(dir);
-  const currentItems = normalizeShopItems(await readJson<ShopItem[]>(shopFile, []));
+  const currentItems = normalizeShopItems(await readJson<LegacyShopItem[]>(shopFile, []));
   const item = currentItems.find((it) => it.id === itemId);
   if (!item) {
     throw new Error("item-not-found");
@@ -412,7 +412,7 @@ opsRouter.get("/:id/shop/items", async (req: Request, res: Response) => {
   try {
     const tenant = tenantId(req);
     const dir = await ensureTenantDir(tenant);
-    const items = await readJson<ShopItem[]>(shopPath(dir), []);
+    const items = await readJson<LegacyShopItem[]>(shopPath(dir), []);
     res.json({ items: enrichItemsForResponse(normalizeShopItems(items)) });
   } catch (err: any) {
     log(`[ops] shop.items.get error: ${err?.message || err}`);
@@ -669,7 +669,7 @@ opsApiRouter.get("/catalog", async (req: Request, res: Response) => {
   try {
     const tenant = tenantFrom(req as AnyReq);
     const dir = await ensureTenantDir(tenant);
-    const items = await readJson<ShopItem[]>(shopPath(dir), []);
+    const items = await readJson<LegacyShopItem[]>(shopPath(dir), []);
     res.json({ items: enrichItemsForResponse(normalizeShopItems(items)) });
   } catch (err: any) {
     log(`[ops] api.catalog.get error: ${err?.message || err}`);

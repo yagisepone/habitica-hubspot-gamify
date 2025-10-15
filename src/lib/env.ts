@@ -68,3 +68,11 @@ export const DEDUPE_TTL_SEC = Number(process.env.DEDUPE_TTL_SEC || 24 * 60 * 60)
 
 /* 安全弁：通話最大3時間 */
 export const MAX_CALL_MS = 3 * 60 * 60 * 1000;
+
+/* ショップ／バッジ設定 */
+export const SHOP_ALLOW_PAID = String(process.env.SHOP_ALLOW_PAID || "false").toLowerCase() === "true";
+export const AUTO_PARTY_DOMAINS = (process.env.AUTO_PARTY_DOMAINS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+export const BADGE_CHECK_ON_EVENTS = String(process.env.BADGE_CHECK_ON_EVENTS || "true").toLowerCase() !== "false";
