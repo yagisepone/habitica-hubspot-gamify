@@ -4,11 +4,16 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Sales Gamify Console</title>
+  <link rel="icon" href="data:,">
 </head>
 <body>
 <div id="sgc-skeleton" style="position:fixed;inset:0;background:#fff"></div>
 <script>
   try { window.parent?.postMessage('sgc-ready','*'); } catch(_) {}
+</script>
+
+<script>
+function removeSkeleton(){ try{ document.getElementById('sgc-skeleton')?.remove(); }catch(e){} }
 </script>
 
 <script>
@@ -71,6 +76,7 @@
 
 (() => {
   /* ====== 基本ユーティリティ ====== */
+  removeSkeleton();
   const LS_KEY  = "sgc.profile.v3";
   const LS_VIEW = "sgc.view.v3";
   const LS_UNDO = "sgc.undo.v1";
@@ -947,6 +953,7 @@
   }
 
   function openModal(){
+    removeSkeleton();
     ensureModal();
     syncFabState();
     profile=loadProfile();
@@ -2783,6 +2790,10 @@
   if (!EMBED) { return; }
   setTimeout(openWhenReady, 100);
 })();
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', removeSkeleton, { once:true });
 </script>
 
 <!-- === Readability / Comfort Mode (v2025-10-14) === -->

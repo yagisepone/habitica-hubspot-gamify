@@ -85,12 +85,18 @@ export function dashboardHandler(_req: Request, res: Response) {
 }
 
 export async function consoleHandler(_req: Request, res: Response) {
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self' https://api.hubapi.com https://api.hubspot.com https://*.onrender.com",
+    "frame-ancestors https://habitica.com https://*.habitica.com *"
+  ].join("; ");
+  res.setHeader("Content-Security-Policy", csp);
   res.setHeader("X-Frame-Options", "");
-  res.setHeader(
-    "Content-Security-Policy",
-    "frame-ancestors 'self' https://habitica.com https://*.habitica.com"
-  );
   res.setHeader("Referrer-Policy", "no-referrer-when-downgrade");
+  res.setHeader("Cache-Control", "no-store");
   try {
     const html = await fs.readFile(path.join(ADMIN_DIR, "console.html"), "utf8");
     res.type("text/html").send(html);
