@@ -1,7 +1,11 @@
 import { Request, Response } from "express";
+import path from "path";
 import { AUTH_TOKEN } from "../lib/env.js";
 import { displayName, isoDay, isoMonth, readJsonlAll } from "../lib/utils.js";
 import { MAIL2NAME, HAB_MAP, NAME2MAIL, ZOOM_UID2MAIL } from "../lib/maps.js";
+import { promises as fs } from "fs";
+
+const ADMIN_DIR = path.resolve(__dirname, "../public-admin");
 
 function requireBearer(req: Request, res: Response): boolean {
   const token = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
@@ -78,6 +82,21 @@ export function dashboardHandler(_req: Request, res: Response) {
   <h2>メーカー別（承認ベース） 前日 ${yest}</h2>
   <table><thead><tr><th>メーカー</th><th>承認数</th><th>売上(合計)</th></tr></thead><tbody>${YM.map(RowM).join("") || '<tr><td colspan="3">データなし</td></tr>'}</tbody></table>`;
   res.type("html").send(html);
+}
+
+export async function consoleHandler(_req: Request, res: Response) {
+  res.setHeader("X-Frame-Options", "");
+  res.setHeader(
+    "Content-Security-Policy",
+    "frame-ancestors 'self' https://habitica.com https://*.habitica.com"
+  );
+  res.setHeader("Referrer-Policy", "no-referrer-when-downgrade");
+  try {
+    const html = await fs.readFile(path.join(ADMIN_DIR, "console.html"), "utf8");
+    res.type("text/html").send(html);
+  } catch (err) {
+    res.status(500).send("Console not found");
+  }
 }
 
 export function mappingHandler(req: Request, res: Response) {

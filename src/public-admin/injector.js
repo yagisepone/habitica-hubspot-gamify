@@ -234,57 +234,56 @@
     const closeBtn = document.createElement('button');
     closeBtn.textContent = '×';
     Object.assign(closeBtn.style, {
-      position: 'absolute',
-      right: '10px',
-      top: '6px',
-      width: '32px',
-      height: '32px',
-      border: 'none',
-      background: 'transparent',
-      fontSize: '20px',
-      cursor: 'pointer',
-      zIndex: 2
+      position:'absolute', right:'10px', top:'6px', width:'32px', height:'32px',
+      border:'0', background:'transparent', fontSize:'20px', cursor:'pointer', zIndex:2
     });
     closeBtn.addEventListener('click', closeConsole);
 
-    const iframe = document.createElement('iframe');
-    iframe.id = IFRAME_ID;
-    iframe.src = `${BASE_URL}/admin/console?embed=1`;
-    iframe.setAttribute('allow', 'clipboard-read; clipboard-write');
-    Object.assign(iframe.style, {
-      border: '0',
-      width: '100%',
-      height: '100%',
-      background: '#fff'
-    });
-
-    let fallbackShown = false;
-    const showFallback = () => {
-      if (fallbackShown) return;
-      fallbackShown = true;
-      const msg = document.createElement('div');
-      msg.innerHTML =
-        '埋め込みがブロックされたため、<a target="_blank" rel="noopener" href="' +
-        iframe.src +
-        '">別タブ</a>で開きます。';
-      Object.assign(msg.style, {
-        position: 'absolute',
-        left: '16px',
-        right: '16px',
-        top: '48px',
-        color: '#333',
-        fontSize: '14px'
-      });
-      shell.appendChild(msg);
-      setTimeout(() => { try { window.open(iframe.src, '_blank', 'noopener'); } catch {} }, 120);
-    };
-    const t = setTimeout(showFallback, 2000);
-    iframe.addEventListener('load', () => { clearTimeout(t); });
-
     shell.appendChild(closeBtn);
-    shell.appendChild(iframe);
     overlay.appendChild(shell);
     (document.body || document.documentElement).appendChild(overlay);
+
+    function inlineEmbed() {
+      try {
+        shell.innerHTML = '';
+        shell.appendChild(closeBtn);
+        const holder = document.createElement('div');
+        Object.assign(holder.style, { width:'100%', height:'100%', overflow:'auto', background:'#fff' });
+        shell.appendChild(holder);
+        fetch(`${BASE_URL}/admin/console?embed=1`, { credentials: 'omit' })
+          .then(r => r.text())
+          .then(html => {
+            holder.innerHTML = html;
+            holder.querySelectorAll('script').forEach(old => {
+              const s = document.createElement('script');
+              [...old.attributes].forEach(a => s.setAttribute(a.name, a.value));
+              if (old.textContent) s.textContent = old.textContent;
+              old.replaceWith(s);
+            });
+          })
+          .catch(() => window.open(`${BASE_URL}/admin/console?embed=1`, '_blank', 'noopener'));
+      } catch {
+        window.open(`${BASE_URL}/admin/console?embed=1`, '_blank', 'noopener');
+      }
+    }
+
+    function iframeEmbed() {
+      const iframe = document.createElement('iframe');
+      iframe.id = IFRAME_ID;
+      iframe.src = `${BASE_URL}/admin/console?embed=1`;
+      iframe.setAttribute('allow', 'clipboard-read; clipboard-write');
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
+      Object.assign(iframe.style, { border:'0', width:'100%', height:'100%', background:'#fff' });
+      shell.appendChild(iframe);
+      let done = false;
+      const t = setTimeout(() => { if (!done) inlineEmbed(); }, 1200);
+      iframe.addEventListener('load', () => { done = true; clearTimeout(t); });
+      window.addEventListener('message', (e) => {
+        if (e?.data === 'sgc-ready') { done = true; clearTimeout(t); }
+      }, { once:false });
+    }
+
+    iframeEmbed();
   }
 
   function closeConsole() {

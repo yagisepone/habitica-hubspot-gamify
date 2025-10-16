@@ -1,5 +1,6 @@
 // src/server.ts
 import express from "express";
+import cors from "cors";
 import path from "path";
 import fs from "fs";
 
@@ -30,7 +31,7 @@ import { habiticaWebhook } from "./features/habitica_daily.js";
 import { csvDetect, csvUpsert } from "./features/csv_handlers.js";
 
 // Admin UI（既存）
-import { dashboardHandler, mappingHandler } from "./routes/admin.js";
+import { dashboardHandler, mappingHandler, consoleHandler } from "./routes/admin.js";
 
 // 観測ラベル（既存）
 import { labelsGet, labelsPut } from "./routes/labels.js";
@@ -49,6 +50,13 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const app = express();
 app.set("x-powered-by", false);
 app.set("trust proxy", true);
+
+app.use(
+  cors({
+    origin: [/^https?:\/\/([^/]+\.)?habitica\.com$/],
+    credentials: false,
+  })
+);
 
 /* ===========================================
    BODY PARSER (keep raw body for webhook signature)
@@ -123,6 +131,7 @@ app.use(
 );
 
 // /admin/console （UI 一式）
+app.get("/admin/console", consoleHandler);
 app.use(
   "/admin/console",
   express.static(ADMIN_STATIC_DIR, {

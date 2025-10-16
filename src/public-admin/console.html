@@ -6,6 +6,10 @@
   <title>Sales Gamify Console</title>
 </head>
 <body>
+<div id="sgc-skeleton" style="position:fixed;inset:0;background:#fff"></div>
+<script>
+  try { window.parent?.postMessage('sgc-ready','*'); } catch(_) {}
+</script>
 
 <script>
 /* ------------------------------
@@ -28,6 +32,31 @@
   } catch(_){}
 })();
 </script>
+
+<script>
+(function(){
+  try{
+    var EMBED = new URL(location.href).searchParams.get('embed') === '1';
+    window.__SGC_EMBED__ = EMBED;
+    var prof = {};
+    try{ prof = JSON.parse(localStorage.getItem("sgc.profile.v3")||"{}")||{}; }catch(_){}
+    var b = (prof.baseUrl||"").replace(/\/+$/,'');
+    if(b){
+      var baseTag = document.createElement('base');
+      baseTag.href = b + '/';
+      document.head.appendChild(baseTag);
+    }
+    if(EMBED && b && (prof.token || prof.tenant)){
+      document.documentElement.classList.add('embed-has-profile');
+    }
+  }catch(_){}
+})();
+</script>
+
+<style id="sgc-embed-css">
+  .embed-has-profile #sgc-header-controls { display: none !important; }
+  .embed-has-profile #sgc-fab { display: none !important; }
+</style>
 
 <script>
 /* ==UserScript==
@@ -2746,10 +2775,12 @@
 </script>
 
 <script>
-// この単体ページを開いたら自動でモーダルを表示
+// この単体ページを開いたら自動でモーダルを表示（embed=1 の場合のみ）
 (function openWhenReady(){
-  const el = document.getElementById('sgc-fab');
-  if (el) { el.click(); return; }
+  var EMBED = (window.__SGC_EMBED__ === true) || (new URL(location.href).searchParams.get('embed') === '1');
+  var el = document.getElementById('sgc-fab');
+  if (EMBED && el) { el.click(); return; }
+  if (!EMBED) { return; }
   setTimeout(openWhenReady, 100);
 })();
 </script>
