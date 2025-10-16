@@ -3010,5 +3010,46 @@ document.addEventListener('DOMContentLoaded', tryRemoveSkeleton, { once:true });
   })();
 </script>
 
+<script>
+(function(){
+  const params = new URLSearchParams(location.search);
+  const EMBED = params.get('embed') === '1' || params.has('embed');
+  function removeSkeleton(){
+    try {
+      const overlays = [
+        '#sg-mask',
+        '.v-overlay',
+        '.modal-backdrop',
+        '[data-embed-skeleton]',
+        '[aria-hidden="true"][style*="position: fixed"]'
+      ];
+      overlays.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => {
+          try { el.remove(); } catch(_) {}
+        });
+      });
+      document.documentElement.style.background = 'transparent';
+      document.documentElement.style.overflow = 'auto';
+      if (document.body) {
+        document.body.style.background = '#fff';
+        document.body.style.overflow = 'auto';
+      }
+      const hideSelectors = ['header', '.header', '#header', '#fab', '.fab'];
+      hideSelectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => {
+          try { el.style.display = 'none'; } catch(_) {}
+        });
+      });
+    } catch(_) {}
+  }
+  if (!EMBED) return;
+  removeSkeleton();
+  window.addEventListener('load', removeSkeleton);
+  setTimeout(removeSkeleton, 300);
+  setTimeout(removeSkeleton, 1000);
+  const observer = new MutationObserver(() => removeSkeleton());
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+})();
+</script>
 </body>
 </html>
