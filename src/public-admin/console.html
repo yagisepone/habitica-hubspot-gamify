@@ -13,7 +13,9 @@
 </script>
 
 <script>
-function removeSkeleton(){ try{ document.getElementById('sgc-skeleton')?.remove(); }catch(e){} }
+  document.addEventListener('DOMContentLoaded', function(){
+    try { document.getElementById('sgc-skeleton')?.remove(); } catch(_){ }
+  }, { once:true });
 </script>
 
 <script>
@@ -76,6 +78,7 @@ function removeSkeleton(){ try{ document.getElementById('sgc-skeleton')?.remove(
 
 (() => {
   /* ====== 基本ユーティリティ ====== */
+  const removeSkeleton = () => { try { document.getElementById("sgc-skeleton")?.remove(); } catch(_){} };
   removeSkeleton();
   const LS_KEY  = "sgc.profile.v3";
   const LS_VIEW = "sgc.view.v3";
@@ -953,11 +956,11 @@ function removeSkeleton(){ try{ document.getElementById('sgc-skeleton')?.remove(
   }
 
   function openModal(){
-    removeSkeleton();
     ensureModal();
     syncFabState();
     profile=loadProfile();
     modal.classList.add("is-open");
+    removeSkeleton();
     modal.querySelector("#sgc-tenant").value=profile.tenant||"default";
     modal.querySelector("#sgc-base").value=profile.baseUrl||"";
     modal.querySelector("#sgc-token").value=profile.token||"";
@@ -2774,6 +2777,14 @@ function removeSkeleton(){ try{ document.getElementById('sgc-skeleton')?.remove(
     ensureFab();
     setupFabObserver();
     maintainFab();
+    try{
+      const isTop = window.top === window.self;
+      const params = new URLSearchParams(location.search);
+      if (isTop && params.get("embed") === "1") {
+        openModal();
+      }
+    }catch(_){ }
+    setTimeout(removeSkeleton, 300);
   }
   if(document.readyState==="complete"){ start(); }
   else window.addEventListener("load", start, {once:true});
