@@ -3051,7 +3051,8 @@ document.addEventListener('DOMContentLoaded', tryRemoveSkeleton, { once:true });
   observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
 </script>
+  <!-- Fallback loader: <base> 影響下でも必ず実行されるように絶対パス指定 -->
+  <script defer src="/admin/console.fallback.js"></script>
+  <script>try{window.parent&&window.parent.postMessage('sgc-ready','*')}catch(e){}</script>
 </body>
-<!-- absolute path so <base> never breaks it -->
-<script defer src="/admin/console.fallback.js"></script>
 </html>

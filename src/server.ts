@@ -154,6 +154,40 @@ app.get("/admin/console/*", (_req, res) => {
   res.sendFile(path.join(ADMIN_STATIC_DIR, "console.html"));
 });
 
+// fallback loader (JS) — ensure correct MIME even if file is missing
+app.get("/admin/console.fallback.js", (_req, res) => {
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  const filePath = path.join(ADMIN_STATIC_DIR, "console.fallback.js");
+  try {
+    const txt = fs.readFileSync(filePath, "utf8");
+    if (txt) {
+      res.send(txt);
+      return;
+    }
+  } catch (err) {
+    log(`[admin] fallback js missing (${String(err)}) — sending inline copy`);
+  }
+  try {
+    const inline = fs.readFileSync(path.join(__dirname, "public-admin", "console.fallback.js"), "utf8");
+    res.send(inline);
+  } catch (err) {
+    res.send(
+      "// fallback inline bootstrap could not be loaded\nconsole.error('console.fallback inline missing');\n"
+    );
+  }
+});
+
+// 汎用: /admin/** を静的に配信（favicon/js/css 404/MIME 対策）
+app.use(
+  "/admin",
+  express.static(ADMIN_STATIC_DIR, {
+    extensions: ["js", "css", "html"],
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "public, max-age=300");
+    },
+  })
+);
+
 // 互換: 旧エントリポイント（/admin/console/i.js, /i.js）
 app.get("/admin/console/i.js", (_req, res) => {
   res.type("application/javascript");

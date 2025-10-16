@@ -58,6 +58,8 @@
       wrap.appendChild(h1);
       wrap.appendChild(p);
       wrap.appendChild(pre);
+
+      try { window.parent && window.parent.postMessage("sgc-ready","*"); } catch {}
     } catch (e) {
       console.error("console.fallback failed", e);
       const msg = document.createElement("div");
