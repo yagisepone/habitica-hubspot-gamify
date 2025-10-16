@@ -1053,6 +1053,7 @@
       badgesCache = [];
       auditCache = [];
       render();
+      window.__CONSOLE_MAIN_RENDERED__ = true;
     }catch(e){ console.warn(e); toast("読み込みエラー", true); }
   }
 
