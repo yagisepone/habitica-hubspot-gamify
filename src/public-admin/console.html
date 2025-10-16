@@ -5,6 +5,24 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Sales Gamify Console</title>
   <link rel="icon" href="data:,">
+  <script>
+    // Habitica 埋め込み時、環境により removeSkeleton が未定義で落ちるのを防ぐ
+    if (typeof window.removeSkeleton !== "function") {
+      window.removeSkeleton = function noop() {};
+    }
+    // 親フレーム側に removeSkeleton がある場合は優先して呼ぶ（例外も握りつぶす）
+    window.tryRemoveSkeleton = function () {
+      try {
+        if (window.parent && typeof window.parent.removeSkeleton === "function") {
+          window.parent.removeSkeleton();
+          return;
+        }
+      } catch (e) {}
+      try {
+        if (typeof window.removeSkeleton === "function") window.removeSkeleton();
+      } catch (e) {}
+    };
+  </script>
 </head>
 <body>
 <div id="sgc-skeleton" style="position:fixed;inset:0;background:#fff"></div>
@@ -14,7 +32,7 @@
 
 <script>
   document.addEventListener('DOMContentLoaded', function(){
-    try { document.getElementById('sgc-skeleton')?.remove(); } catch(_){ }
+    try { window.tryRemoveSkeleton?.(); } catch(_){ }
   }, { once:true });
 </script>
 
@@ -79,7 +97,8 @@
 (() => {
   /* ====== 基本ユーティリティ ====== */
   const removeSkeleton = () => { try { document.getElementById("sgc-skeleton")?.remove(); } catch(_){} };
-  removeSkeleton();
+  window.removeSkeleton = removeSkeleton;
+  tryRemoveSkeleton();
   const LS_KEY  = "sgc.profile.v3";
   const LS_VIEW = "sgc.view.v3";
   const LS_UNDO = "sgc.undo.v1";
@@ -960,7 +979,7 @@
     syncFabState();
     profile=loadProfile();
     modal.classList.add("is-open");
-    removeSkeleton();
+    tryRemoveSkeleton();
     modal.querySelector("#sgc-tenant").value=profile.tenant||"default";
     modal.querySelector("#sgc-base").value=profile.baseUrl||"";
     modal.querySelector("#sgc-token").value=profile.token||"";
@@ -2784,7 +2803,7 @@
         openModal();
       }
     }catch(_){ }
-    setTimeout(removeSkeleton, 300);
+    setTimeout(tryRemoveSkeleton, 300);
   }
   if(document.readyState==="complete"){ start(); }
   else window.addEventListener("load", start, {once:true});
@@ -2804,7 +2823,7 @@
 </script>
 
 <script>
-document.addEventListener('DOMContentLoaded', removeSkeleton, { once:true });
+document.addEventListener('DOMContentLoaded', tryRemoveSkeleton, { once:true });
 </script>
 
 <!-- === Readability / Comfort Mode (v2025-10-14) === -->
