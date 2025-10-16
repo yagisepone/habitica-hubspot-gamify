@@ -1,46 +1,81 @@
-// Minimal, safe boot if the real app didn't render anything.
-// 1) guard: if something already drew meaningful content, do nothing
-(function () {
-  // provide noop for old calls
-  window.removeSkeleton = window.removeSkeleton || function(){};
+// Minimal, safe fallback for /admin/console
+// - Do nothing if main UI rendered successfully
+// - Provide no-op removeSkeleton (past error guard)
+// - If main failed to render (likely due to <base> + relative paths), fetch and show JSON
+(() => {
+  if (window.__CONSOLE_FALLBACK_ATTACHED__) return;
+  window.__CONSOLE_FALLBACK_ATTACHED__ = true;
 
-  function bodyLooksEmpty() {
-    const t = (document.body.textContent || "").trim();
-    // consider "Sales Gamify Console" header or any non-empty content as rendered
-    return document.body.children.length === 0 || t.length === 0;
+  // Past log guard: "removeSkeleton is not defined"
+  if (typeof window.removeSkeleton !== "function") {
+    window.removeSkeleton = () => {};
   }
 
-  // Run after current task queue to allow earlier scripts to render first
-  setTimeout(async () => {
-    try {
-      if (!bodyLooksEmpty()) return; // real app already rendered
-
-      // Create minimal app container
-      const root = document.getElementById("sgc-root") || document.createElement("div");
-      root.id = "sgc-root";
-      root.style.cssText = "max-width:1080px;margin:16px auto;padding:16px;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;color:#222";
-      root.innerHTML = "<h1 style='margin:0 0 12px'>Sales Gamify Console</h1><div id='sgc-status'>Loading…</div>";
-      if (!root.isConnected) document.body.appendChild(root);
-
-      const status = document.getElementById("sgc-status");
-
-      async function j(p){ const r = await fetch(p, {credentials:"include"}); if(!r.ok) throw new Error(p+" "+r.status); return r.json(); }
-      const [rules, labels] = await Promise.all([ j("/rules"), j("/labels") ]);
-
-      // Simple render so it's not blank (keeps prod usable while we track real UI)
-      const pre = document.createElement("pre");
-      pre.style.cssText = "background:#f6f7f8;border:1px solid #e5e7eb;border-radius:8px;padding:12px;overflow:auto;max-height:60vh";
-      pre.textContent = JSON.stringify({ rules, labels }, null, 2);
-      status.textContent = "Loaded (fallback view)";
-      status.style.opacity = "0.7";
-      status.insertAdjacentElement("afterend", pre);
-    } catch (e) {
-      const err = document.createElement("div");
-      err.style.cssText = "color:#b00020;margin-top:8px";
-      err.textContent = "Failed to boot console: " + (e && e.message ? e.message : e);
-      document.body.appendChild(err);
-      // ensure we never leave user with a blank page
-      console.error(e);
+  const hasVisibleContent = () => {
+    const candidates = [
+      "[data-console-root]",
+      "#console-root",
+      "#admin-console-root",
+      "#root",
+      "main"
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el && el.childElementCount > 0) return true;
     }
-  }, 0);
+    const text = (document.body && document.body.innerText || "").trim();
+    return text.length > 20;
+  };
+
+  const showFallback = async () => {
+    if (window.__CONSOLE_FALLBACK_DONE__) return;
+    window.__CONSOLE_FALLBACK_DONE__ = true;
+    try {
+      const [rulesRes, labelsRes] = await Promise.all([
+        fetch("/rules", { credentials: "include" }),
+        fetch("/labels", { credentials: "include" })
+      ]);
+      const rules = await rulesRes.json().catch(() => null);
+      const labels = await labelsRes.json().catch(() => null);
+
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "font:14px/1.5 system-ui,sans-serif;padding:16px;max-width:960px;margin:0 auto;";
+      const h1 = document.createElement("div");
+      h1.textContent = "Loaded (fallback view)";
+      h1.style.cssText = "font-weight:700;font-size:18px;margin-bottom:6px;";
+      const p = document.createElement("div");
+      p.textContent =
+        "本来のコンソールの読み込みに失敗したため、最低限のデータを表示しています。";
+      p.style.cssText = "margin-bottom:12px;";
+      const pre = document.createElement("pre");
+      pre.style.cssText =
+        "white-space:pre-wrap;background:#f6f8fa;border:1px solid #eaecef;border-radius:8px;padding:12px;overflow:auto;max-height:70vh;";
+      pre.textContent = JSON.stringify({ rules, labels }, null, 2);
+
+      document.body.innerHTML = "";
+      document.body.appendChild(wrap);
+      wrap.appendChild(h1);
+      wrap.appendChild(p);
+      wrap.appendChild(pre);
+    } catch (e) {
+      console.error("console.fallback failed", e);
+      const msg = document.createElement("div");
+      msg.textContent = "Fallback failed to fetch data.";
+      document.body.appendChild(msg);
+    }
+  };
+
+  const decide = () => {
+    if (!hasVisibleContent()) {
+      showFallback();
+    }
+  };
+
+  if (document.readyState === "complete") {
+    setTimeout(decide, 700);
+  } else {
+    window.addEventListener("load", () => setTimeout(decide, 700));
+    setTimeout(decide, 2000);
+  }
 })();
