@@ -31,7 +31,7 @@ import { habiticaWebhook } from "./features/habitica_daily.js";
 import { csvDetect, csvUpsert } from "./features/csv_handlers.js";
 
 // Admin UI（既存）
-import { dashboardHandler, mappingHandler, consoleHandler } from "./routes/admin.js";
+import { dashboardHandler, mappingHandler } from "./routes/admin.js";
 
 // 観測ラベル（既存）
 import { labelsGet, labelsPut } from "./routes/labels.js";
@@ -130,30 +130,6 @@ app.use(
   })
 );
 
-// /admin/console （UI 一式）
-app.get("/admin/console", consoleHandler);
-app.use(
-  "/admin/console",
-  express.static(ADMIN_STATIC_DIR, {
-    index: "console.html",
-    extensions: ["html", "js", "css"],
-    setHeaders(res, filePath) {
-      // JS/CSS は短めキャッシュ、HTML はほぼno-cache
-      if (filePath.endsWith(".js") || filePath.endsWith(".css")) {
-        res.setHeader("Cache-Control", "public, max-age=300");
-      } else {
-        res.setHeader("Cache-Control", "no-cache");
-      }
-      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-    },
-  })
-);
-
-// 直リンクで末尾がスラッシュでないパスも console.html にフォールバック
-app.get("/admin/console/*", (_req, res) => {
-  res.sendFile(path.join(ADMIN_STATIC_DIR, "console.html"));
-});
-
 // fallback loader (JS) — ensure correct MIME even if file is missing
 app.get("/admin/console.fallback.js", (_req, res) => {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
@@ -174,6 +150,76 @@ app.get("/admin/console.fallback.js", (_req, res) => {
     res.send(
       "// fallback inline bootstrap could not be loaded\nconsole.error('console.fallback inline missing');\n"
     );
+  }
+});
+
+function readAdminTextSafe(filePath: string): string {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function resolveAdminAsset(assetPath: string): string {
+  if (!assetPath) return "";
+  const cleaned = assetPath.split(/[?#]/)[0];
+  if (/^\/?admin\//i.test(cleaned)) {
+    return path.join(__dirname, cleaned.replace(/^\/?admin\//i, "public-admin/"));
+  }
+  if (cleaned.startsWith("/")) {
+    return path.join(ADMIN_STATIC_DIR, cleaned.replace(/^\//, ""));
+  }
+  return path.join(ADMIN_STATIC_DIR, cleaned);
+}
+
+function inlineAdminConsole(rawHtml: string): string {
+  let html = rawHtml;
+
+  if (!/<base\s+href=/i.test(html)) {
+    html = html.replace(/<head(\s[^>]*)?>/i, (match) => `${match}\n  <base href="/admin/">`);
+  }
+
+  html = html.replace(/<link[^>]+rel=["']stylesheet["'][^>]*href=["']([^"']+)["'][^>]*>/gi, (match, href) => {
+    if (/^https?:\/\//i.test(href)) return match;
+    const css = readAdminTextSafe(resolveAdminAsset(href));
+    return css ? `<style>\n${css}\n</style>` : match;
+  });
+
+  html = html.replace(/<script([^>]*?)\s+src=["']([^"']+)["'][^>]*>\s*<\/script>/gi, (match, attrs, src) => {
+    if (/^https?:\/\//i.test(src)) return match;
+    const js = readAdminTextSafe(resolveAdminAsset(src));
+    if (!js) return match;
+    const attrText = attrs ? attrs.replace(/\s+$/, "") : "";
+    return `<script${attrText}>\n${js}\n</script>`;
+  });
+
+  if (!html.includes("window.parent&&window.parent.postMessage('sgc-ready'")) {
+    html = html.replace(/<\/body>\s*<\/html>\s*$/i, `<script>try{window.parent&&window.parent.postMessage('sgc-ready','*')}catch(e){}</script>\n</body>\n</html>`);
+  }
+
+  const fallbackJs = readAdminTextSafe(path.join(ADMIN_STATIC_DIR, "console.fallback.js"));
+  if (fallbackJs) {
+    html = html.replace(/<\/body>\s*<\/html>\s*$/i, `<script>\n${fallbackJs}\n</script>\n</body>\n</html>`);
+  }
+
+  return html;
+}
+
+app.get("/admin/console", (_req, res) => {
+  const htmlPath = path.join(ADMIN_STATIC_DIR, "console.html");
+  const raw = readAdminTextSafe(htmlPath);
+  if (!raw) {
+    return res.status(404).type("text/plain").send("console.html not found");
+  }
+  try {
+    const inlined = inlineAdminConsole(raw);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(inlined);
+  } catch (error) {
+    console.error("[admin] inline console error", error);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(raw);
   }
 });
 
