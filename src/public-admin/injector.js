@@ -68,38 +68,28 @@
     e ? closeOverlay() : openOverlay();
   }
 
-  function ensureGear() {
+function ensureGear(){
     if (document.getElementById("sgc-gear")) return;
     const gear = document.createElement("button");
     gear.id = "sgc-gear";
-    gear.setAttribute("aria-label", "Sales Gamify Console");
+    gear.setAttribute("aria-label","Sales Gamify Console");
     gear.textContent = "⚙️";
     gear.style.cssText = [
-      "position:fixed",
-      "top:16px",
-      "right:16px",
-      `z-index:${zTop + 1}`,
-      "width:40px",
-      "height:40px",
-      "border-radius:20px",
-      "background:#6c5ce7",
-      "color:#fff",
-      "border:none",
+      "position:fixed","top:16px","right:16px",`z-index:${zTop+1}`,
+      "width:40px","height:40px","border-radius:20px",
+      "background:#6c5ce7","color:#fff","border:none",
       "box-shadow:0 6px 18px rgba(0,0,0,.25)",
-      "font-size:18px",
-      "line-height:40px",
-      "text-align:center",
-      "cursor:pointer",
-      "user-select:none",
-      "opacity:.92",
+      "font-size:18px","line-height:40px","text-align:center",
+      "cursor:pointer","user-select:none","opacity:.96"
     ].join(";");
-    gear.onmouseenter = () => (gear.style.opacity = "1");
-    gear.onmouseleave = () => (gear.style.opacity = ".92");
+    gear.onmouseenter = ()=> gear.style.opacity = "1";
+    gear.onmouseleave = ()=> gear.style.opacity = ".96";
     gear.onclick = toggleOverlay;
     document.body.appendChild(gear);
+    placeGearSafely();
   }
 
-  function installHideGems() {
+function installHideGems() {
     if (window.__hideGemsUnmount) return;
 
     const HCLS = "x-hide-gem-paid";
@@ -218,11 +208,49 @@
     addToggle();
   }
 
+  function placeGearSafely(){
+    const gear = document.getElementById("sgc-gear");
+    if (!gear) return;
+    const SAFETY_GAP = 8;
+    const TOP_MIN = 16;
+    const RIGHT_EDGE = 220;
+    const TOP_SCAN = 120;
+    let top = TOP_MIN;
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const nodes = Array.from(
+      document.querySelectorAll(
+        'a,button,[role="button"],[tabindex],.btn,[class*="Button"],[class*="button"]'
+      )
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width === 0 || r.height === 0) return false;
+      const nearRight = vw - r.right < RIGHT_EDGE;
+      const nearTop = r.top < TOP_SCAN;
+      return nearRight && nearTop;
+    });
+    let maxBottom = 0;
+    for (const el of nodes) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > maxBottom) maxBottom = r.bottom;
+    }
+    const desiredTop = Math.max(TOP_MIN, Math.ceil(maxBottom + SAFETY_GAP));
+    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 0) - 56);
+    top = Math.min(desiredTop, maxTop);
+    gear.style.top = `${top}px`;
+  }
+
   function boot() {
     ensureGear();
     const mo = new MutationObserver(() => ensureGear());
     mo.observe(document.documentElement, { childList: true, subtree: true });
     installHideGems();
+    placeGearSafely();
+    window.addEventListener("resize", placeGearSafely);
+    new MutationObserver(() => placeGearSafely()).observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+    });
   }
 
   if (!window.__SGC_LOADED__) {
