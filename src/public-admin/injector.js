@@ -1,8 +1,8 @@
 // src/public-admin/injector.js
-// Overlay Console + Hide-Gems (強化版)
-// - ギア: 右上の小型丸ボタン。被りを最小化
-// - オーバーレイ: 余白なしの全画面 iframe（overlay=1 を付けて内部UIの「設定」等を隠す）
-// - ジェム非表示: :has() + Fallback監視。トグルは右上で視認性UP
+// Overlay Console + Hide-Gems（強化版）
+// - ギア: 「パーティーを見る」ボタン直下にアンカー（見つからない場合は右上安全配置）
+// - オーバーレイ: 全画面 iframe（overlay=1 で内部UIの二重設定を抑制）
+// - ジェム非表示: :has() 優先 + Fallback 監視。トグルは常に⚙️の真下へ追従
 
 (function () {
   const KEY = "sgc.profile.v3";
@@ -38,6 +38,7 @@
     });
     return String(p.baseUrl || "") + "/admin/console/#" + qs.toString();
   }
+
   function openOverlay() {
     closeOverlay();
     const mask = document.createElement("div");
@@ -59,10 +60,12 @@
     mask.append(fr, close);
     document.body.appendChild(mask);
   }
+
   function closeOverlay() {
     const e = document.getElementById("sgc-overlay");
     if (e) e.remove();
   }
+
   function toggleOverlay() {
     const e = document.getElementById("sgc-overlay");
     e ? closeOverlay() : openOverlay();
@@ -80,7 +83,7 @@
       "right:16px",
       `z-index:${zTop + 1}`,
       "width:40px",
-      "height:35px",
+      "height:40px",
       "border-radius:20px",
       "background:#6c5ce7",
       "color:#fff",
@@ -97,16 +100,61 @@
     gear.onmouseleave = () => (gear.style.opacity = ".96");
     gear.onclick = toggleOverlay;
     document.body.appendChild(gear);
-    placeGearSafely();
+    if (!placeGearUnderParty()) placeGearSafely();
+    positionGemToggleNearGear();
+  }
+
+  function findPartyButton() {
+    const nodes = document.querySelectorAll(
+      'a,button,[role="button"],.btn,[class*="Button"],[class*="button"]'
+    );
+    const keys = ["パーティ", "パーティー", "Party", "ViewParty", "ViewPartyButton"];
+    let best = null;
+    let bestArea = 0;
+    nodes.forEach((el) => {
+      if (!el.isConnected) return;
+      const r = el.getBoundingClientRect();
+      if (!r || r.width === 0 || r.height === 0) return;
+      const t = (el.textContent || "").replace(/\s+/g, "").trim();
+      if (keys.some((k) => t.includes(k))) {
+        const area = r.width * r.height;
+        if (area > bestArea) {
+          bestArea = area;
+          best = el;
+        }
+      }
+    });
+    return best;
+  }
+
+  function placeGearUnderParty() {
+    const gear = document.getElementById("sgc-gear");
+    if (!gear) return false;
+    const btn = findPartyButton();
+    if (!btn) return false;
+    const r = btn.getBoundingClientRect();
+    const GAP = 8;
+    const SIZE = 40;
+    const RIGHT_MIN = 16;
+    const TOP_MIN = 16;
+
+    const rightOffset = Math.max(RIGHT_MIN, Math.round(window.innerWidth - r.right));
+    let top = Math.round(r.bottom + GAP);
+    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 800) - (SIZE + 16));
+    top = Math.min(top, maxTop);
+
+    gear.style.right = `${rightOffset}px`;
+    gear.style.top = `${top}px`;
+    positionGemToggleNearGear();
+    return true;
   }
 
   function placeGearSafely() {
     const gear = document.getElementById("sgc-gear");
     if (!gear) return;
-
     const TOP_MIN = 16;
     const RIGHT_MARGIN = 16;
-    const GEAR_SIZE = 40;
+    const SIZE = 40;
     const GAP = 8;
     const RIGHT_ZONE_W = 360;
     const TOP_ZONE_H = 260;
@@ -127,24 +175,12 @@
     ).filter((el) => {
       const r = el.getBoundingClientRect();
       if (!r || r.width === 0 || r.height === 0) return false;
-      const inZone = !(
+      return !(
         r.right < zone.left ||
         r.left > zone.right ||
         r.bottom < zone.top ||
         r.top > zone.bottom
       );
-      if (!inZone) return false;
-      const t = (el.textContent || "").trim();
-      if (
-        t.includes("パーティ") ||
-        t.includes("見る") ||
-        /party/i.test(t) ||
-        t === "設定" ||
-        /settings?/i.test(t)
-      ) {
-        return true;
-      }
-      return true;
     });
 
     candidates.push(
@@ -162,8 +198,8 @@
       })
     );
 
-    const left = vw - RIGHT_MARGIN - GEAR_SIZE;
     let top = TOP_MIN;
+    const left = vw - RIGHT_MARGIN - SIZE;
     let iterations = 0;
 
     const intersects = (a, b) =>
@@ -175,7 +211,7 @@
       );
 
     while (iterations++ < MAX_ITER) {
-      const box = { left, right: left + GEAR_SIZE, top, bottom: top + GEAR_SIZE };
+      const box = { left, right: left + SIZE, top, bottom: top + SIZE };
       let bumped = false;
       let bumpTo = top;
       for (const el of candidates) {
@@ -190,12 +226,26 @@
       top = bumpTo;
     }
 
-    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 800) - (GEAR_SIZE + 16));
-    gear.style.top = Math.min(top, maxTop) + "px";
-    gear.style.right = RIGHT_MARGIN + "px";
+    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 800) - (SIZE + 16));
+    gear.style.top = `${Math.min(top, maxTop)}px`;
+    gear.style.right = `${RIGHT_MARGIN}px`;
+    positionGemToggleNearGear();
   }
 
-function installHideGems() {
+  function positionGemToggleNearGear() {
+    const toggle = document.getElementById("x-hide-gem-btn");
+    const gear = document.getElementById("sgc-gear");
+    if (!toggle || !gear) return;
+    const cs = window.getComputedStyle(gear);
+    const top = parseInt(cs.top, 10) || 16;
+    const right = parseInt(cs.right, 10) || 16;
+    toggle.style.position = "fixed";
+    toggle.style.top = `${top + 48}px`;
+    toggle.style.right = `${right}px`;
+    toggle.style.zIndex = `${zTop + 1}`;
+  }
+
+  function installHideGems() {
     if (window.__hideGemsUnmount) return;
 
     const HCLS = "x-hide-gem-paid";
@@ -241,17 +291,10 @@ function installHideGems() {
     const markGemCard = (root) => {
       const card =
         root.closest('li,.item,.shop-item,.grid-item,[class*="Item"],[class*="card"]') || root;
-      if (card && !card.classList.contains(HCLS) && isGemCard(card)) {
-        card.classList.add(HCLS);
-      }
+      if (card && !card.classList.contains(HCLS) && isGemCard(card)) card.classList.add(HCLS);
     };
     const sweep = () => {
-      let n = 0;
-      candidates().forEach((el) => {
-        markGemCard(el);
-        if (el.classList.contains(HCLS)) n++;
-      });
-      return n;
+      candidates().forEach((el) => markGemCard(el));
     };
 
     let supportsHas = false;
@@ -277,7 +320,7 @@ function installHideGems() {
       sweep();
     }
 
-    const addToggle = () => {
+    function addToggle() {
       if (document.getElementById(BTN_ID)) return;
       const b = document.createElement("button");
       b.id = BTN_ID;
@@ -303,7 +346,9 @@ function installHideGems() {
         delete window.__hideGemsUnmount;
       };
       document.body.appendChild(b);
-    };
+      positionGemToggleNearGear();
+    }
+
     window.__hideGemsUnmount = () => {
       rm(STYLE_ID);
       const b = document.getElementById(BTN_ID);
@@ -311,17 +356,23 @@ function installHideGems() {
       document.querySelectorAll("." + HCLS).forEach((x) => x.classList.remove(HCLS));
       delete window.__hideGemsUnmount;
     };
+
     addToggle();
   }
 
-    function boot() {
+  function reflowUI() {
+    if (!placeGearUnderParty()) placeGearSafely();
+    positionGemToggleNearGear();
+  }
+
+  function boot() {
     ensureGear();
-    const mo = new MutationObserver(() => ensureGear());
-    mo.observe(document.documentElement, { childList: true, subtree: true });
+    const ensureMo = new MutationObserver(() => ensureGear());
+    ensureMo.observe(document.documentElement, { childList: true, subtree: true });
     installHideGems();
-    placeGearSafely();
-    window.addEventListener("resize", placeGearSafely);
-    new MutationObserver(() => placeGearSafely()).observe(document.body, {
+    reflowUI();
+    window.addEventListener("resize", reflowUI);
+    new MutationObserver(reflowUI).observe(document.body, {
       subtree: true,
       childList: true,
       attributes: true,
