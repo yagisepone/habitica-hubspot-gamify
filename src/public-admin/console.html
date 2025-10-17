@@ -1854,38 +1854,23 @@
       ensure();
     }
   })();
-</script>
-
-<script>
+</script><script>
 (function(){
   try{
-    const params = new URLSearchParams(location.hash.replace(/^#/, ""));
-    if (params.get("overlay") === "1") {
+    const p=new URLSearchParams(location.hash.replace(/^#/, ""));
+    if(p.get("overlay")==="1"){
       document.documentElement.classList.add("sgc-overlay-mode");
-      const kill = () => {
-        document.querySelectorAll("button, .btn, [role='button']").forEach(el=>{
-          const t=(el.textContent||"").trim();
-          if (t==="設定" || t==="Settings") el.remove();
-        });
-      };
-      kill();
-      new MutationObserver(kill).observe(document.body,{subtree:true,childList:true});
+      const kill=()=>{document.querySelectorAll("button,.btn,[role='button']").forEach(el=>{const t=(el.textContent||"").trim(); if(t==="設定"||t==="Settings") el.remove();});};
+      kill(); new MutationObserver(kill).observe(document.body,{subtree:true,childList:true});
     }
   }catch(e){}
 })();
 </script>
 <style>
-  .sgc-overlay-mode body        { margin:0 !important; }
-  .sgc-overlay-mode #app,
-  .sgc-overlay-mode main,
-  .sgc-overlay-mode .container,
-  .sgc-overlay-mode .wrap,
-  .sgc-overlay-mode .content,
-  .sgc-overlay-mode .pane {
-    width:100vw !important; max-width:100vw !important;
-    padding:0 !important; margin:0 !important; border-radius:0 !important;
+  .sgc-overlay-mode body{margin:0!important}
+  .sgc-overlay-mode #app,.sgc-overlay-mode main,.sgc-overlay-mode .container,.sgc-overlay-mode .wrap,.sgc-overlay-mode .content{
+    width:100vw!important;max-width:100vw!important;padding:0!important;margin:0!important;border-radius:0!important;
   }
 </style>
-
 </body>
 </html>
