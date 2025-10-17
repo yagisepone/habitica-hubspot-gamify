@@ -68,25 +68,131 @@
     e ? closeOverlay() : openOverlay();
   }
 
-function ensureGear(){
+  function ensureGear() {
     if (document.getElementById("sgc-gear")) return;
     const gear = document.createElement("button");
     gear.id = "sgc-gear";
-    gear.setAttribute("aria-label","Sales Gamify Console");
+    gear.setAttribute("aria-label", "Sales Gamify Console");
     gear.textContent = "⚙️";
     gear.style.cssText = [
-      "position:fixed","top:16px","right:16px",`z-index:${zTop+1}`,
-      "width:40px","height:40px","border-radius:20px",
-      "background:#6c5ce7","color:#fff","border:none",
+      "position:fixed",
+      "top:16px",
+      "right:16px",
+      `z-index:${zTop + 1}`,
+      "width:40px",
+      "height:35px",
+      "border-radius:20px",
+      "background:#6c5ce7",
+      "color:#fff",
+      "border:none",
       "box-shadow:0 6px 18px rgba(0,0,0,.25)",
-      "font-size:18px","line-height:40px","text-align:center",
-      "cursor:pointer","user-select:none","opacity:.96"
+      "font-size:18px",
+      "line-height:40px",
+      "text-align:center",
+      "cursor:pointer",
+      "user-select:none",
+      "opacity:.96",
     ].join(";");
-    gear.onmouseenter = ()=> gear.style.opacity = "1";
-    gear.onmouseleave = ()=> gear.style.opacity = ".96";
+    gear.onmouseenter = () => (gear.style.opacity = "1");
+    gear.onmouseleave = () => (gear.style.opacity = ".96");
     gear.onclick = toggleOverlay;
     document.body.appendChild(gear);
     placeGearSafely();
+  }
+
+  function placeGearSafely() {
+    const gear = document.getElementById("sgc-gear");
+    if (!gear) return;
+
+    const TOP_MIN = 16;
+    const RIGHT_MARGIN = 16;
+    const GEAR_SIZE = 40;
+    const GAP = 8;
+    const RIGHT_ZONE_W = 360;
+    const TOP_ZONE_H = 260;
+    const MAX_ITER = 10;
+
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const zone = {
+      left: vw - RIGHT_ZONE_W,
+      right: vw,
+      top: 0,
+      bottom: TOP_ZONE_H,
+    };
+
+    const candidates = Array.from(
+      document.querySelectorAll(
+        'a,button,[role="button"],[tabindex],.btn,[class*="Button"],[class*="button"],[class*="pill"],[class*="Chip"],[class*="Badge"],[class*="popover"],[class*="tooltip"],[class*="menu"]'
+      )
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width === 0 || r.height === 0) return false;
+      const inZone = !(
+        r.right < zone.left ||
+        r.left > zone.right ||
+        r.bottom < zone.top ||
+        r.top > zone.bottom
+      );
+      if (!inZone) return false;
+      const t = (el.textContent || "").trim();
+      if (
+        t.includes("パーティ") ||
+        t.includes("見る") ||
+        /party/i.test(t) ||
+        t === "設定" ||
+        /settings?/i.test(t)
+      ) {
+        return true;
+      }
+      return true;
+    });
+
+    candidates.push(
+      ...Array.from(document.querySelectorAll("*")).filter((el) => {
+        const st = window.getComputedStyle(el);
+        if (st.position !== "fixed") return false;
+        const r = el.getBoundingClientRect();
+        if (!r || r.width === 0 || r.height === 0) return false;
+        return !(
+          r.right < zone.left ||
+          r.left > zone.right ||
+          r.bottom < zone.top ||
+          r.top > zone.bottom
+        );
+      })
+    );
+
+    const left = vw - RIGHT_MARGIN - GEAR_SIZE;
+    let top = TOP_MIN;
+    let iterations = 0;
+
+    const intersects = (a, b) =>
+      !(
+        a.right <= b.left ||
+        a.left >= b.right ||
+        a.bottom <= b.top ||
+        a.top >= b.bottom
+      );
+
+    while (iterations++ < MAX_ITER) {
+      const box = { left, right: left + GEAR_SIZE, top, bottom: top + GEAR_SIZE };
+      let bumped = false;
+      let bumpTo = top;
+      for (const el of candidates) {
+        const r = el.getBoundingClientRect();
+        if (!r) continue;
+        if (intersects(box, r)) {
+          bumped = true;
+          bumpTo = Math.max(bumpTo, Math.ceil(r.bottom + GAP));
+        }
+      }
+      if (!bumped) break;
+      top = bumpTo;
+    }
+
+    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 800) - (GEAR_SIZE + 16));
+    gear.style.top = Math.min(top, maxTop) + "px";
+    gear.style.right = RIGHT_MARGIN + "px";
   }
 
 function installHideGems() {
@@ -208,38 +314,7 @@ function installHideGems() {
     addToggle();
   }
 
-  function placeGearSafely(){
-    const gear = document.getElementById("sgc-gear");
-    if (!gear) return;
-    const SAFETY_GAP = 8;
-    const TOP_MIN = 16;
-    const RIGHT_EDGE = 220;
-    const TOP_SCAN = 120;
-    let top = TOP_MIN;
-    const vw = window.innerWidth || document.documentElement.clientWidth;
-    const nodes = Array.from(
-      document.querySelectorAll(
-        'a,button,[role="button"],[tabindex],.btn,[class*="Button"],[class*="button"]'
-      )
-    ).filter((el) => {
-      const r = el.getBoundingClientRect();
-      if (!r || r.width === 0 || r.height === 0) return false;
-      const nearRight = vw - r.right < RIGHT_EDGE;
-      const nearTop = r.top < TOP_SCAN;
-      return nearRight && nearTop;
-    });
-    let maxBottom = 0;
-    for (const el of nodes) {
-      const r = el.getBoundingClientRect();
-      if (r.bottom > maxBottom) maxBottom = r.bottom;
-    }
-    const desiredTop = Math.max(TOP_MIN, Math.ceil(maxBottom + SAFETY_GAP));
-    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 0) - 56);
-    top = Math.min(desiredTop, maxTop);
-    gear.style.top = `${top}px`;
-  }
-
-  function boot() {
+    function boot() {
     ensureGear();
     const mo = new MutationObserver(() => ensureGear());
     mo.observe(document.documentElement, { childList: true, subtree: true });
