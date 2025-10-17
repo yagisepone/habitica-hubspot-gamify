@@ -10,6 +10,17 @@ import {
 } from "../lib/env.js";
 import { log } from "../lib/utils.js";
 
+export type TrophyRule = {
+  id: string;
+  title: string;
+  event: "call" | "appointment" | "approval" | "sales" | "label";
+  filter?: { labelId?: string; labelTitle?: string; maker?: string };
+  window: { type: "daily" | "weekly" | "monthly" | "rolling"; days?: number };
+  threshold: { count?: number; amountYen?: number; minutes?: number; streakDays?: number };
+  reward: { xp?: number; badge?: string; chatwork?: boolean };
+  enabled?: boolean;
+};
+
 type Rules = {
   xp: {
     call: { perCall: number };
@@ -23,6 +34,7 @@ type Rules = {
   };
   approval: { enabled: boolean; xp: number; badge: string };
   sales: { milestones: Array<{ amount: number; xp: number; badge?: string }> };
+  trophies: TrophyRule[];
 };
 
 const RULES_DIR = path.resolve("data/rules");
@@ -43,6 +55,7 @@ function defaults(): Rules {
     },
     approval: { enabled: true, xp: 0, badge: "承認" },
     sales: { milestones: [] },
+    trophies: [],
   };
 }
 
@@ -117,6 +130,79 @@ function normalizeRules(b: any): Rules {
     xp: Math.max(0, Number(m?.xp) || 0),
     badge: m?.badge ? String(m.badge) : undefined,
   }));
+
+  const rawTrophies = Array.isArray(b?.trophies) ? b.trophies : [];
+  const allowedEvents: TrophyRule["event"][] = ["call", "appointment", "approval", "sales", "label"];
+  const allowedWindows: TrophyRule["window"]["type"][] = ["daily", "weekly", "monthly", "rolling"];
+  const normalizeFilter = (f: any) => {
+    const obj: NonNullable<TrophyRule["filter"]> = {};
+    const labelId = String(f?.labelId ?? f?.label_id ?? "").trim();
+    const labelTitle = String(f?.labelTitle ?? f?.label_title ?? "").trim();
+    const maker = String(f?.maker ?? "").trim();
+    if (labelId) obj.labelId = labelId;
+    if (labelTitle) obj.labelTitle = labelTitle;
+    if (maker) obj.maker = maker;
+    return Object.keys(obj).length ? obj : undefined;
+  };
+  const normalizeWindow = (w: any): TrophyRule["window"] => {
+    const typeRaw = String(w?.type ?? "").trim().toLowerCase();
+    const type = allowedWindows.includes(typeRaw as TrophyRule["window"]["type"])
+      ? (typeRaw as TrophyRule["window"]["type"])
+      : "daily";
+    if (type === "rolling") {
+      const daysNum = Number(w?.days);
+      const days =
+        Number.isFinite(daysNum) && daysNum > 0 ? Math.floor(daysNum) : 7;
+      return { type, days };
+    }
+    return { type };
+  };
+  const normalizeThreshold = (t: any): TrophyRule["threshold"] => {
+    const num = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+    };
+    const out: TrophyRule["threshold"] = {};
+    const count = num(t?.count);
+    if (count != null) out.count = count;
+    const minutes = num(t?.minutes);
+    if (minutes != null) out.minutes = minutes;
+    const amount = num(t?.amountYen ?? t?.amount);
+    if (amount != null) out.amountYen = amount;
+    const streak = num(t?.streakDays ?? t?.streak);
+    if (streak != null) out.streakDays = streak;
+    return out;
+  };
+  const normalizeReward = (rw: any): TrophyRule["reward"] => {
+    const reward: TrophyRule["reward"] = {};
+    const xpRaw = Number(rw?.xp);
+    if (Number.isFinite(xpRaw) && xpRaw > 0) reward.xp = Math.floor(xpRaw);
+    const badge = String(rw?.badge || "").trim();
+    if (badge) reward.badge = badge;
+    if (rw?.chatwork) reward.chatwork = true;
+    return reward;
+  };
+
+  r.trophies = rawTrophies.map((entry: any, idx: number) => {
+    const idRaw = String(entry?.id || "").trim();
+    const eventRaw = String(entry?.event || "").trim().toLowerCase();
+    const enabled =
+      entry?.enabled === false ? false : true;
+    const title = String(entry?.title || "").trim() || "称号";
+    const event = allowedEvents.includes(eventRaw as TrophyRule["event"])
+      ? (eventRaw as TrophyRule["event"])
+      : "label";
+    return {
+      id: idRaw || `trophy_${idx + 1}`,
+      title,
+      event,
+      filter: normalizeFilter(entry?.filter),
+      window: normalizeWindow(entry?.window),
+      threshold: normalizeThreshold(entry?.threshold),
+      reward: normalizeReward(entry?.reward ?? {}),
+      enabled,
+    };
+  });
 
   return r;
 }

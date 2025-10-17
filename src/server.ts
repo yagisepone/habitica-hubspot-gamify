@@ -19,6 +19,7 @@ import { requireEditorToken } from "./lib/auth.js";
 
 // ルールAPI（既存）
 import { rulesGet, rulesPut, statsToday as statsTodayBase } from "./routes/rules.js";
+import { trophiesGet, trophiesPut, trophiesRun } from "./routes/trophies.js";
 
 // Webhook（既存）
 import { hubspotWebhook } from "./features/hubspot.js";
@@ -31,6 +32,7 @@ import { csvDetect, csvUpsert } from "./features/csv_handlers.js";
 
 // Admin UI（既存）
 import { dashboardHandler, mappingHandler } from "./routes/admin.js";
+import { partyPutConfig, partyGetSuggest, partyHabiticaSync } from "./routes/party.js";
 
 // 観測ラベル（既存）
 import { labelsGet, labelsPut } from "./routes/labels.js";
@@ -74,6 +76,18 @@ app.use(
     },
   })
 );
+
+const PUBLIC_ADMIN_STATIC_DIRS = [
+  path.resolve(process.cwd(), "dist", "public-admin"),
+  path.resolve(process.cwd(), "src", "public-admin"),
+];
+const mountedPublicDirs = new Set<string>();
+for (const dir of PUBLIC_ADMIN_STATIC_DIRS) {
+  if (fs.existsSync(dir) && !mountedPublicDirs.has(dir)) {
+    app.use("/public-admin", express.static(dir));
+    mountedPublicDirs.add(dir);
+  }
+}
 
 // === CORS: すべてのパスで許可（特に /tenant/* /admin/*） ===
 app.use((req, res, next) => {
@@ -125,6 +139,16 @@ app.post("/admin/csv", express.text({ type: "text/csv", limit: "20mb" }), csvUps
 /* Admin UI（既存） */
 app.get("/admin/dashboard", dashboardHandler);
 app.get("/admin/mapping", mappingHandler);
+
+/* トロフィー（称号） */
+app.get("/tenant/:id/trophies", trophiesGet);
+app.put("/tenant/:id/trophies", express.json({ limit: "1mb" }), trophiesPut);
+app.post("/tenant/:id/trophies/run", trophiesRun);
+
+/* パーティ自動化 */
+app.put("/tenant/:id/party/config", express.json({ limit: "1mb" }), partyPutConfig);
+app.get("/tenant/:id/party/suggest", partyGetSuggest);
+app.post("/tenant/:id/party/habitica-sync", partyHabiticaSync);
 
 /* Operations API（新規） */
 app.use("/tenant", opsRouter);

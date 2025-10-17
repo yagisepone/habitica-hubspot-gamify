@@ -19,6 +19,10 @@ function headers(cred?: HabiticaCred) {
 }
 
 const BASE = process.env.HABITICA_BASE_URL || "https://habitica.com/api/v3";
+const BASE_V4 =
+  BASE.endsWith("/api/v3") || BASE.endsWith("/api/v3/")
+    ? BASE.replace(/\/api\/v3\/?$/, "/api/v4")
+    : `${BASE.replace(/\/+$/, "")}/v4`;
 
 export async function createTodo(
   title: string,
@@ -133,4 +137,62 @@ export async function addSales(
   const todo = await createTodo(title, notes, undefined, cred);
   const id = (todo as any)?.id;
   if (id) await completeTask(id, cred);
+}
+
+type HabiticaRequestInit = {
+  method?: string;
+  body?: any;
+  headers?: Record<string, string>;
+};
+
+async function habitApi(cred: HabiticaCred, path: string, init: HabiticaRequestInit = {}) {
+  const h = headers(cred);
+  if (!h) throw new Error("no_credentials");
+  const url = `${BASE_V4}${path.startsWith("/") ? path : `/${path}`}`;
+  const mergedHeaders = { ...h, ...(init.headers || {}) };
+  const res = await fetch(url, {
+    ...(init as any),
+    headers: mergedHeaders,
+  } as any);
+  const json = await res.json().catch(() => undefined);
+  return { ok: res.ok, status: res.status, json };
+}
+
+export async function ensurePartyAndInvite(leader: HabiticaCred, member: HabiticaCred) {
+  let partyId: string | undefined;
+  try {
+    const current = await habitApi(leader, "/groups?type=party", { method: "GET" });
+    if (current.ok && Array.isArray(current.json?.data) && current.json.data[0]?.id) {
+      partyId = String(current.json.data[0].id);
+    }
+  } catch (err) {
+    console.warn("[party] failed to fetch party list", (err as Error)?.message || err);
+  }
+
+  if (!partyId) {
+    try {
+      const created = await habitApi(leader, "/groups", {
+        method: "POST",
+        body: JSON.stringify({ name: "Company Party", type: "party" }),
+      });
+      if (created.ok && created.json?.data?.id) {
+        partyId = String(created.json.data.id);
+      }
+    } catch (err) {
+      console.warn("[party] create party failed", (err as Error)?.message || err);
+    }
+  }
+
+  if (!partyId) {
+    throw new Error("failed to ensure party");
+  }
+
+  try {
+    await habitApi(leader, `/groups/${partyId}/invite`, {
+      method: "POST",
+      body: JSON.stringify({ uuids: [member.userId] }),
+    });
+  } catch (err) {
+    console.warn("[party] invite failed", (err as Error)?.message || err);
+  }
 }

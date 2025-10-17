@@ -49,6 +49,7 @@
   const PIN_KEY = "sgc_pin";
 
   const h = (html) => { const t=document.createElement("template"); t.innerHTML=html.trim(); return t.content.firstElementChild; };
+  const esc = (value) => String(value ?? "").replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch] || ch));
   const asNum=(v,d=0)=>{ const n=Number(v); return Number.isFinite(n)?n:d; };
   const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
   const load=(k,def={})=>{ try{ return JSON.parse(localStorage.getItem(k)||"")||def; }catch{ return def; } };
@@ -187,6 +188,9 @@
   /* ====== モーダル作成 ====== */
   let profile={}, currentTab="score", rulesCache=null, labelsCache=null;
   let adjustmentsCache=[], shopItemsCache=[], auditCache=[];
+  let trophiesCache=[];
+  let partyConfig={ domains:[], leaderEmail:"" };
+  let partyLastResult=null;
   let fabObserver=null;
   let modal, bodyArea;
 
@@ -261,8 +265,10 @@
       {id:"score",  label:"スコア設定"},
       {id:"hub",    label:"HubSpot連携（ラベル）"},
       {id:"approve",label:"承認・売上（CSV連動）"},
+      {id:"trophies", label:"称号/トロフィー"},
       {id:"csv",    label:"CSV取込"},
       {id:"dash",   label:"ダッシュボード"},
+      {id:"party",  label:"パーティ"},
       {id:"adjust", label:"手動調整"},
       {id:"shop",   label:"ショップ"},
       {id:"audit",  label:"監査ログ"},
@@ -302,11 +308,52 @@
       ]);
       rulesCache = rules || {};
       labelsCache = Array.isArray(labels?.items) ? labels.items : [];
+      await Promise.all([loadTrophies(), loadPartyConfig()]);
       adjustmentsCache = [];
       shopItemsCache = [];
       auditCache = [];
       render();
     }catch(e){ console.warn(e); toast("読み込みエラー", true); }
+  }
+
+  async function loadTrophies(){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl){ trophiesCache = []; return trophiesCache; }
+    try{
+      const url = `${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/trophies`;
+      const data = await apiGET(url, profile);
+      trophiesCache = Array.isArray(data) ? data : [];
+    }catch(e){
+      console.warn("[trophies] load failed", e);
+      trophiesCache = [];
+    }
+    return trophiesCache;
+  }
+
+  async function loadPartyConfig(){
+    ensureProfileFromInputs();
+    if(!profile.baseUrl){
+      partyConfig = { domains: [], leaderEmail: "" };
+      partyLastResult = null;
+      return partyConfig;
+    }
+    try{
+      const url = `${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/party/suggest`;
+      const data = await apiGET(url, profile);
+      if(data && typeof data === "object"){
+        partyConfig = {
+          domains: Array.isArray(data.domains) ? data.domains : [],
+          leaderEmail: String(data.leaderEmail || ""),
+        };
+        partyLastResult = null;
+        return data;
+      }
+    }catch(e){
+      console.warn("[party] load failed", e);
+    }
+    partyConfig = { domains: [], leaderEmail: "" };
+    partyLastResult = null;
+    return null;
   }
 
   async function saveAll(){
@@ -340,8 +387,10 @@
     if(currentTab==="score") renderScore();
     else if(currentTab==="hub") renderHub();
     else if(currentTab==="approve") renderApprove();
+    else if(currentTab==="trophies") renderTrophies();
     else if(currentTab==="csv") renderCSV();
     else if(currentTab==="dash") renderDash();
+    else if(currentTab==="party") renderParty();
     else if(currentTab==="adjust") renderAdjust();
     else if(currentTab==="shop") renderShop();
     else if(currentTab==="audit") renderAudit();
@@ -741,6 +790,288 @@
     }catch{
       return "";
     }
+  }
+
+  function renderTrophies(){
+    const initial = Array.isArray(trophiesCache) ? [...trophiesCache] : [];
+    const actions = h(`<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <button id="sgc-trophies-add" class="sgc-btn">＋ ルール追加</button>
+      <button id="sgc-trophies-save" class="sgc-btn primary">保存</button>
+      <button id="sgc-trophies-run" class="sgc-btn">手動実行</button>
+    </div>`);
+    bodyArea.appendChild(actions);
+    const list = h(`<div id="sgc-trophies-list" class="sgc-list" style="margin-top:10px;display:grid;gap:10px"></div>`);
+    bodyArea.appendChild(list);
+
+    const events = ["call","appointment","approval","sales","label"];
+    const windows = ["daily","weekly","monthly","rolling"];
+    const optionHtml = (values, selected) =>
+      values.map((v) => `<option value="${v}"${selected === v ? " selected" : ""}>${v}</option>`).join("");
+
+    function draw(itemsArr){
+      list.innerHTML = "";
+      if (!itemsArr.length) {
+        list.appendChild(h(`<div class="sgc-bare" style="padding:16px;color:#777">ルールは未登録です。「＋ ルール追加」で作成してください。</div>`));
+      }
+      itemsArr.forEach((item, idx) => {
+        const id = String(item?.id || `trophy_${idx + 1}`);
+        const threshold = item?.threshold || {};
+        const reward = item?.reward || {};
+        const filter = item?.filter || {};
+        const windowObj = item?.window || { type: "daily" };
+        const windowDaysValue =
+          windowObj.type === "rolling" && Number.isFinite(Number(windowObj.days))
+            ? Number(windowObj.days)
+            : "";
+        const card = h(`<div class="sgc-card" data-id="${esc(id)}"></div>`);
+        card.innerHTML = `
+          <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px">
+            <label>タイトル<input data-k="title" value="${esc(item?.title || "称号")}"></label>
+            <label>イベント<select data-k="event">${optionHtml(events, String(item?.event || "label"))}</select></label>
+            <label>有効<input data-k="enabled" type="checkbox"${item?.enabled === false ? "" : " checked"}></label>
+            <label>labelId<input data-k="filter.labelId" value="${esc(filter.labelId || "")}"></label>
+            <label>labelTitle<input data-k="filter.labelTitle" value="${esc(filter.labelTitle || "")}"></label>
+            <label>maker<input data-k="filter.maker" value="${esc(filter.maker || "")}"></label>
+            <label>ウィンドウ<select data-k="window.type">${optionHtml(windows, String(windowObj.type || "daily"))}</select></label>
+            <label>rolling日数<input data-k="window.days" type="number" min="1" value="${windowDaysValue}"></label>
+            <label>件数>=<input data-k="threshold.count" type="number" min="1" value="${Number.isFinite(Number(threshold.count)) ? Number(threshold.count) : ""}"></label>
+            <label>分数>=<input data-k="threshold.minutes" type="number" min="1" value="${Number.isFinite(Number(threshold.minutes)) ? Number(threshold.minutes) : ""}"></label>
+            <label>金額>=<input data-k="threshold.amountYen" type="number" min="1" value="${Number.isFinite(Number(threshold.amountYen)) ? Number(threshold.amountYen) : ""}"></label>
+            <label>連続日数>=<input data-k="threshold.streakDays" type="number" min="1" value="${Number.isFinite(Number(threshold.streakDays)) ? Number(threshold.streakDays) : ""}"></label>
+            <label>報酬XP<input data-k="reward.xp" type="number" min="0" value="${Number.isFinite(Number(reward.xp)) ? Number(reward.xp) : 0}"></label>
+            <label>バッジ<input data-k="reward.badge" value="${esc(reward.badge || "")}"></label>
+            <label>Chatwork<input data-k="reward.chatwork" type="checkbox"${reward.chatwork ? " checked" : ""}></label>
+          </div>`;
+        list.appendChild(card);
+      });
+      list.dataset.count = String(itemsArr.length);
+    }
+
+    function read(){
+      const cards = Array.from(list.querySelectorAll(".sgc-card"));
+      const toNumber = (val) => {
+        const num = Number(val);
+        return Number.isFinite(num) ? num : undefined;
+      };
+      const result = cards.map((card, idx) => {
+        const get = (key) => card.querySelector(`[data-k="${key}"]`);
+        const id = card.getAttribute("data-id") || `trophy_${idx + 1}`;
+        const titleEl = get("title");
+        const eventEl = get("event");
+        const enabledEl = get("enabled");
+        const labelIdEl = get("filter.labelId");
+        const labelTitleEl = get("filter.labelTitle");
+        const makerEl = get("filter.maker");
+        const windowTypeEl = get("window.type");
+        const windowDaysEl = get("window.days");
+        const thCountEl = get("threshold.count");
+        const thMinutesEl = get("threshold.minutes");
+        const thAmountEl = get("threshold.amountYen");
+        const thStreakEl = get("threshold.streakDays");
+        const rewardXpEl = get("reward.xp");
+        const rewardBadgeEl = get("reward.badge");
+        const rewardChatworkEl = get("reward.chatwork");
+
+        const title = titleEl ? String(titleEl.value || "称号") : "称号";
+        const event = eventEl ? String(eventEl.value || "label") : "label";
+        const enabled = enabledEl ? !!enabledEl.checked : true;
+        const labelId = labelIdEl ? String(labelIdEl.value || "").trim() : "";
+        const labelTitle = labelTitleEl ? String(labelTitleEl.value || "").trim() : "";
+        const maker = makerEl ? String(makerEl.value || "").trim() : "";
+        const windowType = windowTypeEl ? String(windowTypeEl.value || "daily") : "daily";
+        const windowDays = windowDaysEl ? toNumber(windowDaysEl.value) : undefined;
+        const thresholdCount = thCountEl ? toNumber(thCountEl.value) : undefined;
+        const thresholdMinutes = thMinutesEl ? toNumber(thMinutesEl.value) : undefined;
+        const thresholdAmount = thAmountEl ? toNumber(thAmountEl.value) : undefined;
+        const thresholdStreak = thStreakEl ? toNumber(thStreakEl.value) : undefined;
+        const rewardXp = rewardXpEl ? toNumber(rewardXpEl.value) ?? 0 : 0;
+        const rewardBadge = rewardBadgeEl ? String(rewardBadgeEl.value || "").trim() : "";
+        const rewardChatwork = rewardChatworkEl ? !!rewardChatworkEl.checked : false;
+
+        const filter = {};
+        if (labelId) filter.labelId = labelId;
+        if (labelTitle) filter.labelTitle = labelTitle;
+        if (maker) filter.maker = maker;
+
+        const threshold = {};
+        if (thresholdCount != null) threshold.count = thresholdCount;
+        if (thresholdMinutes != null) threshold.minutes = thresholdMinutes;
+        if (thresholdAmount != null) threshold.amountYen = thresholdAmount;
+        if (thresholdStreak != null) threshold.streakDays = thresholdStreak;
+
+        const windowObj = { type: windowType };
+        if (windowType === "rolling" && windowDays != null) windowObj.days = windowDays;
+
+        const reward = { xp: Math.max(0, rewardXp) };
+        if (rewardBadge) reward.badge = rewardBadge;
+        if (rewardChatwork) reward.chatwork = true;
+
+        return {
+          id,
+          title,
+          event,
+          enabled,
+          filter: Object.keys(filter).length ? filter : undefined,
+          window: windowObj,
+          threshold,
+          reward,
+        };
+      });
+      trophiesCache = result;
+      return result;
+    }
+
+    draw(initial);
+
+    actions.querySelector("#sgc-trophies-add").addEventListener("click", () => {
+      const current = read();
+      const nextIndex = current.length + 1;
+      current.push({
+        id: `trophy_${nextIndex}`,
+        title: "称号",
+        event: "label",
+        enabled: true,
+        window: { type: "daily" },
+        threshold: {},
+        reward: { xp: 0 },
+      });
+      draw(current);
+    });
+
+    actions.querySelector("#sgc-trophies-save").addEventListener("click", async () => {
+      ensureProfileFromInputs();
+      if (!profile.baseUrl) { toast("BaseURL を入力してください", true); return; }
+      const body = read();
+      try {
+        await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/trophies`, body, profile);
+        await loadTrophies();
+        const refreshed = Array.isArray(trophiesCache) ? [...trophiesCache] : [];
+        draw(refreshed);
+        toast("トロフィールールを保存しました");
+      } catch (e) {
+        console.error(e);
+        toast("トロフィールールの保存に失敗しました", true);
+      }
+    });
+
+    actions.querySelector("#sgc-trophies-run").addEventListener("click", async () => {
+      ensureProfileFromInputs();
+      if (!profile.baseUrl) { toast("BaseURL を入力してください", true); return; }
+      try {
+        await apiPOST(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/trophies/run`, {}, profile);
+        toast("手動実行を受け付けました");
+      } catch (e) {
+        console.error(e);
+        toast("手動実行に失敗しました", true);
+      }
+    });
+  }
+
+  function renderParty(){
+    const domains = Array.isArray(partyConfig?.domains) ? partyConfig.domains : [];
+    const leader = String(partyConfig?.leaderEmail || "");
+    const domainRow = h(`<div class="sgc-row">
+      <label>自動パーティ化ドメイン（カンマ区切り）
+        <input id="sgc-party-domains" placeholder="example.co.jp,wabisabi.co.jp" value="${esc(domains.join(","))}">
+      </label>
+    </div>`);
+    const leaderRow = h(`<div class="sgc-row">
+      <label>Habitica Leader メール
+        <input id="sgc-party-leader" placeholder="leader@example.co.jp" value="${esc(leader)}">
+      </label>
+    </div>`);
+    const buttonRow = h(`<div class="sgc-row">
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <button id="sgc-party-save" class="sgc-btn primary">保存</button>
+        <button id="sgc-party-preview" class="sgc-btn">候補プレビュー</button>
+        <button id="sgc-party-sync" class="sgc-btn">Habiticaへ同期（招待）</button>
+      </div>
+    </div>`);
+
+    bodyArea.appendChild(domainRow);
+    bodyArea.appendChild(leaderRow);
+    bodyArea.appendChild(buttonRow);
+
+    const resultPre = document.createElement("pre");
+    resultPre.id = "sgc-party-result";
+    resultPre.style.whiteSpace = "pre-wrap";
+    resultPre.style.fontFamily = "Menlo,Consolas,monospace";
+    resultPre.style.fontSize = "13px";
+    resultPre.style.background = "#f5f5fa";
+    resultPre.style.borderRadius = "8px";
+    resultPre.style.padding = "12px";
+    resultPre.style.minHeight = "120px";
+    resultPre.textContent = partyLastResult ? JSON.stringify(partyLastResult, null, 2) : "";
+    bodyArea.appendChild(resultPre);
+
+    const domainsInput = domainRow.querySelector("#sgc-party-domains");
+    const leaderInput = leaderRow.querySelector("#sgc-party-leader");
+    const parseDomains = () =>
+      String(domainsInput?.value || "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+
+    buttonRow.querySelector("#sgc-party-save").addEventListener("click", async () => {
+      ensureProfileFromInputs();
+      if (!profile.baseUrl) { toast("BaseURL を入力してください", true); return; }
+      const domainsSan = parseDomains();
+      const leaderSan = String(leaderInput?.value || "").trim().toLowerCase();
+      try {
+        await apiPUT(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/party/config`, { domains: domainsSan, leaderEmail: leaderSan }, profile);
+        partyConfig = { domains: domainsSan, leaderEmail: leaderSan };
+        partyLastResult = null;
+        resultPre.textContent = "";
+        if (domainsInput) domainsInput.value = domainsSan.join(",");
+        if (leaderInput) leaderInput.value = leaderSan;
+        toast("パーティ設定を保存しました");
+      } catch (e) {
+        console.error(e);
+        toast("パーティ設定の保存に失敗しました", true);
+      }
+    });
+
+    buttonRow.querySelector("#sgc-party-preview").addEventListener("click", async () => {
+      ensureProfileFromInputs();
+      if (!profile.baseUrl) { toast("BaseURL を入力してください", true); return; }
+      try {
+        const data = await apiGET(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/party/suggest`, profile);
+        partyLastResult = data;
+        resultPre.textContent = data ? JSON.stringify(data, null, 2) : "";
+        if (data && typeof data === "object") {
+          if (Array.isArray(data.domains)) {
+            const san = data.domains.map((d) => String(d || "").toLowerCase().trim()).filter(Boolean);
+            partyConfig.domains = san;
+            if (domainsInput) domainsInput.value = san.join(",");
+          }
+          if (data.leaderEmail) {
+            const leaderSan = String(data.leaderEmail || "").toLowerCase().trim();
+            partyConfig.leaderEmail = leaderSan;
+            if (leaderInput) leaderInput.value = leaderSan;
+          }
+        }
+        toast("候補を取得しました");
+      } catch (e) {
+        console.error(e);
+        toast("候補の取得に失敗しました", true);
+      }
+    });
+
+    buttonRow.querySelector("#sgc-party-sync").addEventListener("click", async () => {
+      ensureProfileFromInputs();
+      if (!profile.baseUrl) { toast("BaseURL を入力してください", true); return; }
+      const leaderSan = String(leaderInput?.value || "").trim().toLowerCase();
+      if (!leaderSan) { toast("Leader メールを入力してください", true); return; }
+      try {
+        const res = await apiPOST(`${profile.baseUrl}/tenant/${encodeURIComponent(profile.tenant)}/party/habitica-sync`, {}, profile);
+        partyLastResult = res;
+        resultPre.textContent = res ? JSON.stringify(res, null, 2) : "";
+        toast("Habitica招待を実行しました");
+      } catch (e) {
+        console.error(e);
+        toast("Habitica招待に失敗しました", true);
+      }
+    });
   }
 
   /* ====== CSV取込 ====== */
