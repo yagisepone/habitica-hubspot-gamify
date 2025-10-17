@@ -77,17 +77,54 @@ app.use(
   })
 );
 
-const PUBLIC_ADMIN_STATIC_DIRS = [
-  path.resolve(process.cwd(), "dist", "public-admin"),
-  path.resolve(process.cwd(), "src", "public-admin"),
-];
-const mountedPublicDirs = new Set<string>();
-for (const dir of PUBLIC_ADMIN_STATIC_DIRS) {
-  if (fs.existsSync(dir) && !mountedPublicDirs.has(dir)) {
-    app.use("/public-admin", express.static(dir));
-    mountedPublicDirs.add(dir);
-  }
+function corsHeaders(
+  _req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  next();
 }
+const setStaticHeaders = (res: any, _path?: string, _stat?: any) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Cross-Origin-Resource-Policy", "cross-origin");
+};
+
+const PUB_DIST = path.resolve(__dirname, "../public-admin");
+const PUB_ROOT = path.resolve(process.cwd(), "public-admin");
+const PUB_SRC = path.resolve(process.cwd(), "src/public-admin");
+
+if (fs.existsSync(PUB_DIST)) {
+  app.use(
+    "/public-admin",
+    corsHeaders,
+    express.static(PUB_DIST, { setHeaders: setStaticHeaders })
+  );
+}
+if (fs.existsSync(PUB_ROOT)) {
+  app.use(
+    "/public-admin",
+    corsHeaders,
+    express.static(PUB_ROOT, { setHeaders: setStaticHeaders })
+  );
+}
+
+app.get("/public-admin/injector.js", corsHeaders, (_req, res) => {
+  const candidates = [
+    path.join(PUB_DIST, "injector.js"),
+    path.join(PUB_ROOT, "injector.js"),
+    path.join(PUB_SRC, "injector.js"),
+  ];
+  const file = candidates.find((f) => fs.existsSync(f));
+  if (!file) {
+    return res.status(404).type("text/plain").send("injector.js not found");
+  }
+  res.type("application/javascript");
+  res.sendFile(file);
+});
 
 // === CORS: すべてのパスで許可（特に /tenant/* /admin/*） ===
 app.use((req, res, next) => {
