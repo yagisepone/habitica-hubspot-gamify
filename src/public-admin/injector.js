@@ -1,387 +1,129 @@
-// src/public-admin/injector.js
-// Overlay Console + Hide-Gems（強化版）
-// - ギア: 「パーティーを見る」ボタン直下にアンカー（見つからない場合は右上安全配置）
-// - オーバーレイ: 全画面 iframe（overlay=1 で内部UIの二重設定を抑制）
-// - ジェム非表示: :has() 優先 + Fallback 監視。トグルは常に⚙️の真下へ追従
+(() => {
+  if (window.__SGC_LOADED__) { window.SGC?.toggle(); return; }
+  window.__SGC_LOADED__ = true;
 
-(function () {
-  const KEY = "sgc.profile.v3";
-  const zTop = 2147483600;
+  // --- state & storage ---
+  const LS_POS = "sgc.fab.pos.v1";
+  const LS_CFG = "sgc.settings.v1";
+  const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || "null") ?? d; } catch { return d; } };
+  const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+  const cfg = load(LS_CFG, { tenant:"", baseUrl:"https://sales-gamify.onrender.com", token:"" });
+  const pos = load(LS_POS, { right: 18, bottom: 18 }); // 位置保存（右下デフォルト）
 
-  try {
-    const cur = JSON.parse(localStorage.getItem(KEY) || "null");
-    if (!cur || !cur.baseUrl || !cur.tenant || !cur.token) {
-      localStorage.setItem(
-        KEY,
-        JSON.stringify({
-          baseUrl: "https://sales-gamify.onrender.com",
-          tenant: "ワビサビ株式会社",
-          token: "wabisabi-habitica-hubspot-connection",
-        })
-      );
+  // --- Shadow DOM (CSSを隔離) ---
+  const host = document.createElement("div");
+  document.documentElement.appendChild(host);
+  const root = host.attachShadow({ mode: "open" });
+
+  const css = document.createElement("style");
+  css.textContent = `
+    .sgc-fab { position: fixed; z-index: 999999; }
+    .sgc-fab .btn {
+      all: unset; background:#6b5b95; color:#fff; font:600 14px/1 system-ui;
+      padding:10px 12px; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.2);
+      cursor:pointer; user-select:none;
     }
-  } catch {}
-  const p = (() => {
+    .sgc-mask { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 999998; }
+    .sgc-modal {
+      position: fixed; right: 24px; bottom: 72px; width: 760px; max-width: calc(100vw - 40px);
+      max-height: calc(100vh - 120px); background:#fff; border-radius:12px; overflow:hidden;
+      box-shadow: 0 10px 30px rgba(0,0,0,.25); display:flex; flex-direction:column; z-index: 999999;
+    }
+    .hd { display:flex; gap:10px; align-items:center; padding:12px 14px; background:#f6f7fb; border-bottom:1px solid #e8eaf2; }
+    .hd .ttl { font:700 15px system-ui; color:#333; margin-right:auto; }
+    .hd input { font:14px system-ui; padding:6px 8px; border:1px solid #dcdfea; border-radius:8px; width:180px; }
+    .hd .token { width:230px; }
+    .hd .btn { all:unset; background:#4c7ef3; color:#fff; padding:8px 10px; border-radius:8px; cursor:pointer; }
+    .body { padding:12px 14px; overflow:auto; }
+    .ft { padding:8px 14px; border-top:1px solid #e8eaf2; display:flex; justify-content:space-between; font:12px system-ui; color:#666; }
+    .close { all:unset; background:#eee; padding:4px 8px; border-radius:6px; cursor:pointer; }
+    .toast { position: fixed; right: 24px; top: 24px; background:#222; color:#fff; padding:10px 12px; border-radius:10px; z-index: 1000000; }
+  `;
+  root.append(css);
+
+  const elFab = document.createElement("div");
+  elFab.className = "sgc-fab";
+  elFab.style.right = pos.right + "px";
+  elFab.style.bottom = pos.bottom + "px";
+  elFab.innerHTML = `<button class="btn" title="ドラッグで移動">⚙ 設定</button>`;
+
+  const elMask = document.createElement("div");
+  elMask.className = "sgc-mask"; elMask.hidden = true;
+
+  const elModal = document.createElement("div");
+  elModal.className = "sgc-modal"; elModal.hidden = true;
+  elModal.innerHTML = `
+    <div class="hd">
+      <div class="ttl">Sales Gamify Console</div>
+      <input placeholder="Tenant" value="${cfg.tenant}">
+      <input placeholder="BaseURL" value="${cfg.baseUrl}">
+      <input placeholder="Token" type="password" class="token" value="${cfg.token}">
+      <button class="btn ping">Ping</button>
+      <button class="btn save">保存</button>
+      <button class="close">閉じる</button>
+    </div>
+    <div class="body">
+      <p>背景のHabiticaは見えるまま、ここに設定UIを並べていきます。</p>
+    </div>
+    <div class="ft">
+      <span>SGC v2.1</span>
+      <span class="role"></span>
+    </div>
+  `;
+
+  root.append(elFab, elMask, elModal);
+
+  // --- 開閉 & Toast ---
+  const show = () => { elMask.hidden = false; elModal.hidden = false; };
+  const hide = () => { elMask.hidden = true;  elModal.hidden = true;  };
+  const toast = (m, t=1800) => {
+    const x = document.createElement("div");
+    x.className = "toast"; x.textContent = m; root.append(x); setTimeout(()=>x.remove(), t);
+  };
+
+  // --- ボタン動作 ---
+  root.querySelector(".btn")?.addEventListener("click", show);
+  elMask.addEventListener("click", hide);
+  elModal.querySelector(".close").addEventListener("click", hide);
+
+  // --- Ping/保存 ---
+  elModal.querySelector(".save").addEventListener("click", () => {
+    const [tenant, baseUrl, token] = Array.from(elModal.querySelectorAll(".hd input")).map(i=>i.value.trim());
+    save(LS_CFG, { tenant, baseUrl: baseUrl.replace(/\\/+$/,""), token });
+    toast("保存しました");
+  });
+  elModal.querySelector(".ping").addEventListener("click", async () => {
+    const [tenant, baseUrl, token] = Array.from(elModal.querySelectorAll(".hd input")).map(i=>i.value.trim());
     try {
-      return JSON.parse(localStorage.getItem(KEY) || "{}") || {};
-    } catch {
-      return {};
-    }
+      const r = await fetch(baseUrl.replace(/\\/+$/,"") + "/ping", { headers: { "x-sgc-token": token } });
+      const j = await r.json().catch(()=>({}));
+      elModal.querySelector(".role").textContent = "Role: " + (j.role || "unknown");
+      toast(r.ok ? "Ping OK" : "Ping NG");
+    } catch(e){ toast("Ping NG"); }
+  });
+
+  // --- FAB: ドラッグで位置変更（座標保存） ---
+  (() => {
+    const btn = elFab.querySelector(".btn");
+    let dragging = false, sx=0, sy=0, sr=0, sb=0;
+    btn.addEventListener("mousedown", (ev) => {
+      if (ev.button !== 0) return;
+      dragging = true; sx = ev.clientX; sy = ev.clientY;
+      sr = parseInt(elFab.style.right); sb = parseInt(elFab.style.bottom);
+      ev.preventDefault();
+    });
+    window.addEventListener("mousemove", (ev) => {
+      if (!dragging) return;
+      const dx = ev.clientX - sx, dy = ev.clientY - sy;
+      elFab.style.right  = Math.max(8, sr - dx) + "px";
+      elFab.style.bottom = Math.max(8, sb - dy) + "px";
+    });
+    window.addEventListener("mouseup", () => {
+      if (!dragging) return; dragging = false;
+      save(LS_POS, { right: parseInt(elFab.style.right), bottom: parseInt(elFab.style.bottom) });
+    });
   })();
 
-  function consoleUrl() {
-    const qs = new URLSearchParams({
-      tenant: String(p.tenant || ""),
-      token: String(p.token || ""),
-      base: String(p.baseUrl || ""),
-      overlay: "1",
-    });
-    return String(p.baseUrl || "") + "/admin/console/#" + qs.toString();
-  }
-
-  function openOverlay() {
-    closeOverlay();
-    const mask = document.createElement("div");
-    mask.id = "sgc-overlay";
-    mask.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,.30);z-index:${zTop}`;
-
-    const fr = document.createElement("iframe");
-    fr.src = consoleUrl();
-    fr.allow = "clipboard-read; clipboard-write";
-    fr.style.cssText =
-      "position:absolute;inset:0;width:100vw;height:100vh;border:0;border-radius:0;box-shadow:none;background:#fff";
-
-    const close = document.createElement("button");
-    close.textContent = "×";
-    close.title = "閉じる";
-    close.style.cssText = `position:fixed;top:14px;right:14px;width:40px;height:40px;border:0;border-radius:10px;background:#fff;box-shadow:0 4px 12px rgba(0,0,0,.2);font-size:20px;cursor:pointer;z-index:${zTop + 2}`;
-    close.onclick = () => mask.remove();
-
-    mask.append(fr, close);
-    document.body.appendChild(mask);
-  }
-
-  function closeOverlay() {
-    const e = document.getElementById("sgc-overlay");
-    if (e) e.remove();
-  }
-
-  function toggleOverlay() {
-    const e = document.getElementById("sgc-overlay");
-    e ? closeOverlay() : openOverlay();
-  }
-
-  function ensureGear() {
-    if (document.getElementById("sgc-gear")) return;
-    const gear = document.createElement("button");
-    gear.id = "sgc-gear";
-    gear.setAttribute("aria-label", "Sales Gamify Console");
-    gear.textContent = "⚙️";
-    gear.style.cssText = [
-      "position:fixed",
-      "top:16px",
-      "right:16px",
-      `z-index:${zTop + 1}`,
-      "width:40px",
-      "height:40px",
-      "border-radius:20px",
-      "background:#6c5ce7",
-      "color:#fff",
-      "border:none",
-      "box-shadow:0 6px 18px rgba(0,0,0,.25)",
-      "font-size:18px",
-      "line-height:40px",
-      "text-align:center",
-      "cursor:pointer",
-      "user-select:none",
-      "opacity:.96",
-    ].join(";");
-    gear.onmouseenter = () => (gear.style.opacity = "1");
-    gear.onmouseleave = () => (gear.style.opacity = ".96");
-    gear.onclick = toggleOverlay;
-    document.body.appendChild(gear);
-    if (!placeGearUnderParty()) placeGearSafely();
-    positionGemToggleNearGear();
-  }
-
-  function findPartyButton() {
-    const nodes = document.querySelectorAll(
-      'a,button,[role="button"],.btn,[class*="Button"],[class*="button"]'
-    );
-    const keys = ["パーティ", "パーティー", "Party", "ViewParty", "ViewPartyButton"];
-    let best = null;
-    let bestArea = 0;
-    nodes.forEach((el) => {
-      if (!el.isConnected) return;
-      const r = el.getBoundingClientRect();
-      if (!r || r.width === 0 || r.height === 0) return;
-      const t = (el.textContent || "").replace(/\s+/g, "").trim();
-      if (keys.some((k) => t.includes(k))) {
-        const area = r.width * r.height;
-        if (area > bestArea) {
-          bestArea = area;
-          best = el;
-        }
-      }
-    });
-    return best;
-  }
-
-  function placeGearUnderParty() {
-    const gear = document.getElementById("sgc-gear");
-    if (!gear) return false;
-    const btn = findPartyButton();
-    if (!btn) return false;
-    const r = btn.getBoundingClientRect();
-    const GAP = 8;
-    const SIZE = 40;
-    const RIGHT_MIN = 16;
-    const TOP_MIN = 16;
-
-    const rightOffset = Math.max(RIGHT_MIN, Math.round(window.innerWidth - r.right));
-    let top = Math.round(r.bottom + GAP);
-    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 800) - (SIZE + 16));
-    top = Math.min(top, maxTop);
-
-    gear.style.right = `${rightOffset}px`;
-    gear.style.top = `${top}px`;
-    positionGemToggleNearGear();
-    return true;
-  }
-
-  function placeGearSafely() {
-    const gear = document.getElementById("sgc-gear");
-    if (!gear) return;
-    const TOP_MIN = 16;
-    const RIGHT_MARGIN = 16;
-    const SIZE = 40;
-    const GAP = 8;
-    const RIGHT_ZONE_W = 360;
-    const TOP_ZONE_H = 260;
-    const MAX_ITER = 10;
-
-    const vw = window.innerWidth || document.documentElement.clientWidth;
-    const zone = {
-      left: vw - RIGHT_ZONE_W,
-      right: vw,
-      top: 0,
-      bottom: TOP_ZONE_H,
-    };
-
-    const candidates = Array.from(
-      document.querySelectorAll(
-        'a,button,[role="button"],[tabindex],.btn,[class*="Button"],[class*="button"],[class*="pill"],[class*="Chip"],[class*="Badge"],[class*="popover"],[class*="tooltip"],[class*="menu"]'
-      )
-    ).filter((el) => {
-      const r = el.getBoundingClientRect();
-      if (!r || r.width === 0 || r.height === 0) return false;
-      return !(
-        r.right < zone.left ||
-        r.left > zone.right ||
-        r.bottom < zone.top ||
-        r.top > zone.bottom
-      );
-    });
-
-    candidates.push(
-      ...Array.from(document.querySelectorAll("*")).filter((el) => {
-        const st = window.getComputedStyle(el);
-        if (st.position !== "fixed") return false;
-        const r = el.getBoundingClientRect();
-        if (!r || r.width === 0 || r.height === 0) return false;
-        return !(
-          r.right < zone.left ||
-          r.left > zone.right ||
-          r.bottom < zone.top ||
-          r.top > zone.bottom
-        );
-      })
-    );
-
-    let top = TOP_MIN;
-    const left = vw - RIGHT_MARGIN - SIZE;
-    let iterations = 0;
-
-    const intersects = (a, b) =>
-      !(
-        a.right <= b.left ||
-        a.left >= b.right ||
-        a.bottom <= b.top ||
-        a.top >= b.bottom
-      );
-
-    while (iterations++ < MAX_ITER) {
-      const box = { left, right: left + SIZE, top, bottom: top + SIZE };
-      let bumped = false;
-      let bumpTo = top;
-      for (const el of candidates) {
-        const r = el.getBoundingClientRect();
-        if (!r) continue;
-        if (intersects(box, r)) {
-          bumped = true;
-          bumpTo = Math.max(bumpTo, Math.ceil(r.bottom + GAP));
-        }
-      }
-      if (!bumped) break;
-      top = bumpTo;
-    }
-
-    const maxTop = Math.max(TOP_MIN, (window.innerHeight || 800) - (SIZE + 16));
-    gear.style.top = `${Math.min(top, maxTop)}px`;
-    gear.style.right = `${RIGHT_MARGIN}px`;
-    positionGemToggleNearGear();
-  }
-
-  function positionGemToggleNearGear() {
-    const toggle = document.getElementById("x-hide-gem-btn");
-    const gear = document.getElementById("sgc-gear");
-    if (!toggle || !gear) return;
-    const cs = window.getComputedStyle(gear);
-    const top = parseInt(cs.top, 10) || 16;
-    const right = parseInt(cs.right, 10) || 16;
-    toggle.style.position = "fixed";
-    toggle.style.top = `${top + 48}px`;
-    toggle.style.right = `${right}px`;
-    toggle.style.zIndex = `${zTop + 1}`;
-  }
-
-  function installHideGems() {
-    if (window.__hideGemsUnmount) return;
-
-    const HCLS = "x-hide-gem-paid";
-    const STYLE_ID = "x-hide-gem-style";
-    const BTN_ID = "x-hide-gem-btn";
-
-    const addStyle = (txt, id) => {
-      let s = document.getElementById(id);
-      if (!s) {
-        s = document.createElement("style");
-        s.id = id;
-        document.head.appendChild(s);
-      }
-      s.textContent = txt;
-    };
-    const rm = (id) => {
-      const el = document.getElementById(id);
-      if (el) el.remove();
-    };
-
-    const candidates = () =>
-      document.querySelectorAll(
-        `
-        [data-page='shops'] li,
-        [data-page='shops'] .item,
-        [data-page='shops'] [class*="ShopItem"],
-        .market li, .market .item,
-        .shop .item, .items .item,
-        [data-test="shopItem"],
-        [class*="shop-item"], [class*="grid-item"], [class*="ItemCard"], [class*="ItemTile"]
-      `
-      );
-    const isGemCard = (root) => {
-      if (root.querySelector('[data-test*="gem" i],[data-testid*="gem" i]')) return true;
-      if (root.querySelector('[aria-label*="Gem" i],[aria-label*="ジェム"]')) return true;
-      if (root.querySelector('svg[class*="gem" i],svg[aria-label*="Gem" i]')) return true;
-      if (root.querySelector('img[alt*="Gem" i],img[alt*="ジェム"]')) return true;
-      const txt = (root.textContent || "").replace(/\s+/g, " ").trim();
-      if (/([^a-z]|^)gem(s)?([^a-z]|$)/i.test(txt)) return true;
-      if (txt.includes("ジェム") || txt.includes("💎")) return true;
-      return false;
-    };
-    const markGemCard = (root) => {
-      const card =
-        root.closest('li,.item,.shop-item,.grid-item,[class*="Item"],[class*="card"]') || root;
-      if (card && !card.classList.contains(HCLS) && isGemCard(card)) card.classList.add(HCLS);
-    };
-    const sweep = () => {
-      candidates().forEach((el) => markGemCard(el));
-    };
-
-    let supportsHas = false;
-    try {
-      supportsHas = !!(CSS && CSS.supports && CSS.supports("selector(:has(*))"));
-    } catch {
-      supportsHas = false;
-    }
-    if (supportsHas) {
-      addStyle(
-        `
-        [data-page='shops'] .items-list > *:has([data-test*="gem" i],[data-testid*="gem" i],[aria-label*="Gem" i],[aria-label*="ジェム"]),
-        [data-page='shops'] .item:has([data-test*="gem" i],[data-testid*="gem" i],[aria-label*="Gem" i],[aria-label*="ジェム"]),
-        .task-column--rewards *:has([data-test*="gem" i],[data-testid*="gem" i],[aria-label*="Gem" i],[aria-label*="ジェム"])
-        { display:none !important; }
-      `,
-        STYLE_ID
-      );
-    } else {
-      addStyle(`.${HCLS}{display:none!important}`, STYLE_ID);
-      const mo = new MutationObserver(() => sweep());
-      mo.observe(document.body, { subtree: true, childList: true });
-      sweep();
-    }
-
-    function addToggle() {
-      if (document.getElementById(BTN_ID)) return;
-      const b = document.createElement("button");
-      b.id = BTN_ID;
-      b.textContent = "💎 ジェム非表示: ON（クリックで解除）";
-      Object.assign(b.style, {
-        position: "fixed",
-        top: "64px",
-        right: "16px",
-        zIndex: zTop + 1,
-        padding: "8px 12px",
-        borderRadius: "18px",
-        border: "none",
-        background: "#16a34a",
-        color: "#fff",
-        fontSize: "13px",
-        boxShadow: "0 2px 8px rgba(0,0,0,.25)",
-        cursor: "pointer",
-      });
-      b.onclick = () => {
-        rm(STYLE_ID);
-        document.querySelectorAll("." + HCLS).forEach((x) => x.classList.remove(HCLS));
-        b.remove();
-        delete window.__hideGemsUnmount;
-      };
-      document.body.appendChild(b);
-      positionGemToggleNearGear();
-    }
-
-    window.__hideGemsUnmount = () => {
-      rm(STYLE_ID);
-      const b = document.getElementById(BTN_ID);
-      if (b) b.remove();
-      document.querySelectorAll("." + HCLS).forEach((x) => x.classList.remove(HCLS));
-      delete window.__hideGemsUnmount;
-    };
-
-    addToggle();
-  }
-
-  function reflowUI() {
-    if (!placeGearUnderParty()) placeGearSafely();
-    positionGemToggleNearGear();
-  }
-
-  function boot() {
-    ensureGear();
-    const ensureMo = new MutationObserver(() => ensureGear());
-    ensureMo.observe(document.documentElement, { childList: true, subtree: true });
-    installHideGems();
-    reflowUI();
-    window.addEventListener("resize", reflowUI);
-    new MutationObserver(reflowUI).observe(document.body, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-    });
-  }
-
-  if (!window.__SGC_LOADED__) {
-    window.__SGC_LOADED__ = true;
-    boot();
-  }
-  toggleOverlay();
+  // --- public API（ブックマーク2回押しでトグル） ---
+  window.SGC = { toggle: () => (elModal.hidden ? show() : hide()), unmount: () => { host.remove(); delete window.__SGC_LOADED__; } };
 })();
